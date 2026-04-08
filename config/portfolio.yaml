@@ -1,0 +1,27 @@
+# 我的持仓 - 用于多维度信号监控
+# type: stock (A股个股) / board (行业板块) / us_stock (美股)
+
+holdings:
+  - name: 方正电机
+    code: "002196"
+    type: stock
+    board: 电机
+
+  - name: 襄阳轴承
+    code: "000678"
+    type: stock
+    board: 汽车零部件
+
+  - name: 国防军工
+    code: null
+    type: board
+    board: 军工装备
+
+  - name: 华友钴业
+    code: "603799"
+    type: stock
+    board: 能源金属
+
+  - name: 理想汽车
+    code: "LI"
+    type: us_stock

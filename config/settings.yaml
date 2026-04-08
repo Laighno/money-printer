@@ -1,0 +1,29 @@
+# Money Printer - 行业轮动量化配置
+
+data:
+  source: akshare
+  cache_dir: data/cache
+  db_url: sqlite:///data/market.db
+
+strategy:
+  mode: rotation            # rotation (行业轮动) | factor (多因子选股)
+  universe: hs300
+  rebalance_freq: monthly
+  top_n: 5                  # 持有板块数量
+  start_date: "2024-01-01"
+  end_date: null
+
+# 风险管理 - 核心模块
+risk:
+  max_position_pct: 0.20    # 单板块最大仓位
+  stop_loss_pct: 0.08       # 硬止损
+  trailing_stop_pct: 0.12   # 追踪止损(从最高点回撤)
+  max_drawdown_pct: 0.15    # 组合最大回撤熔断
+  max_sectors: 5            # 最大同时持有板块数
+  vol_target: 0.15          # 目标年化波动率
+
+execution:
+  mode: simulation
+  broker: null
+  slippage_bps: 5
+  commission_bps: 3

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "additionalDirectories": [
+      "/Users/laighno/laighno/money-printer/mp"
+    ],
+    "allow": [
+      "Bash(.venv/bin/python -c ':*)"
+    ]
+  }
+}
