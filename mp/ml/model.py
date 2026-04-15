@@ -103,6 +103,8 @@ class StockRanker:
 
         cv_maes: List[float] = []
         cv_ics: List[float] = []
+        cv_hit_rates: List[float] = []
+        cv_precisions: List[float] = []
         best_rounds_list: List[int] = []
 
         params = {
@@ -162,8 +164,14 @@ class StockRanker:
             if not np.isnan(ic):
                 cv_ics.append(float(ic))
 
-            logger.info("Fold {}: MAE={:.4f}, IC={:.3f}, rounds={}",
-                        fold, mae, ic if not np.isnan(ic) else 0.0, best_iter)
+            topk = _topk_metrics(preds, y[val_mask], dates[val_mask], k=10)
+            if not np.isnan(topk["hit_rate_at_k"]):
+                cv_hit_rates.append(topk["hit_rate_at_k"])
+            if not np.isnan(topk["precision_at_k"]):
+                cv_precisions.append(topk["precision_at_k"])
+            logger.info("Fold {}: MAE={:.4f}, IC={:.3f}, HitRate@10={:.2f}, Precision@10={:.2f}, rounds={}",
+                        fold, mae, ic if not np.isnan(ic) else 0.0,
+                        topk["hit_rate_at_k"], topk["precision_at_k"], best_iter)
 
         # --- Final model: retrain on all data ---
         best_rounds = int(np.median(best_rounds_list)) if best_rounds_list else 200
@@ -184,14 +192,19 @@ class StockRanker:
             "cv_mae_std": float(np.std(cv_maes)) if cv_maes else float("nan"),
             "cv_ic_mean": float(np.mean(cv_ics)) if cv_ics else float("nan"),
             "cv_ic_std": float(np.std(cv_ics)) if cv_ics else float("nan"),
+            "cv_hit_rate_mean": float(np.mean(cv_hit_rates)) if cv_hit_rates else float("nan"),
+            "cv_precision_mean": float(np.mean(cv_precisions)) if cv_precisions else float("nan"),
             "best_rounds": best_rounds,
             "n_folds": len(cv_maes),
             "n_train_rows": len(y),
             "feature_importance": self.feature_importance_report(),
         }
-        logger.info("Training complete: MAE={:.4f}+/-{:.4f}, IC={:.3f}+/-{:.3f}",
-                     metrics["cv_mae_mean"], metrics["cv_mae_std"],
-                     metrics["cv_ic_mean"], metrics["cv_ic_std"])
+        logger.info(
+            "Training complete: MAE={:.4f}±{:.4f}, IC={:.3f}±{:.3f}, HitRate@10={:.2f}, Precision@10={:.2f}",
+            metrics["cv_mae_mean"], metrics["cv_mae_std"],
+            metrics["cv_ic_mean"], metrics["cv_ic_std"],
+            metrics["cv_hit_rate_mean"], metrics["cv_precision_mean"],
+        )
         return metrics
 
     def train_fast(self, df: pd.DataFrame, val_frac: float = 0.15) -> dict:

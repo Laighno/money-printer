@@ -287,8 +287,10 @@ def run_walk_forward():
                 ranker = StockRanker(feature_cols=FACTOR_COLUMNS)
                 try:
                     metrics = ranker.train_fast(train_df)
-                    logger.info("  Train: {} rows, MAE={:.4f}, IC={:.3f}, rounds={}",
+                    logger.info("  Train: {} rows, MAE={:.4f}, IC={:.3f}, HitRate@10={:.2f}, Precision@10={:.2f}, rounds={}",
                                 len(train_df), metrics["mae"], metrics["ic"],
+                                metrics.get("hit_rate_at_k", float("nan")),
+                                metrics.get("precision_at_k", float("nan")),
                                 metrics["best_rounds"])
                     current_ranker = ranker
                 except Exception as e:
@@ -533,8 +535,9 @@ def update_production_models(
         if not ds_20.empty:
             ranker = StockRanker(model_path="data/model.lgb")
             m = ranker.train(ds_20)
-            logger.info("20d model: MAE={}, IC={}, rounds={}",
-                         m["cv_mae_mean"], m["cv_ic_mean"], m["best_rounds"])
+            logger.info("20d model: MAE={:.4f}±{:.4f}, IC={:.3f}±{:.3f}, rounds={}",
+                         m["cv_mae_mean"], m["cv_mae_std"],
+                         m["cv_ic_mean"], m["cv_ic_std"], m["best_rounds"])
             results["20d"] = m
         else:
             logger.error("Failed to build 20d dataset")
@@ -546,8 +549,9 @@ def update_production_models(
     if not ds_60.empty:
         ranker_60 = StockRanker(model_path="data/model_60d.lgb")
         m = ranker_60.train(ds_60)
-        logger.info("60d model: MAE={}, IC={}, rounds={}",
-                     m["cv_mae_mean"], m["cv_ic_mean"], m["best_rounds"])
+        logger.info("60d model: MAE={:.4f}±{:.4f}, IC={:.3f}±{:.3f}, rounds={}",
+                     m["cv_mae_mean"], m["cv_mae_std"],
+                     m["cv_ic_mean"], m["cv_ic_std"], m["best_rounds"])
         results["60d"] = m
     else:
         logger.error("Failed to build 60d dataset")
@@ -608,10 +612,14 @@ def send_model_update_report(
         else:
             mae  = m.get("cv_mae_mean", "N/A")
             ic   = m.get("cv_ic_mean",  "N/A")
+            hr   = m.get("cv_hit_rate_mean")
+            prec = m.get("cv_precision_mean")
             rds  = m.get("best_rounds", "N/A")
             mae_str = f"{mae:.4f}" if isinstance(mae, float) else str(mae)
-            ic_str  = f"{ic:.4f}"  if isinstance(ic,  float) else str(ic)
-            lines.append(f"**{label}**: ✅  MAE={mae_str}  IC={ic_str}  迭代={rds}")
+            ic_str  = f"{ic:.3f}"  if isinstance(ic,  float) else str(ic)
+            hr_str  = f"{hr:.2f}"  if isinstance(hr,  float) else "N/A"
+            prec_str = f"{prec:.2f}" if isinstance(prec, float) else "N/A"
+            lines.append(f"**{label}**: ✅  MAE={mae_str}  IC={ic_str}  HitRate@10={hr_str}  Precision@10={prec_str}  迭代={rds}")
         lines.append("")
 
     # --- Backtest summary (only for full runs) ---
