@@ -1,62 +1,179 @@
 """Market data fetcher using akshare with multi-source fallback.
 
 Data source priority:
-  - Industry boards: THS (同花顺) primary, eastmoney fallback
-  - Stock bars: Sina (新浪) primary, eastmoney fallback
-  - Valuation: Xueqiu (雪球) per-stock, Sina spot fallback
-  - Financial: eastmoney (unique source)
+  - Index constituents: CSIndex primary, eastmoney fallback
+  - Industry boards:    THS (同花顺) primary, eastmoney fallback
+  - Stock bars:         DB cache first → Sina primary → eastmoney fallback
+  - Valuation:          Eastmoney primary, Sina fallback; backed by TTL disk cache
+  - Financial:          Eastmoney primary; results persisted to DB, served from DB on failure
+
+Caching / persistence strategy
+-------------------------------
+* ``get_industry_list()`` and ``get_valuation_snapshot()`` are cached to
+  ``data/cache/`` for a configurable TTL (4 h and 6 h respectively).  A stale
+  cache is always used as last-resort if every live source fails.
+
+* ``get_index_constituents()`` is cached for 24 h (index membership changes
+  quarterly).
+
+* ``get_daily_bars()`` uses a **DB-first incremental** pattern:
+    1. Load what's already in the local SQLite DB.
+    2. If the DB is fresh enough (last trading day covered), return it directly.
+    3. Otherwise fetch only the *missing* date range from the API, save to DB,
+       and return the merged result.
+  This avoids re-downloading years of history on every run.
+
+* ``get_financial_data()`` saves successful fetches to DB and falls back to the
+  DB when the live source fails.
+
+Retry
+-----
+All single-source helpers wrap their akshare call in ``_with_retry()`` which
+retries up to 3 times with exponential back-off (1 s, 2 s, 4 s).
 """
 
-from datetime import date
+from __future__ import annotations
+
+import time
+from datetime import date, datetime, timedelta
+from typing import Callable, TypeVar
 
 import akshare as ak
 import pandas as pd
 from loguru import logger
 
 from . import proxy_patch
+from .cache import cache_get, cache_put
+
 proxy_patch.apply()
 
+T = TypeVar("T")
 
-# === Index / Universe ===
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+def _with_retry(fn: Callable[[], T], retries: int = 3, base_delay: float = 1.0) -> T:
+    """Call *fn()* up to *retries* extra times on exception with exponential back-off."""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                delay = base_delay * (2 ** attempt)
+                logger.debug("Retry {}/{} after {:.1f}s ({})", attempt + 1, retries, delay, exc)
+                time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Index / Universe
+# ---------------------------------------------------------------------------
+
+_INDEX_TTL = 24 * 3600  # index membership changes quarterly
 
 def get_index_constituents(index: str = "hs300") -> list[str]:
-    """Get constituent stock codes for a given index."""
+    """Get constituent stock codes for a given index.
+
+    Primary:  CSIndex (中证指数)
+    Fallback: Eastmoney spot list filtered by market cap (approximate)
+    Cache:    24-hour TTL in data/cache/; stale copy used on total failure
+    """
     code_map = {"hs300": "000300", "zz500": "000905", "zz1000": "000852"}
     if index not in code_map:
         raise ValueError(f"Unsupported index: {index}. Use hs300/zz500/zz1000.")
 
+    cached = cache_get("index_constituents", ttl=_INDEX_TTL, index=index)
+    if cached is not None and not cached.empty:
+        codes = cached["code"].tolist()
+        logger.info(f"Index {index} constituents from cache: {len(codes)} stocks")
+        return codes
+
     logger.info(f"Fetching {index} constituents...")
-    df = ak.index_stock_cons_weight_csindex(symbol=code_map[index])
-    codes = df["成分券代码"].astype(str).str.zfill(6).tolist()
-    logger.info(f"Got {len(codes)} stocks for {index}")
-    return codes
+
+    # Primary: CSIndex
+    try:
+        df = _with_retry(lambda: ak.index_stock_cons_weight_csindex(symbol=code_map[index]))
+        codes = df["成分券代码"].astype(str).str.zfill(6).tolist()
+        logger.info(f"Got {len(codes)} stocks for {index} from CSIndex")
+        cache_put("index_constituents", pd.DataFrame({"code": codes}), index=index)
+        return codes
+    except Exception as e:
+        logger.warning(f"CSIndex constituents for {index} failed: {e}, trying eastmoney...")
+
+    # Fallback: Eastmoney spot — top-N by market cap as proxy
+    try:
+        spot = _with_retry(lambda: ak.stock_zh_a_spot_em())
+        spot["code"] = spot["代码"].astype(str).str.zfill(6)
+        spot["total_mv"] = pd.to_numeric(spot["总市值"], errors="coerce")
+        n_map = {"hs300": 300, "zz500": 500, "zz1000": 1000}
+        top = spot.nlargest(n_map[index], "total_mv")
+        codes = top["code"].tolist()
+        logger.warning(f"Using EM market-cap proxy for {index}: {len(codes)} stocks")
+        cache_put("index_constituents", pd.DataFrame({"code": codes}), index=index)
+        return codes
+    except Exception as e:
+        logger.warning(f"EM fallback for {index} also failed: {e}")
+
+    # Last resort: stale cache (7 days)
+    stale = cache_get("index_constituents", ttl=7 * 24 * 3600, index=index)
+    if stale is not None and not stale.empty:
+        codes = stale["code"].tolist()
+        logger.warning(f"Using stale cache for {index} constituents: {len(codes)} stocks")
+        return codes
+
+    raise RuntimeError(f"All sources failed for index constituents: {index}")
 
 
-# === Industry / Sector ===
+# ---------------------------------------------------------------------------
+# Industry / Sector
+# ---------------------------------------------------------------------------
+
+_INDUSTRY_LIST_TTL = 4 * 3600  # industry list rarely changes intraday
 
 def get_industry_list() -> pd.DataFrame:
     """Get all industry board names from THS (primary) or eastmoney (fallback).
 
     Returns:
         DataFrame with: date, board_name, board_code, close, change_pct, ...
+
+    Results are cached for 4 hours.  If all live sources fail, the most recent
+    cached copy is returned (stale-on-error).
     """
-    # Try THS first
+    cached = cache_get("industry_list", ttl=_INDUSTRY_LIST_TTL)
+    if cached is not None:
+        return cached
+
     try:
-        return _get_industry_list_ths()
+        df = _with_retry(_get_industry_list_ths)
+        cache_put("industry_list", df)
+        return df
     except Exception as e:
         logger.warning(f"THS industry list failed: {e}, trying eastmoney...")
 
-    # Fallback to eastmoney
-    return _get_industry_list_em()
+    try:
+        df = _with_retry(_get_industry_list_em)
+        cache_put("industry_list", df)
+        return df
+    except Exception as e:
+        logger.warning(f"EM industry list also failed: {e}")
+
+    # Stale-on-error
+    stale = cache_get("industry_list", ttl=7 * 24 * 3600)
+    if stale is not None:
+        logger.warning("Returning stale industry list from cache (all live sources failed)")
+        return stale
+
+    return pd.DataFrame()
 
 
 def _get_industry_list_ths() -> pd.DataFrame:
     """THS industry board list with summary data."""
     logger.info("Fetching industry boards from THS (同花顺)...")
-    # Get board name/code mapping (reliable)
     boards = ak.stock_board_industry_name_ths()
 
-    # Try to get summary for extra data (change_pct etc.), but don't fail if unavailable
     try:
         summary = ak.stock_board_industry_summary_ths()
         summary_map = {}
@@ -122,14 +239,12 @@ def get_industry_hist(board_name: str, start: str, end: str | None = None) -> pd
     if end is None:
         end = date.today().strftime("%Y%m%d")
 
-    # Try THS first
     try:
-        return _get_industry_hist_ths(board_name, start, end)
+        return _with_retry(lambda: _get_industry_hist_ths(board_name, start, end))
     except Exception as e:
         logger.debug(f"THS hist for '{board_name}' failed: {e}, trying eastmoney...")
 
-    # Fallback to eastmoney
-    return _get_industry_hist_em(board_name, start, end)
+    return _with_retry(lambda: _get_industry_hist_em(board_name, start, end))
 
 
 def _get_industry_hist_ths(board_name: str, start: str, end: str) -> pd.DataFrame:
@@ -146,7 +261,6 @@ def _get_industry_hist_ths(board_name: str, start: str, end: str) -> pd.DataFram
     })
     result["board_name"] = board_name
     result["date"] = pd.to_datetime(result["date"])
-    # THS doesn't provide change_pct and turnover directly, compute change_pct
     result["change_pct"] = result["close"].pct_change() * 100
     result["turnover"] = 0.0
     return result[["board_name", "date", "open", "high", "low", "close",
@@ -190,50 +304,46 @@ def get_industry_constituents(board_name: str) -> pd.DataFrame:
 
     Returns DataFrame with: code, name, close, pe_ttm, pb, board_name, ...
     """
-    # Try SW (申万) first
     try:
         return _get_industry_constituents_sw(board_name)
     except Exception as e:
         logger.debug(f"SW constituents for '{board_name}' failed: {e}, trying eastmoney...")
 
-    # Fallback to eastmoney
     return _get_industry_constituents_em(board_name)
 
 
 # THS board name -> SW industry code mapping (built lazily)
 _THS_SW_MAP: dict[str, str] | None = None
 
-# Manual mappings for THS boards that don't auto-match SW second-level
 _THS_SW_MANUAL = {
-    "公路铁路运输": "801179",   # SW二级: 铁路公路
-    "军工装备": "801744",       # SW二级: 航空装备Ⅱ
-    "塑料制品": "801036",       # SW二级: 塑料
-    "建筑材料": "801710",       # SW一级: 建筑材料
-    "建筑装饰": "801720",       # SW一级: 建筑装饰
-    "房地产": "801181",         # SW二级: 房地产开发
-    "文化传媒": "801760",       # SW一级: 传媒
-    "旅游及酒店": "801993",     # SW二级: 旅游及景区
-    "机场航运": "801991",       # SW二级: 航空机场
-    "橡胶制品": "801037",       # SW二级: 橡胶
-    "汽车整车": "801091",       # SW二级: 乘用车
-    "汽车服务及其他": "801092",  # SW二级: 汽车服务
-    "油气开采及服务": "801960",  # SW一级: 石油石化
-    "港口航运": "801992",       # SW二级: 航运港口
-    "煤炭开采加工": "801951",   # SW二级: 煤炭开采
-    "石油加工贸易": "801073",   # SW二级: 石油化工
-    "种植业与林业": "801016",   # SW二级: 种植业
-    "美容护理": "801980",       # SW一级: 美容护理
-    "其他社会服务": "801881",   # SW二级: 摩托车及其他(近似)
-    "钢铁": "801040",           # SW一级: 钢铁
-    "银行": "801780",           # SW一级: 银行
-    "零售": "801203",           # SW二级: 一般零售
-    "食品加工制造": "801124",   # SW二级: 食品加工
-    "饮料制造": "801127",       # SW二级: 饮料乳品
+    "公路铁路运输": "801179",
+    "军工装备": "801744",
+    "塑料制品": "801036",
+    "建筑材料": "801710",
+    "建筑装饰": "801720",
+    "房地产": "801181",
+    "文化传媒": "801760",
+    "旅游及酒店": "801993",
+    "机场航运": "801991",
+    "橡胶制品": "801037",
+    "汽车整车": "801091",
+    "汽车服务及其他": "801092",
+    "油气开采及服务": "801960",
+    "港口航运": "801992",
+    "煤炭开采加工": "801951",
+    "石油加工贸易": "801073",
+    "种植业与林业": "801016",
+    "美容护理": "801980",
+    "其他社会服务": "801881",
+    "钢铁": "801040",
+    "银行": "801780",
+    "零售": "801203",
+    "食品加工制造": "801124",
+    "饮料制造": "801127",
 }
 
 
 def _build_ths_sw_map() -> dict[str, str]:
-    """Build THS board name -> SW industry code mapping."""
     global _THS_SW_MAP
     if _THS_SW_MAP is not None:
         return _THS_SW_MAP
@@ -253,7 +363,6 @@ def _build_ths_sw_map() -> dict[str, str]:
         if clean != sw_name:
             sw_map[clean] = sw_code
 
-    # Add manual overrides
     sw_map.update(_THS_SW_MANUAL)
     _THS_SW_MAP = sw_map
     return _THS_SW_MAP
@@ -266,7 +375,6 @@ def _get_industry_constituents_sw(board_name: str) -> pd.DataFrame:
     if not sw_code:
         raise ValueError(f"No SW mapping for THS board '{board_name}'")
 
-    # Try sw_index_third_cons first (has PE/PB/市值 built in, best source)
     try:
         sw3_cons = ak.sw_index_third_cons(symbol=f"{sw_code}.SI")
         result = sw3_cons.rename(columns={
@@ -288,13 +396,11 @@ def _get_industry_constituents_sw(board_name: str) -> pd.DataFrame:
     except Exception as e:
         logger.debug(f"sw_index_third_cons for {sw_code} failed: {e}")
 
-    # Fallback: index_component_sw (basic list) + XQ per-stock valuation
     try:
         df = ak.index_component_sw(symbol=sw_code)
     except Exception as e:
         raise ValueError(f"SW index_component_sw failed for {sw_code}: {e}")
 
-    # Column names vary between versions
     code_col = next((c for c in df.columns if "代码" in c), None)
     name_col = next((c for c in df.columns if "名称" in c or "简称" in c), None)
     if not code_col or not name_col:
@@ -303,9 +409,8 @@ def _get_industry_constituents_sw(board_name: str) -> pd.DataFrame:
     codes = df[code_col].astype(str).str.replace(r"\.\w+$", "", regex=True).str.zfill(6).tolist()
     names = df[name_col].tolist()
 
-    # Batch XQ valuation (only for small boards, skip for >50 stocks)
     rows = []
-    for i, (code, name) in enumerate(zip(codes, names)):
+    for code, name in zip(codes, names):
         row = {"code": code, "name": name, "close": 0, "change_pct": 0,
                "amount": 0, "turnover": 0, "pe_ttm": None, "pb": None,
                "board_name": board_name}
@@ -339,59 +444,92 @@ def _get_industry_constituents_em(board_name: str) -> pd.DataFrame:
     return result
 
 
-# === Stock bars ===
+# ---------------------------------------------------------------------------
+# Stock bars — DB-first incremental pattern
+# ---------------------------------------------------------------------------
 
 def get_daily_bars(code: str, start: str, end: str | None = None) -> pd.DataFrame:
-    """Fetch daily OHLCV bars. Sina primary, eastmoney fallback, local DB supplement.
+    """Fetch daily OHLCV bars with a DB-first incremental strategy.
 
-    If the API returns data ending before what's in the local DB, the local DB
-    rows are appended so that manually-ingested bars (e.g. from Sina realtime)
-    are picked up by downstream feature computation.
+    Flow:
+    1. Load existing data from local SQLite for the requested range.
+    2. If DB already covers up to the last expected trading day, return it directly.
+    3. Otherwise fetch only the *missing* tail from API (Sina → EM fallback).
+    4. Persist new API rows back to DB via upsert.
+    5. Return merged result.
+
+    This avoids re-downloading full history on every run.
     """
+    from mp.data.store import DataStore
+
     if end is None:
         end = date.today().strftime("%Y%m%d")
 
-    # Try Sina first
-    df = None
-    try:
-        df = _get_daily_bars_sina(code, start, end)
-    except Exception as e:
-        logger.debug(f"Sina bars for {code} failed: {e}, trying eastmoney...")
+    store = DataStore()
 
-    # Fallback to eastmoney
-    if df is None or df.empty:
+    # Step 1: load from DB
+    db_df = store.load_bars(codes=[code], start=start, end=end)
+
+    # Step 2: check freshness — only fetch what's missing
+    fetch_start: str
+    if not db_df.empty:
+        db_max = db_df["date"].max().date()
+        expected = _last_expected_trading_day()
+        if db_max >= expected:
+            logger.debug(f"{code}: DB is fresh (last={db_max}), skipping API")
+            return db_df
+        fetch_start = (db_max + timedelta(days=1)).strftime("%Y%m%d")
+        logger.debug(f"{code}: DB ends {db_max}, fetching {fetch_start}~{end}")
+    else:
+        fetch_start = start
+
+    # Step 3: incremental API fetch with retry
+    api_df: pd.DataFrame | None = None
+    try:
+        api_df = _with_retry(lambda: _get_daily_bars_sina(code, fetch_start, end))
+    except Exception as e:
+        logger.debug(f"Sina bars for {code} ({fetch_start}~{end}): {e}, trying EM...")
+
+    if api_df is None or api_df.empty:
         try:
-            df = _get_daily_bars_em(code, start, end)
+            api_df = _with_retry(lambda: _get_daily_bars_em(code, fetch_start, end))
         except Exception as e:
-            logger.debug(f"EM bars for {code} failed: {e}, trying local DB...")
+            logger.debug(f"EM bars for {code}: {e}")
 
-    # Supplement from local DB if API data is stale
-    try:
-        from mp.data.store import DataStore
-        store = DataStore()
-        db_df = store.load_bars(codes=[code], start=start, end=end)
-        if not db_df.empty:
-            db_df["date"] = pd.to_datetime(db_df["date"])
-            if df is None or df.empty:
-                return db_df
-            api_max = df["date"].max()
-            db_extra = db_df[db_df["date"] > api_max]
-            if not db_extra.empty:
-                # Align columns
-                cols = df.columns.tolist()
-                for c in cols:
-                    if c not in db_extra.columns:
-                        db_extra[c] = float("nan")
-                df = pd.concat([df, db_extra[cols]], ignore_index=True)
-                logger.debug(f"{code}: supplemented {len(db_extra)} bars from local DB")
-    except Exception as e:
-        logger.debug(f"DB supplement for {code} failed: {e}")
+    # Step 4: persist new rows to DB
+    if api_df is not None and not api_df.empty:
+        try:
+            store.save_bars_upsert(api_df)
+        except Exception as e:
+            logger.warning(f"Failed to save bars for {code} to DB: {e}")
 
-    return df if df is not None else pd.DataFrame()
+    # Step 5: merge and return
+    if not db_df.empty and api_df is not None and not api_df.empty:
+        combined = pd.concat([db_df, api_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["code", "date"]).sort_values("date").reset_index(drop=True)
+        return combined
+    if api_df is not None and not api_df.empty:
+        return api_df
+    if not db_df.empty:
+        return db_df
+
+    logger.warning(f"No bar data found for {code} ({start}~{end})")
+    return pd.DataFrame()
+
+
+def _last_expected_trading_day() -> date:
+    """Last trading day we expect to have closing data for.
+
+    After 16:00 → today; before → yesterday.  Skip weekends (not holidays).
+    """
+    now = datetime.now()
+    candidate = now.date() if now.hour >= 16 else now.date() - timedelta(days=1)
+    while candidate.weekday() >= 5:  # Sat=5, Sun=6
+        candidate -= timedelta(days=1)
+    return candidate
 
 
 def _code_to_sina(code: str) -> str:
-    """Convert 6-digit code to Sina format (sz/sh prefix)."""
     if code.startswith(("6", "9")):
         return f"sh{code}"
     return f"sz{code}"
@@ -407,14 +545,13 @@ def _get_daily_bars_sina(code: str, start: str, end: str) -> pd.DataFrame:
     })
     df["code"] = code
     df["date"] = pd.to_datetime(df["date"])
-    # Sina doesn't provide turnover, fill with NaN
     if "turnover" not in df.columns:
         df["turnover"] = float("nan")
     return df[["code", "date", "open", "high", "low", "close", "volume", "amount", "turnover"]]
 
 
 def _get_daily_bars_em(code: str, start: str, end: str) -> pd.DataFrame:
-    """Eastmoney daily bars (original)."""
+    """Eastmoney daily bars."""
     df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
     df = df.rename(columns={
         "日期": "date", "开盘": "open", "最高": "high", "最低": "low",
@@ -443,18 +580,43 @@ def get_daily_bars_batch(codes: list[str], start: str, end: str | None = None) -
     return pd.concat(frames, ignore_index=True)
 
 
-# === Valuation (real-time snapshot) ===
+# ---------------------------------------------------------------------------
+# Valuation (real-time snapshot)
+# ---------------------------------------------------------------------------
+
+_VALUATION_TTL = 6 * 3600  # intraday data, 6-hour cache
 
 def get_valuation_snapshot() -> pd.DataFrame:
-    """Fetch real-time PE/PB for all A-shares. Eastmoney primary, Sina fallback."""
-    # Try eastmoney first (fastest, has PE/PB)
+    """Fetch real-time PE/PB for all A-shares.
+
+    Priority: Eastmoney → Sina → TTL disk cache → stale disk cache.
+    Cache TTL: 6 hours.
+    """
+    cached = cache_get("valuation_snapshot", ttl=_VALUATION_TTL)
+    if cached is not None:
+        return cached
+
     try:
-        return _get_valuation_snapshot_em()
+        df = _with_retry(_get_valuation_snapshot_em)
+        cache_put("valuation_snapshot", df)
+        return df
     except Exception as e:
         logger.warning(f"EM valuation snapshot failed: {e}, trying Sina...")
 
-    # Fallback to Sina (no PE/PB but has basic price data)
-    return _get_valuation_snapshot_sina()
+    try:
+        df = _with_retry(_get_valuation_snapshot_sina)
+        cache_put("valuation_snapshot", df)
+        return df
+    except Exception as e:
+        logger.warning(f"Sina valuation snapshot also failed: {e}")
+
+    # Stale-on-error (up to 2 days old)
+    stale = cache_get("valuation_snapshot", ttl=2 * 24 * 3600)
+    if stale is not None:
+        logger.warning("Returning stale valuation snapshot (all live sources failed)")
+        return stale
+
+    return pd.DataFrame()
 
 
 def _get_valuation_snapshot_em() -> pd.DataFrame:
@@ -492,7 +654,9 @@ def _get_valuation_snapshot_sina() -> pd.DataFrame:
     return result
 
 
-# === Financial statements ===
+# ---------------------------------------------------------------------------
+# Financial statements — DB-backed with live fallthrough
+# ---------------------------------------------------------------------------
 
 def _code_to_em(code: str) -> str:
     if code.startswith(("6", "9")):
@@ -501,30 +665,53 @@ def _code_to_em(code: str) -> str:
 
 
 def get_financial_data(code: str) -> pd.DataFrame:
-    """Fetch financial indicators from eastmoney. Includes report publish date for time-alignment."""
+    """Fetch financial indicators from eastmoney with DB persistence.
+
+    On success, saves to DB so future calls can survive API outages.
+    On failure, falls back to the most recent DB copy.
+    """
     em_code = _code_to_em(code)
+    df: pd.DataFrame | None = None
+
     try:
-        df = ak.stock_financial_analysis_indicator_em(symbol=em_code)
+        raw = _with_retry(lambda: ak.stock_financial_analysis_indicator_em(symbol=em_code))
+        if raw is not None and not raw.empty:
+            df = pd.DataFrame({
+                "code": code,
+                "report_date": pd.to_datetime(raw["REPORT_DATE"]),
+                "publish_date": pd.to_datetime(raw["NOTICE_DATE"]),
+                "roe": pd.to_numeric(raw["ROEJQ"], errors="coerce"),
+                "eps": pd.to_numeric(raw["EPSJB"], errors="coerce"),
+                "bps": pd.to_numeric(raw["BPS"], errors="coerce"),
+                "debt_ratio": pd.to_numeric(raw["ZCFZL"], errors="coerce"),
+                "gross_margin": pd.to_numeric(raw.get("XSMLL"), errors="coerce"),
+                "net_margin": pd.to_numeric(raw["XSJLL"], errors="coerce"),
+                "revenue_growth": pd.to_numeric(raw["YYZSRGDHBZC"], errors="coerce"),
+                "profit_growth": pd.to_numeric(raw["NETPROFITRPHBZC"], errors="coerce"),
+            })
+            # Persist to DB so it's available offline
+            try:
+                from mp.data.store import DataStore
+                DataStore().save_financial(df)
+            except Exception as save_err:
+                logger.debug(f"Failed to save financial data for {code}: {save_err}")
     except Exception as e:
-        logger.warning(f"Failed to fetch financial data for {code}: {e}")
-        return pd.DataFrame()
+        logger.warning(f"Live financial fetch failed for {code}: {e}, trying DB fallback...")
 
-    if df.empty:
-        return pd.DataFrame()
+    if df is not None and not df.empty:
+        return df
 
-    return pd.DataFrame({
-        "code": code,
-        "report_date": pd.to_datetime(df["REPORT_DATE"]),
-        "publish_date": pd.to_datetime(df["NOTICE_DATE"]),
-        "roe": pd.to_numeric(df["ROEJQ"], errors="coerce"),
-        "eps": pd.to_numeric(df["EPSJB"], errors="coerce"),
-        "bps": pd.to_numeric(df["BPS"], errors="coerce"),
-        "debt_ratio": pd.to_numeric(df["ZCFZL"], errors="coerce"),
-        "gross_margin": pd.to_numeric(df.get("XSMLL"), errors="coerce"),
-        "net_margin": pd.to_numeric(df["XSJLL"], errors="coerce"),
-        "revenue_growth": pd.to_numeric(df["YYZSRGDHBZC"], errors="coerce"),
-        "profit_growth": pd.to_numeric(df["NETPROFITRPHBZC"], errors="coerce"),
-    })
+    # DB fallback — return all historical rows for this stock
+    try:
+        from mp.data.store import DataStore
+        db_df = DataStore().load_financial(codes=[code])
+        if not db_df.empty:
+            logger.debug(f"Financial data for {code} served from DB ({len(db_df)} rows)")
+            return db_df
+    except Exception as db_err:
+        logger.debug(f"DB fallback for {code} failed: {db_err}")
+
+    return pd.DataFrame()
 
 
 def get_financial_data_batch(codes: list[str]) -> pd.DataFrame:

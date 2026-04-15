@@ -20,9 +20,16 @@ class DataStore:
                 CREATE TABLE IF NOT EXISTS daily_bars (
                     code TEXT NOT NULL, date TEXT NOT NULL,
                     open REAL, high REAL, low REAL, close REAL, volume REAL, amount REAL,
+                    turnover REAL,
                     PRIMARY KEY (code, date)
                 )
             """))
+            # Add turnover column to existing DBs that were created before it was added
+            try:
+                conn.execute(text("ALTER TABLE daily_bars ADD COLUMN turnover REAL"))
+                conn.commit()
+            except Exception:
+                pass  # column already exists
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS industry_bars (
                     board_name TEXT NOT NULL, date TEXT NOT NULL,
@@ -60,6 +67,54 @@ class DataStore:
         df.to_sql("daily_bars", self.engine, if_exists="append", index=False, method="multi", chunksize=500)
         logger.info(f"Saved {len(df)} rows to daily_bars")
 
+    def save_bars_upsert(self, df: pd.DataFrame) -> int:
+        """Insert or replace bars — safe for incremental updates without duplicates.
+
+        Returns the number of rows written.
+        """
+        if df.empty:
+            return 0
+        df = df.copy()
+        df["date"] = df["date"].astype(str)
+        cols = ["code", "date", "open", "high", "low", "close", "volume", "amount", "turnover"]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
+        df = df[cols]
+
+        written = 0
+        with self.engine.connect() as conn:
+            for chunk_start in range(0, len(df), 500):
+                chunk = df.iloc[chunk_start:chunk_start + 500]
+                values_placeholder = ",".join(["(?,?,?,?,?,?,?,?,?)"] * len(chunk))
+                flat_values = []
+                for row in chunk.itertuples(index=False):
+                    flat_values.extend([
+                        row.code, row.date,
+                        _real(row.open), _real(row.high), _real(row.low), _real(row.close),
+                        _real(row.volume), _real(row.amount), _real(row.turnover),
+                    ])
+                conn.execute(
+                    text(f"INSERT OR REPLACE INTO daily_bars VALUES {values_placeholder}"),
+                    flat_values,
+                )
+                written += len(chunk)
+            conn.commit()
+        logger.debug(f"Upserted {written} bar rows")
+        return written
+
+    def get_max_bar_date(self, code: str) -> str | None:
+        """Return the latest date string stored for *code*, or None if no data.
+
+        Returned format: 'YYYY-MM-DD'.
+        """
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT MAX(date) FROM daily_bars WHERE code = :code"),
+                {"code": code},
+            ).scalar()
+        return result  # e.g. "2025-04-10" or None
+
     @staticmethod
     def _normalize_date(d: str) -> str:
         """Normalize YYYYMMDD to YYYY-MM-DD for consistent DB queries."""
@@ -90,16 +145,37 @@ class DataStore:
     # --- industry bars ---
 
     def save_industry_bars(self, df: pd.DataFrame):
+        """Upsert industry bar rows (INSERT OR REPLACE per board+date)."""
         if df.empty:
             return
         df = df.copy()
         df["date"] = df["date"].astype(str)
-        # Clear existing data and re-insert (handles duplicates on refresh)
+        cols = ["board_name", "date", "open", "high", "low", "close",
+                "change_pct", "volume", "amount", "turnover"]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
+        df = df[cols]
+
+        written = 0
         with self.engine.connect() as conn:
-            conn.execute(text("DELETE FROM industry_bars"))
+            for chunk_start in range(0, len(df), 500):
+                chunk = df.iloc[chunk_start:chunk_start + 500]
+                values_placeholder = ",".join(["(?,?,?,?,?,?,?,?,?,?)"] * len(chunk))
+                flat_values = []
+                for row in chunk.itertuples(index=False):
+                    flat_values.extend([
+                        row.board_name, row.date,
+                        _real(row.open), _real(row.high), _real(row.low), _real(row.close),
+                        _real(row.change_pct), _real(row.volume), _real(row.amount), _real(row.turnover),
+                    ])
+                conn.execute(
+                    text(f"INSERT OR REPLACE INTO industry_bars VALUES {values_placeholder}"),
+                    flat_values,
+                )
+                written += len(chunk)
             conn.commit()
-        df.to_sql("industry_bars", self.engine, if_exists="append", index=False, method="multi", chunksize=500)
-        logger.info(f"Saved {len(df)} rows to industry_bars")
+        logger.info(f"Saved {written} rows to industry_bars")
 
     def load_industry_bars(self, board_names: list[str] | None = None, start: str | None = None, end: str | None = None) -> pd.DataFrame:
         query = "SELECT * FROM industry_bars WHERE 1=1"
@@ -218,3 +294,17 @@ class DataStore:
     def has_financial_data(self) -> bool:
         with self.engine.connect() as conn:
             return conn.execute(text("SELECT COUNT(*) FROM financial")).scalar() > 0
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _real(v) -> float | None:
+    """Convert a value to Python float, returning None for NaN/None."""
+    try:
+        f = float(v)
+        import math
+        return None if math.isnan(f) else f
+    except (TypeError, ValueError):
+        return None
