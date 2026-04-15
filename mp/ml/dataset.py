@@ -159,8 +159,31 @@ FUNDAMENTAL_COLUMNS: List[str] = [
     "profit_growth",
 ]
 
+# Fundamental trend factors: quarter-over-quarter changes in financial metrics.
+# Captures whether fundamentals are improving or deteriorating.
+FUNDAMENTAL_TREND_COLUMNS: List[str] = [
+    "roe_qoq",              # ROE this period - ROE last period
+    "profit_growth_accel",  # profit_growth change vs prior period
+    "revenue_growth_accel", # revenue_growth change vs prior period
+]
+
+# Industry-relative ranking factors: percentile rank within the stock's
+# industry peer group on each date.  Computed as a cross-sectional
+# post-processing step after all stocks are assembled.
+INDUSTRY_RANK_COLUMNS: List[str] = [
+    "pe_ind_rank",      # PE percentile within industry (0=cheapest, 1=most expensive)
+    "pb_ind_rank",
+    "roe_ind_rank",     # ROE percentile within industry (0=lowest, 1=highest)
+    "mom_20d_ind_rank", # 20-day momentum percentile within industry
+]
+
 # All factor columns
-FACTOR_COLUMNS: List[str] = TECHNICAL_COLUMNS + FUNDAMENTAL_COLUMNS
+FACTOR_COLUMNS: List[str] = (
+    TECHNICAL_COLUMNS
+    + FUNDAMENTAL_COLUMNS
+    + FUNDAMENTAL_TREND_COLUMNS
+    + INDUSTRY_RANK_COLUMNS
+)
 
 # Label column names
 EXCESS_LABEL = "excess_ret"
@@ -276,18 +299,26 @@ def _compute_technical_factors(
 def _fetch_financial_history(code: str) -> Optional[pd.DataFrame]:
     """Fetch historical financial data with publish dates for time-alignment.
 
-    Returns DataFrame with columns: publish_date, roe, revenue_growth, profit_growth.
-    Sorted by publish_date ascending.
+    Returns DataFrame with columns:
+        publish_date, roe, revenue_growth, profit_growth,
+        roe_qoq, profit_growth_accel, revenue_growth_accel
+    Sorted by publish_date ascending.  The *_qoq / *_accel columns are
+    quarter-over-quarter differences computed from consecutive reports.
     """
     try:
         from mp.data.fetcher import get_financial_data
         fin = get_financial_data(code)
         if fin.empty:
             return None
-        fin = fin.dropna(subset=["publish_date"]).sort_values("publish_date")
+        fin = fin.dropna(subset=["publish_date"]).sort_values("publish_date").reset_index(drop=True)
         if fin.empty:
             return None
-        return fin[["publish_date", "roe", "revenue_growth", "profit_growth"]].copy()
+        fin = fin[["publish_date", "roe", "revenue_growth", "profit_growth"]].copy()
+        # Quarter-over-quarter deltas: positive = improving, negative = deteriorating
+        fin["roe_qoq"] = fin["roe"].diff()
+        fin["profit_growth_accel"] = fin["profit_growth"].diff()
+        fin["revenue_growth_accel"] = fin["revenue_growth"].diff()
+        return fin
     except Exception:
         return None
 
@@ -307,9 +338,12 @@ def _align_fundamentals_to_dates(
     (used by build_latest_features). For training, these columns will be NaN.
     """
     n = len(dates)
-    result: Dict[str, np.ndarray] = {col: np.full(n, np.nan) for col in FUNDAMENTAL_COLUMNS}
+    _fund_cols = FUNDAMENTAL_COLUMNS + FUNDAMENTAL_TREND_COLUMNS
+    result: Dict[str, np.ndarray] = {col: np.full(n, np.nan) for col in _fund_cols}
 
-    # --- ROE / growth: time-aligned via publish_date ---
+    # --- ROE / growth + trend diffs: time-aligned via publish_date ---
+    _align_cols = ["roe", "revenue_growth", "profit_growth",
+                   "roe_qoq", "profit_growth_accel", "revenue_growth_accel"]
     if fin_hist is not None and not fin_hist.empty:
         dates_df = pd.DataFrame({"date": pd.to_datetime(dates)}).sort_values("date")
         fin_hist = fin_hist.copy()
@@ -325,8 +359,8 @@ def _align_fundamentals_to_dates(
         for _, row in merged.iterrows():
             idx = date_to_idx.get(row["date"])
             if idx is not None:
-                for col in ["roe", "revenue_growth", "profit_growth"]:
-                    if pd.notna(row.get(col)):
+                for col in _align_cols:
+                    if col in row and pd.notna(row.get(col)):
                         result[col][idx] = float(row[col])
 
     # --- PE / PB / market cap: snapshot only (for latest features) ---
@@ -559,7 +593,7 @@ def _process_single_stock(
 
     # --- fundamental factors (time-aligned via publish_date) ---
     fund_aligned = _align_fundamentals_to_dates(df["date"], fin_hist, valuation_row)
-    for col in FUNDAMENTAL_COLUMNS:
+    for col in FUNDAMENTAL_COLUMNS + FUNDAMENTAL_TREND_COLUMNS:
         result[col] = fund_aligned[col]
 
     # Derive total_mv_log from daily bars (close * volume / turnover).
@@ -623,6 +657,66 @@ def _compute_benchmark_fwd_ret(
         bench.append({"date": dt, "bench_fwd_ret": t_fwd_close / t_close - 1.0})
 
     return pd.DataFrame(bench)
+
+
+# ---------------------------------------------------------------------------
+# Industry-relative cross-sectional ranking (post-processing)
+# ---------------------------------------------------------------------------
+
+def _add_industry_relative_features(
+    df: pd.DataFrame,
+    code_to_industry: Dict[str, str],
+) -> pd.DataFrame:
+    """Add industry-relative percentile rank columns to a cross-sectional panel.
+
+    For each (date, industry) group, computes the within-group percentile rank
+    for PE, PB, ROE, and 20-day momentum.  Stocks not in *code_to_industry*
+    get NaN for all rank columns (LightGBM handles NaN natively).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Panel with columns ``code``, ``date``, ``pe_ttm``, ``pb``,
+        ``roe``, ``mom_20d``.
+    code_to_industry : dict
+        {code: industry_name} mapping from ``get_industry_mapping()``.
+
+    Returns
+    -------
+    The same DataFrame with INDUSTRY_RANK_COLUMNS added in-place.
+    """
+    if df.empty or not code_to_industry:
+        for col in INDUSTRY_RANK_COLUMNS:
+            df[col] = np.nan
+        return df
+
+    df = df.copy()
+    df["_industry"] = df["code"].map(code_to_industry)
+
+    _rank_map = {
+        "pe_ind_rank": "pe_ttm",
+        "pb_ind_rank": "pb",
+        "roe_ind_rank": "roe",
+        "mom_20d_ind_rank": "mom_20d",
+    }
+
+    for rank_col, src_col in _rank_map.items():
+        if src_col not in df.columns:
+            df[rank_col] = np.nan
+            continue
+        # Within each (date, industry) group, compute 0-1 percentile rank.
+        # min_periods=1 allows groups with a single stock (rank=0.5 for lone member).
+        df[rank_col] = df.groupby(["date", "_industry"], observed=True)[src_col].transform(
+            lambda x: x.rank(pct=True, na_option="keep")
+        )
+
+    df.drop(columns=["_industry"], inplace=True)
+    n_mapped = df["pe_ind_rank"].notna().sum()
+    logger.debug(
+        "Industry rank features computed: {}/{} rows have industry assignment",
+        n_mapped, len(df),
+    )
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +814,20 @@ def build_dataset(
             logger.info("Excess return computed: {}/{} rows with valid bench", n_valid, len(dataset))
         except Exception as e:
             logger.warning("Failed to compute benchmark fwd_ret, excess_ret unavailable: {}", e)
+
+    # --- Industry-relative ranking features (cross-sectional post-processing) ---
+    if include_fundamentals and len(dataset) > 0:
+        try:
+            from mp.data.fetcher import get_industry_mapping
+            code_to_industry = get_industry_mapping(universe=codes)
+            dataset = _add_industry_relative_features(dataset, code_to_industry)
+            n_ranked = dataset["pe_ind_rank"].notna().sum()
+            logger.info("Industry rank features added: {}/{} rows", n_ranked, len(dataset))
+        except Exception as e:
+            logger.warning("Industry rank features failed, skipping: {}", e)
+            for col in INDUSTRY_RANK_COLUMNS:
+                if col not in dataset.columns:
+                    dataset[col] = np.nan
 
     logger.info(
         "build_dataset complete: {} rows, {} stocks, {} factors, date range {} ~ {}",
@@ -849,6 +957,18 @@ def build_latest_features(
         logger.warning("⚠ {}/{} 股票存在基本面数据缺失，预测可能不准", n_warn, len(result))
     if n_warn > len(result) * 0.5:
         logger.warning("⚠ 超过50%股票缺少基本面数据(PE/PB等)，数据源可能异常")
+
+    # --- Industry-relative ranking features ---
+    if include_fundamentals and len(result) > 0:
+        try:
+            from mp.data.fetcher import get_industry_mapping
+            code_to_industry = get_industry_mapping(universe=codes)
+            result = _add_industry_relative_features(result, code_to_industry)
+        except Exception as e:
+            logger.warning("Industry rank features failed for live prediction, skipping: {}", e)
+            for col in INDUSTRY_RANK_COLUMNS:
+                if col not in result.columns:
+                    result[col] = np.nan
 
     logger.info("build_latest_features complete: {} stocks, {} factors", len(result), len(FACTOR_COLUMNS))
     return result

@@ -726,3 +726,73 @@ def get_financial_data_batch(codes: list[str]) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def get_industry_mapping(universe: list[str] | None = None) -> dict[str, str]:
+    """Return a {stock_code: industry_name} mapping for the given universe.
+
+    Fetches all THS/EM industry board constituent lists concurrently and builds
+    the mapping.  Results are cached to disk for 7 days (industry membership
+    changes rarely).
+
+    Parameters
+    ----------
+    universe : list[str] or None
+        If provided, only codes in this list are included in the result.
+        If None, all codes found across all boards are returned.
+
+    Returns
+    -------
+    dict mapping 6-digit code → board_name string.  Empty dict on total failure.
+    """
+    cache_key = "industry_mapping_v1"
+    cached = cache_get(cache_key, ttl=60 * 60 * 24 * 7)  # 7 days
+    if cached is not None and not cached.empty:
+        mapping = dict(zip(cached["code"], cached["board_name"]))
+        if universe:
+            mapping = {c: v for c, v in mapping.items() if c in set(universe)}
+        logger.debug(f"Industry mapping served from cache ({len(mapping)} stocks)")
+        return mapping
+
+    logger.info("Fetching industry mapping (all boards)...")
+    try:
+        boards_df = get_industry_list()
+        if boards_df.empty:
+            logger.warning("get_industry_list returned empty, industry mapping unavailable")
+            return {}
+        board_names = boards_df["board_name"].dropna().unique().tolist()
+    except Exception as e:
+        logger.warning(f"Failed to get industry list for mapping: {e}")
+        return {}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+    rows: list[dict] = []
+
+    def _fetch_one(bname: str) -> list[dict]:
+        try:
+            cons = get_industry_constituents(bname)
+            if cons.empty or "code" not in cons.columns:
+                return []
+            return [{"code": c, "board_name": bname} for c in cons["code"].dropna().unique()]
+        except Exception:
+            return []
+
+    workers = min(12, len(board_names))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_fetch_one, b): b for b in board_names}
+        for fut in _as_completed(futs):
+            rows.extend(fut.result())
+
+    if not rows:
+        logger.warning("Industry mapping: no constituent data retrieved")
+        return {}
+
+    result_df = pd.DataFrame(rows).drop_duplicates(subset=["code"], keep="first")
+    cache_put(cache_key, result_df)
+    logger.info(f"Industry mapping built: {len(result_df)} stocks across {len(board_names)} boards")
+
+    mapping = dict(zip(result_df["code"], result_df["board_name"]))
+    if universe:
+        mapping = {c: v for c, v in mapping.items() if c in set(universe)}
+    return mapping
