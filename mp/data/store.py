@@ -94,8 +94,8 @@ class DataStore:
                         _real(row.open), _real(row.high), _real(row.low), _real(row.close),
                         _real(row.volume), _real(row.amount), _real(row.turnover),
                     ])
-                conn.execute(
-                    text(f"INSERT OR REPLACE INTO daily_bars VALUES {values_placeholder}"),
+                conn.exec_driver_sql(
+                    f"INSERT OR REPLACE INTO daily_bars VALUES {values_placeholder}",
                     flat_values,
                 )
                 written += len(chunk)
@@ -169,8 +169,8 @@ class DataStore:
                         _real(row.open), _real(row.high), _real(row.low), _real(row.close),
                         _real(row.change_pct), _real(row.volume), _real(row.amount), _real(row.turnover),
                     ])
-                conn.execute(
-                    text(f"INSERT OR REPLACE INTO industry_bars VALUES {values_placeholder}"),
+                conn.exec_driver_sql(
+                    f"INSERT OR REPLACE INTO industry_bars VALUES {values_placeholder}",
                     flat_values,
                 )
                 written += len(chunk)
