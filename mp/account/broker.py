@@ -43,17 +43,37 @@ class BrokerPosition:
 
 @dataclass
 class FeeSchedule:
-    slippage_bps: float = 5
+    slippage_bps: float = 5             # linear fallback when ADV unavailable
     commission_bps: float = 3
     stamp_tax_bps_old: float = 10       # sell-side only, before cut date
     stamp_tax_bps_new: float = 5        # sell-side only, from cut date
     stamp_tax_cut_date: str = "2023-08-28"
+    # ── Square-root market-impact model ──────────────────────────────────────
+    # When ADV (average daily value) is provided at trade time, slippage is
+    # estimated as:
+    #   impact_bps = impact_alpha_bps * sqrt(notional / adv)
+    # clamped to a minimum of min_slippage_bps (bid-ask spread floor).
+    # Falls back to flat ``slippage_bps`` when ADV is unknown.
+    #
+    # Calibration for A-share ZZ500 (mid-caps, ~500M CNY ADV):
+    #   10万 portfolio, 1万/stock → participation ~0.002% → ~0.7 bps impact
+    #   10M  portfolio, 1M/stock  → participation ~0.2%  → ~6.7 bps impact
+    use_sqrt_impact: bool = True
+    impact_alpha_bps: float = 150.0     # α; typical range 100–300 for A-shares
+    min_slippage_bps: float = 3.0       # bid-ask spread floor (always charged)
 
-    def buy_exec_price(self, price: float) -> float:
-        return price * (1 + self.slippage_bps / 10_000)
+    def _slippage_bps(self, notional: float | None = None, adv: float | None = None) -> float:
+        """Compute one-side slippage in bps for a given trade."""
+        if self.use_sqrt_impact and notional is not None and adv is not None and adv > 0:
+            impact = self.impact_alpha_bps * (notional / adv) ** 0.5
+            return max(self.min_slippage_bps, impact)
+        return self.slippage_bps
 
-    def sell_exec_price(self, price: float) -> float:
-        return price * (1 - self.slippage_bps / 10_000)
+    def buy_exec_price(self, price: float, notional: float | None = None, adv: float | None = None) -> float:
+        return price * (1 + self._slippage_bps(notional, adv) / 10_000)
+
+    def sell_exec_price(self, price: float, notional: float | None = None, adv: float | None = None) -> float:
+        return price * (1 - self._slippage_bps(notional, adv) / 10_000)
 
     def buy_fee(self, cost: float) -> float:
         return cost * self.commission_bps / 10_000
@@ -92,11 +112,23 @@ class SimulatedBroker:
         return self.cash + sum(p.market_value for p in self.positions.values())
 
     def buy(self, code: str, price: float, target_value: float | None = None,
-            shares: int | None = None, date: str = "", action: str = "BUY") -> dict | None:
+            shares: int | None = None, date: str = "", action: str = "BUY",
+            adv: float | None = None) -> dict | None:
+        """Execute a buy order.
+
+        Parameters
+        ----------
+        adv:
+            Average daily trading value (amount) in CNY over the past N days,
+            used to compute square-root market impact.  When ``None``, falls
+            back to the flat ``FeeSchedule.slippage_bps``.
+        """
         if price <= 0:
             return None
 
-        exec_price = self.fees.buy_exec_price(price)
+        # Estimate notional for impact model; target_value is a good proxy.
+        notional_est = target_value or (shares or 1) * price
+        exec_price = self.fees.buy_exec_price(price, notional=notional_est, adv=adv)
 
         if shares is not None:
             buy_shares = int(shares / LOT_SIZE) * LOT_SIZE
@@ -156,7 +188,15 @@ class SimulatedBroker:
         return trade
 
     def sell(self, code: str, price: float, shares: int | None = None,
-             date: str = "", action: str = "SELL") -> dict | None:
+             date: str = "", action: str = "SELL",
+             adv: float | None = None) -> dict | None:
+        """Execute a sell order.
+
+        Parameters
+        ----------
+        adv:
+            Average daily trading value in CNY; used for sqrt impact model.
+        """
         if code not in self.positions:
             return None
         pos = self.positions[code]
@@ -165,7 +205,9 @@ class SimulatedBroker:
         if price <= 0:
             return None
 
-        exec_price = self.fees.sell_exec_price(price)
+        sell_shares_est = shares if shares is not None else pos.shares
+        notional_est = sell_shares_est * price
+        exec_price = self.fees.sell_exec_price(price, notional=notional_est, adv=adv)
 
         if shares is None:
             sell_shares = pos.shares

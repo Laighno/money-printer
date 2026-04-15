@@ -206,18 +206,34 @@ def _get_monthly_retrain_dates(panel: pd.DataFrame) -> List[pd.Timestamp]:
     return monthly.tolist()
 
 
-def _build_close_open_lookup(
+_ADV_PERIOD = 20   # days for rolling average daily value
+
+
+def _build_price_adv_lookup(
     bars_map: Dict[str, pd.DataFrame],
-) -> tuple[Dict, Dict]:
-    """Build (code,date)->price lookup dicts."""
+) -> tuple[Dict, Dict, Dict]:
+    """Build (code,date)->{close,open,adv} lookup dicts.
+
+    ADV (average daily value) is the 20-day rolling mean of ``amount``
+    ending the day BEFORE the trade date (no look-ahead).
+    """
     close_lk: Dict[tuple, float] = {}
     open_lk: Dict[tuple, float] = {}
+    adv_lk: Dict[tuple, float] = {}
     for code, df in bars_map.items():
+        df = df.sort_values("date").reset_index(drop=True)
         for _, row in df.iterrows():
             d = row["date"]
             close_lk[(code, d)] = float(row["close"])
             open_lk[(code, d)] = float(row["open"])
-    return close_lk, open_lk
+        if "amount" in df.columns:
+            # shift(1) so that ADV on day D uses amounts from D-20..D-1
+            rolling_adv = df["amount"].rolling(_ADV_PERIOD, min_periods=5).mean().shift(1)
+            for i, row in df.iterrows():
+                v = rolling_adv.iloc[i]
+                if not pd.isna(v) and v > 0:
+                    adv_lk[(code, row["date"])] = float(v)
+    return close_lk, open_lk, adv_lk
 
 
 def run_walk_forward():
@@ -236,7 +252,7 @@ def run_walk_forward():
     # 2. Data
     bars_map = _load_or_fetch_bars(codes)
     panel = _load_or_build_factors(bars_map, codes)
-    close_lk, open_lk = _build_close_open_lookup(bars_map)
+    close_lk, open_lk, adv_lk = _build_price_adv_lookup(bars_map)
 
     # All trading dates in the BT window
     bt_start_ts = pd.Timestamp(BT_START)
@@ -294,7 +310,10 @@ def run_walk_forward():
     # ────────────────────────────────────────────────────────────────────────
 
     # 3. Simulation state
-    fees = FeeSchedule(slippage_bps=SLIPPAGE_BPS, commission_bps=COMMISSION_BPS)
+    fees = FeeSchedule(slippage_bps=SLIPPAGE_BPS, commission_bps=COMMISSION_BPS,
+                       use_sqrt_impact=True, impact_alpha_bps=150.0, min_slippage_bps=3.0)
+    logger.info("Slippage model: sqrt-impact α={} bps, floor={} bps (fallback linear={} bps)",
+                fees.impact_alpha_bps, fees.min_slippage_bps, fees.slippage_bps)
     broker = SimulatedBroker(INITIAL_CAPITAL, fees, silent=True)
     nav_records: List[dict] = []
     monthly_returns: List[dict] = []
@@ -367,7 +386,8 @@ def run_walk_forward():
                 for code in list(broker.positions.keys()):
                     if code not in sel_codes:
                         sell_price = open_lk.get((code, dt), broker.positions[code].current_price)
-                        broker.sell(code, sell_price, date=dt_str)
+                        broker.sell(code, sell_price, date=dt_str,
+                                    adv=adv_lk.get((code, dt)))
 
                 # (c) Buy new / adjust positions (equal weight) at today's open
                 target_per_stock = broker.total_value / TOP_K
@@ -376,7 +396,9 @@ def run_walk_forward():
                     if price_raw is None or price_raw <= 0:
                         continue
                     broker.buy(code, price_raw, target_value=target_per_stock,
-                               date=dt_str, action="BUY (add)" if code in broker.positions else "BUY")
+                               date=dt_str,
+                               action="BUY (add)" if code in broker.positions else "BUY",
+                               adv=adv_lk.get((code, dt)))
 
                 logger.info("  Day {}: rebalanced → {} stocks, cash: {:,.0f}",
                             dt.strftime("%Y-%m-%d"), len(broker.positions), broker.cash)
