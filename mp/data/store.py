@@ -55,6 +55,17 @@ class DataStore:
                     PRIMARY KEY (code, report_date)
                 )
             """))
+            # Constituent snapshots: one row per (index, date, stock_code).
+            # Accumulates quarterly over time; used to build a time-varying
+            # backtest universe and mitigate survivorship bias.
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS constituent_snapshots (
+                    index_name TEXT NOT NULL,
+                    snapshot_date TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    PRIMARY KEY (index_name, snapshot_date, code)
+                )
+            """))
             conn.commit()
 
     # --- daily bars ---
@@ -96,7 +107,7 @@ class DataStore:
                     ])
                 conn.exec_driver_sql(
                     f"INSERT OR REPLACE INTO daily_bars VALUES {values_placeholder}",
-                    flat_values,
+                    tuple(flat_values),
                 )
                 written += len(chunk)
             conn.commit()
@@ -171,7 +182,7 @@ class DataStore:
                     ])
                 conn.exec_driver_sql(
                     f"INSERT OR REPLACE INTO industry_bars VALUES {values_placeholder}",
-                    flat_values,
+                    tuple(flat_values),
                 )
                 written += len(chunk)
             conn.commit()
@@ -294,6 +305,88 @@ class DataStore:
     def has_financial_data(self) -> bool:
         with self.engine.connect() as conn:
             return conn.execute(text("SELECT COUNT(*) FROM financial")).scalar() > 0
+
+    # --- constituent snapshots ---
+
+    def save_constituent_snapshot(
+        self,
+        index_name: str,
+        codes: list[str],
+        snapshot_date: str | None = None,
+    ) -> None:
+        """Persist a point-in-time index constituent list.
+
+        Parameters
+        ----------
+        index_name:
+            Short name, e.g. ``"hs300"``, ``"zz500"``.
+        codes:
+            List of 6-digit stock codes in the index on *snapshot_date*.
+        snapshot_date:
+            ISO date string ``"YYYY-MM-DD"``; defaults to today.
+        """
+        from datetime import date as _date
+        if snapshot_date is None:
+            snapshot_date = _date.today().isoformat()
+        if not codes:
+            return
+        with self.engine.connect() as conn:
+            for chunk_start in range(0, len(codes), 500):
+                chunk = codes[chunk_start:chunk_start + 500]
+                placeholders = ",".join(["(?,?,?)"] * len(chunk))
+                flat = []
+                for c in chunk:
+                    flat.extend([index_name, snapshot_date, c])
+                conn.exec_driver_sql(
+                    f"INSERT OR REPLACE INTO constituent_snapshots VALUES {placeholders}",
+                    tuple(flat),
+                )
+            conn.commit()
+        logger.info("Saved constituent snapshot: {} {} codes for {}", index_name, len(codes), snapshot_date)
+
+    def load_constituent_snapshot_at(
+        self,
+        index_name: str,
+        as_of_date: str,
+    ) -> list[str] | None:
+        """Return the most recent constituent list whose snapshot_date ≤ as_of_date.
+
+        Returns ``None`` if no snapshot exists on or before *as_of_date*.
+        """
+        with self.engine.connect() as conn:
+            best_date = conn.execute(
+                text("""
+                    SELECT MAX(snapshot_date) FROM constituent_snapshots
+                    WHERE index_name = :idx AND snapshot_date <= :asof
+                """),
+                {"idx": index_name, "asof": as_of_date},
+            ).scalar()
+            if best_date is None:
+                return None
+            rows = conn.execute(
+                text("""
+                    SELECT code FROM constituent_snapshots
+                    WHERE index_name = :idx AND snapshot_date = :d
+                    ORDER BY code
+                """),
+                {"idx": index_name, "d": best_date},
+            ).fetchall()
+        codes = [r[0] for r in rows]
+        logger.debug("Loaded {} constituent snapshot for {}: {} codes (as_of {})",
+                     index_name, best_date, len(codes), as_of_date)
+        return codes if codes else None
+
+    def list_constituent_snapshot_dates(self, index_name: str) -> list[str]:
+        """Return all snapshot dates stored for *index_name*, ascending."""
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT DISTINCT snapshot_date FROM constituent_snapshots
+                    WHERE index_name = :idx ORDER BY snapshot_date
+                """),
+                {"idx": index_name},
+            ).fetchall()
+        return [r[0] for r in rows]
 
 
 # ---------------------------------------------------------------------------

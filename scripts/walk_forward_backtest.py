@@ -38,7 +38,7 @@ os.chdir(_PROJECT_ROOT)
 from mp.account.broker import FeeSchedule, SimulatedBroker
 from mp.backtest.engine import calc_performance
 from mp.backtest.ml_backtest import _build_factor_panel, _prefetch_bars
-from mp.data.fetcher import get_daily_bars, get_index_constituents
+from mp.data.fetcher import get_daily_bars, get_index_constituents, get_index_constituents_at
 from mp.ml.dataset import (
     CURATED_COLUMNS,
     FACTOR_COLUMNS,
@@ -260,6 +260,39 @@ def run_walk_forward():
     # Trading calendar from panel for label_cutoff (Fix #3: avoid calendar-day approximation)
     _all_trade_dates = sorted(panel["date"].unique())
 
+    # ── Survivorship-bias mitigation: time-varying scoring universe ──────────
+    # Build a mapping from each retrain month to the index constituents that
+    # were known at that time (from accumulated constituent_snapshots in the DB).
+    # On the first ever run only today's snapshot exists, so all historical
+    # months fall back to the current list.  Over quarterly runs the DB
+    # accumulates snapshots and the mapping becomes increasingly accurate.
+    _current_codes_set = frozenset(codes)
+    _month_universe: Dict[pd.Period, frozenset] = {}
+    _snapshot_dates = []
+    try:
+        from mp.data.store import DataStore as _DS
+        _snapshot_dates = _DS().list_constituent_snapshot_dates(UNIVERSE)
+    except Exception:
+        pass
+    n_snapshots = len(_snapshot_dates)
+    if n_snapshots > 1:
+        logger.info("Found {} historical {} snapshots — using time-varying universe",
+                    n_snapshots, UNIVERSE)
+    else:
+        logger.warning(
+            "Only {} constituent snapshot(s) available for {} — "
+            "scoring universe uses current members throughout.  "
+            "Survivorship bias is present: stocks that left the index "
+            "before today are excluded from all historical periods.  "
+            "Re-run quarterly to accumulate snapshots.",
+            n_snapshots, UNIVERSE,
+        )
+    for rd in retrain_dates:
+        rd_str = rd.strftime("%Y-%m-%d")
+        snap = get_index_constituents_at(UNIVERSE, rd_str)
+        _month_universe[rd.to_period("M")] = frozenset(snap) if snap else _current_codes_set
+    # ────────────────────────────────────────────────────────────────────────
+
     # 3. Simulation state
     fees = FeeSchedule(slippage_bps=SLIPPAGE_BPS, commission_bps=COMMISSION_BPS)
     broker = SimulatedBroker(INITIAL_CAPITAL, fees, silent=True)
@@ -270,6 +303,7 @@ def run_walk_forward():
     current_month = None
     current_ranker: Optional[StockRanker] = None
     pending_selection: Optional[List[tuple]] = None  # signal from previous close
+    current_universe: frozenset = _current_codes_set  # updated at each retrain
 
     # 4. Main loop — retrain monthly, score & rebalance daily
     for step, dt in enumerate(trading_dates):
@@ -288,10 +322,17 @@ def run_walk_forward():
         # --- Monthly: retrain model on first trading day of each month ---
         if dt in retrain_set:
             logger.info("── Retrain: {} ──", dt.strftime("%Y-%m-%d"))
-            # Exclude last HORIZON trading days to prevent fwd_ret label leakage.
-            # fwd_ret[t] uses close[t+HORIZON], so rows with date >= dt - HORIZON
-            # have labels that peek into the out-of-sample period.
-            # Use actual trading calendar to go back HORIZON trading days (not calendar days)
+            # Update scoring universe for this month.
+            current_universe = _month_universe.get(dt_period, _current_codes_set)
+
+            # ── Label-cutoff logic (prevents fwd_ret leakage into test period) ──
+            # fwd_ret[t] = close[t + HORIZON] / close[t] - 1.
+            # A row at date D is safe to train on iff D + HORIZON < dt
+            # (i.e. the label uses only prices that pre-date the test period start).
+            # label_cutoff is the trading date at position (idx_of_dt - HORIZON),
+            # so every row with date < label_cutoff satisfies D + HORIZON < dt.
+            # The `< label_cutoff` strict inequality ensures the cutoff date
+            # itself (whose fwd_ret uses close[dt]) is also excluded.
             _dt_idx = bisect.bisect_right(_all_trade_dates, dt) - 1
             _cutoff_idx = max(0, _dt_idx - HORIZON)
             label_cutoff = _all_trade_dates[_cutoff_idx]
@@ -342,9 +383,13 @@ def run_walk_forward():
             pending_selection = None  # consumed
 
         # --- Step B: Score stocks at today's close, store as pending for tomorrow ---
+        # Filter to the universe that was known on this date to avoid look-ahead
+        # from index membership.  When only today's snapshot is available,
+        # current_universe == all current codes (no filtering effect).
         if current_ranker is not None and current_ranker.model is not None:
             today_df = panel_by_date.get(dt)
             if today_df is not None:
+                today_df = today_df[today_df["code"].isin(current_universe)]
                 today_valid = today_df.dropna(subset=core)
                 if not today_valid.empty:
                     codes_in = today_valid["code"].tolist()

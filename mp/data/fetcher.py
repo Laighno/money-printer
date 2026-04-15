@@ -99,6 +99,7 @@ def get_index_constituents(index: str = "hs300") -> list[str]:
         codes = df["成分券代码"].astype(str).str.zfill(6).tolist()
         logger.info(f"Got {len(codes)} stocks for {index} from CSIndex")
         cache_put("index_constituents", pd.DataFrame({"code": codes}), index=index)
+        _save_constituent_snapshot(index, codes)
         return codes
     except Exception as e:
         logger.warning(f"CSIndex constituents for {index} failed: {e}, trying eastmoney...")
@@ -113,6 +114,7 @@ def get_index_constituents(index: str = "hs300") -> list[str]:
         codes = top["code"].tolist()
         logger.warning(f"Using EM market-cap proxy for {index}: {len(codes)} stocks")
         cache_put("index_constituents", pd.DataFrame({"code": codes}), index=index)
+        _save_constituent_snapshot(index, codes)
         return codes
     except Exception as e:
         logger.warning(f"EM fallback for {index} also failed: {e}")
@@ -125,6 +127,40 @@ def get_index_constituents(index: str = "hs300") -> list[str]:
         return codes
 
     raise RuntimeError(f"All sources failed for index constituents: {index}")
+
+
+def _save_constituent_snapshot(index: str, codes: list[str]) -> None:
+    """Persist today's constituent list to the DB (best-effort, silent on failure)."""
+    try:
+        from .store import DataStore
+        DataStore().save_constituent_snapshot(index, codes)
+    except Exception as e:
+        logger.debug("Constituent snapshot save failed (non-critical): {}", e)
+
+
+def get_index_constituents_at(index: str, as_of_date: str) -> list[str] | None:
+    """Return the most recent stored constituent list for *index* on or before *as_of_date*.
+
+    Uses the ``constituent_snapshots`` table accumulated over successive runs.
+    Returns ``None`` when no snapshot predates *as_of_date* (e.g. first ever run).
+
+    Parameters
+    ----------
+    index:
+        ``"hs300"``, ``"zz500"``, or ``"zz1000"``.
+    as_of_date:
+        ISO date string ``"YYYY-MM-DD"`` or ``"YYYYMMDD"``.
+    """
+    # Normalise to YYYY-MM-DD
+    d = as_of_date.strip()
+    if len(d) == 8 and "-" not in d:
+        d = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    try:
+        from .store import DataStore
+        return DataStore().load_constituent_snapshot_at(index, d)
+    except Exception as e:
+        logger.debug("get_index_constituents_at failed: {}", e)
+        return None
 
 
 # ---------------------------------------------------------------------------
