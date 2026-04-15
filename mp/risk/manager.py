@@ -1,16 +1,14 @@
 """Risk manager - the module that keeps you alive.
 
-Core principle: risk management is about avoiding ruin, not maximizing returns.
+Architecture:
+- Portfolio: position bookkeeping and NAV accounting (no risk knowledge)
+- RiskGuard: pure risk rules — stop-loss, circuit breaker, position sizing
+- RiskManager: thin facade that owns both, preserves the original API
 
-Implements:
-1. Dynamic position sizing (inverse volatility weighting)
-2. Per-position stop-loss
-3. Portfolio-level max drawdown circuit breaker
-4. Entry/exit rules enforcement
+Core principle: risk management is about avoiding ruin, not maximizing returns.
 """
 
-from dataclasses import dataclass, field
-from datetime import date
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -49,13 +47,16 @@ class PositionState:
         return (self.current_price / self.peak_price - 1)
 
 
-class RiskManager:
-    def __init__(self, params: RiskParams | None = None, silent: bool = False):
-        self.params = params or RiskParams()
+# ---------------------------------------------------------------------------
+# Portfolio — position bookkeeping and NAV accounting
+# ---------------------------------------------------------------------------
+
+class Portfolio:
+    def __init__(self, silent: bool = False):
         self.positions: dict[str, PositionState] = {}
         self.nav_peak: float = 1.0
         self.nav_current: float = 1.0
-        self.circuit_breaker_active: bool = False
+        self._prev_prices: dict[str, float] = {}
         self.silent: bool = silent
 
     @property
@@ -64,77 +65,24 @@ class RiskManager:
             return 0.0
         return (self.nav_current / self.nav_peak - 1)
 
-    def calc_position_size(self, board_name: str, volatility_20d: float) -> float:
-        """Inverse-volatility position sizing.
-
-        Higher volatility -> smaller position. Targets a consistent risk contribution.
-        """
-        if volatility_20d <= 0 or np.isnan(volatility_20d):
-            return 0.0
-
-        # Target vol contribution per position
-        n_positions = max(len(self.positions) + 1, 1)
-        target_vol_per_pos = self.params.vol_target / np.sqrt(n_positions)
-
-        # Weight = target_vol / actual_vol, capped
-        raw_weight = target_vol_per_pos / (volatility_20d / 100)  # vol_20d is in percent
-        weight = min(raw_weight, self.params.max_position_pct)
-        weight = max(weight, 0.02)  # minimum 2%
-
-        return round(weight, 4)
-
-    def check_entry(self, board_name: str) -> tuple[bool, str]:
-        """Check if a new position can be entered."""
-        if self.circuit_breaker_active:
-            return False, "Circuit breaker active - max drawdown exceeded"
-
-        if len(self.positions) >= self.params.max_sectors:
-            return False, f"Max sectors ({self.params.max_sectors}) reached"
-
-        if board_name in self.positions:
-            return False, f"Already holding {board_name}"
-
-        return True, "OK"
-
-    def check_exit(self, board_name: str) -> tuple[bool, str]:
-        """Check if a position should be exited (stop-loss or trailing stop)."""
-        if board_name not in self.positions:
-            return False, "No position"
-
-        pos = self.positions[board_name]
-
-        # Hard stop-loss
-        if pos.pnl_pct <= -self.params.stop_loss_pct:
-            return True, f"Stop-loss triggered: {pos.pnl_pct:.2%} <= -{self.params.stop_loss_pct:.2%}"
-
-        # Trailing stop from peak
-        if pos.drawdown_from_peak <= -self.params.trailing_stop_pct:
-            return True, f"Trailing stop triggered: {pos.drawdown_from_peak:.2%} from peak"
-
-        return False, "Hold"
-
-    def update_prices(self, prices: dict[str, float]):
-        """Update current prices and check circuit breaker."""
+    def update_prices(self, prices: dict[str, float]) -> None:
+        """Update position prices and recalculate NAV incrementally."""
         for name, price in prices.items():
             if name in self.positions:
                 pos = self.positions[name]
                 pos.current_price = price
                 pos.peak_price = max(pos.peak_price, price)
 
-        # Update portfolio NAV (simplified)
-        total_pnl = sum(pos.pnl_pct * pos.weight for pos in self.positions.values())
-        self.nav_current = self.nav_peak * (1 + total_pnl)
+        daily_ret = 0.0
+        for pos in self.positions.values():
+            prev_p = self._prev_prices.get(pos.board_name, pos.entry_price)
+            if prev_p > 0 and pos.current_price > 0:
+                daily_ret += (pos.current_price / prev_p - 1) * pos.weight
+        self.nav_current *= (1 + daily_ret)
         self.nav_peak = max(self.nav_peak, self.nav_current)
+        self._prev_prices = {pos.board_name: pos.current_price for pos in self.positions.values()}
 
-        # Circuit breaker check
-        if self.portfolio_drawdown <= -self.params.max_drawdown_pct:
-            if not self.circuit_breaker_active:
-                if not self.silent:
-                    logger.warning(f"CIRCUIT BREAKER: Portfolio drawdown {self.portfolio_drawdown:.2%} exceeds limit")
-                self.circuit_breaker_active = True
-
-    def enter_position(self, board_name: str, price: float, weight: float, entry_date: str):
-        """Record a new position entry."""
+    def enter_position(self, board_name: str, price: float, weight: float, entry_date: str) -> None:
         self.positions[board_name] = PositionState(
             board_name=board_name,
             entry_price=price,
@@ -147,14 +95,12 @@ class RiskManager:
             logger.info(f"ENTER {board_name}: price={price:.2f}, weight={weight:.2%}, date={entry_date}")
 
     def exit_position(self, board_name: str, reason: str) -> PositionState | None:
-        """Record a position exit."""
         pos = self.positions.pop(board_name, None)
         if pos and not self.silent:
             logger.info(f"EXIT {board_name}: pnl={pos.pnl_pct:.2%}, reason={reason}")
         return pos
 
     def get_status(self) -> pd.DataFrame:
-        """Get current portfolio status as DataFrame."""
         if not self.positions:
             return pd.DataFrame(columns=["board_name", "entry_price", "current_price", "weight", "pnl_pct", "dd_from_peak", "entry_date"])
         rows = []
@@ -171,11 +117,115 @@ class RiskManager:
         return pd.DataFrame(rows)
 
     def get_summary(self) -> dict:
-        """Get risk summary."""
         return {
             "n_positions": len(self.positions),
             "total_weight": sum(p.weight for p in self.positions.values()),
             "portfolio_dd": f"{self.portfolio_drawdown:.2%}",
-            "circuit_breaker": self.circuit_breaker_active,
             "nav": f"{self.nav_current:.4f}",
         }
+
+
+# ---------------------------------------------------------------------------
+# RiskGuard — pure risk rules, no position state
+# ---------------------------------------------------------------------------
+
+class RiskGuard:
+    def __init__(self, params: RiskParams):
+        self.params = params
+        self.circuit_breaker_active: bool = False
+
+    def check_entry(self, board_name: str, positions: dict[str, PositionState]) -> tuple[bool, str]:
+        if self.circuit_breaker_active:
+            return False, "Circuit breaker active - max drawdown exceeded"
+        if len(positions) >= self.params.max_sectors:
+            return False, f"Max sectors ({self.params.max_sectors}) reached"
+        if board_name in positions:
+            return False, f"Already holding {board_name}"
+        return True, "OK"
+
+    def check_exit(self, board_name: str, positions: dict[str, PositionState]) -> tuple[bool, str]:
+        if board_name not in positions:
+            return False, "No position"
+        pos = positions[board_name]
+        if pos.pnl_pct <= -self.params.stop_loss_pct:
+            return True, f"Stop-loss triggered: {pos.pnl_pct:.2%} <= -{self.params.stop_loss_pct:.2%}"
+        if pos.drawdown_from_peak <= -self.params.trailing_stop_pct:
+            return True, f"Trailing stop triggered: {pos.drawdown_from_peak:.2%} from peak"
+        return False, "Hold"
+
+    def calc_position_size(self, n_current_positions: int, volatility_20d: float) -> float:
+        """Inverse-volatility position sizing."""
+        if volatility_20d <= 0 or np.isnan(volatility_20d):
+            return 0.0
+        n_positions = max(n_current_positions + 1, 1)
+        target_vol_per_pos = self.params.vol_target / np.sqrt(n_positions)
+        raw_weight = target_vol_per_pos / (volatility_20d / 100)
+        weight = min(raw_weight, self.params.max_position_pct)
+        weight = max(weight, 0.02)
+        return round(weight, 4)
+
+    def check_circuit_breaker(self, portfolio_drawdown: float, silent: bool = False) -> None:
+        if portfolio_drawdown <= -self.params.max_drawdown_pct:
+            if not self.circuit_breaker_active:
+                if not silent:
+                    logger.warning(f"CIRCUIT BREAKER: Portfolio drawdown {portfolio_drawdown:.2%} exceeds limit")
+                self.circuit_breaker_active = True
+
+
+# ---------------------------------------------------------------------------
+# RiskManager — facade that delegates to Portfolio + RiskGuard
+# ---------------------------------------------------------------------------
+
+class RiskManager:
+    def __init__(self, params: RiskParams | None = None, silent: bool = False):
+        self.params = params or RiskParams()
+        self._portfolio = Portfolio(silent=silent)
+        self._guard = RiskGuard(self.params)
+        self.silent = silent
+
+    @property
+    def positions(self) -> dict[str, PositionState]:
+        return self._portfolio.positions
+
+    @property
+    def nav_current(self) -> float:
+        return self._portfolio.nav_current
+
+    @property
+    def nav_peak(self) -> float:
+        return self._portfolio.nav_peak
+
+    @property
+    def circuit_breaker_active(self) -> bool:
+        return self._guard.circuit_breaker_active
+
+    @property
+    def portfolio_drawdown(self) -> float:
+        return self._portfolio.portfolio_drawdown
+
+    def update_prices(self, prices: dict[str, float]) -> None:
+        self._portfolio.update_prices(prices)
+        self._guard.check_circuit_breaker(self._portfolio.portfolio_drawdown, self.silent)
+
+    def enter_position(self, board_name: str, price: float, weight: float, entry_date: str) -> None:
+        self._portfolio.enter_position(board_name, price, weight, entry_date)
+
+    def exit_position(self, board_name: str, reason: str) -> PositionState | None:
+        return self._portfolio.exit_position(board_name, reason)
+
+    def check_entry(self, board_name: str) -> tuple[bool, str]:
+        return self._guard.check_entry(board_name, self._portfolio.positions)
+
+    def check_exit(self, board_name: str) -> tuple[bool, str]:
+        return self._guard.check_exit(board_name, self._portfolio.positions)
+
+    def calc_position_size(self, board_name: str, volatility_20d: float) -> float:
+        return self._guard.calc_position_size(len(self._portfolio.positions), volatility_20d)
+
+    def get_status(self) -> pd.DataFrame:
+        return self._portfolio.get_status()
+
+    def get_summary(self) -> dict:
+        summary = self._portfolio.get_summary()
+        summary["circuit_breaker"] = self._guard.circuit_breaker_active
+        return summary

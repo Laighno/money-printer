@@ -1,10 +1,18 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -c ':*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('mp/ml/dataset.py'\\).read\\(\\)\\); print\\('dataset.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('mp/ml/model.py'\\).read\\(\\)\\); print\\('model.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/daily_report.py'\\).read\\(\\)\\); print\\('daily_report.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('app.py OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('mp/ml/dataset.py'\\).read\\(\\)\\); print\\('dataset.py OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('mp/ml/model.py'\\).read\\(\\)\\); print\\('model.py OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('scripts/daily_report.py'\\).read\\(\\)\\); print\\('daily_report.py OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('app.py OK'\\)\")"
+    ],
     "additionalDirectories": [
       "/Users/laighno/laighno/money-printer/mp"
-    ],
-    "allow": [
-      "Bash(.venv/bin/python -c ':*)"
     ]
   }
 }

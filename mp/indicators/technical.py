@@ -178,6 +178,168 @@ def _interpret_vol_price_div(close: np.ndarray, volume: np.ndarray, window: int 
                   signal="neutral", detail=f"量价{p_chg:+.1f}%/{v_chg:.2f}x, 无明显背离")
 
 
+# === MACD Divergence (顶背离/底背离) ===
+
+def _find_local_extremes(arr: np.ndarray, window: int = 5) -> list[tuple[int, float]]:
+    """Find local maxima or minima indices within a 1-D array."""
+    peaks, troughs = [], []
+    for i in range(window, len(arr) - window):
+        if arr[i] == max(arr[i - window: i + window + 1]):
+            peaks.append((i, float(arr[i])))
+        if arr[i] == min(arr[i - window: i + window + 1]):
+            troughs.append((i, float(arr[i])))
+    return peaks, troughs
+
+
+def _interpret_macd_divergence(close: np.ndarray, fast: int = 12, slow: int = 26,
+                               sig: int = 9, lookback: int = 60) -> Signal:
+    """Detect MACD top/bottom divergence over recent `lookback` bars."""
+    n = len(close)
+    ema_fast = _ema(close, fast)
+    ema_slow = _ema(close, slow)
+    dif = ema_fast - ema_slow
+    start = slow - 1
+    dea = _ema(dif[start:], sig)
+    hist = 2 * (dif[start:] - dea)
+
+    # Align hist to close (hist is shorter by `start` bars)
+    full_hist = np.full(n, np.nan)
+    full_hist[start:] = hist
+
+    # Only look at recent window
+    begin = max(start, n - lookback)
+    c_seg = close[begin:]
+    h_seg = full_hist[begin:]
+
+    peaks_c, troughs_c = _find_local_extremes(c_seg)
+    peaks_h, troughs_h = _find_local_extremes(h_seg)
+
+    # Top divergence: price higher high + MACD lower high
+    if len(peaks_c) >= 2 and len(peaks_h) >= 2:
+        pc1, pc2 = peaks_c[-2], peaks_c[-1]
+        ph1, ph2 = peaks_h[-2], peaks_h[-1]
+        if pc2[1] > pc1[1] and ph2[1] < ph1[1]:
+            return Signal(dimension="技术指标", name="MACD背离", value=round(h_seg[-1], 3),
+                          signal="bearish", detail="顶背离: 价格创新高但MACD柱走低, 上涨动能衰减")
+
+    # Bottom divergence: price lower low + MACD higher low
+    if len(troughs_c) >= 2 and len(troughs_h) >= 2:
+        tc1, tc2 = troughs_c[-2], troughs_c[-1]
+        th1, th2 = troughs_h[-2], troughs_h[-1]
+        if tc2[1] < tc1[1] and th2[1] > th1[1]:
+            return Signal(dimension="技术指标", name="MACD背离", value=round(h_seg[-1], 3),
+                          signal="bullish", detail="底背离: 价格创新低但MACD柱走高, 下跌动能衰竭")
+
+    return Signal(dimension="技术指标", name="MACD背离", value=None,
+                  signal="neutral", detail="近期无明显MACD背离")
+
+
+# === Bollinger Squeeze (布林缩口/开口) ===
+
+def _interpret_bollinger_squeeze(close: np.ndarray, period: int = 20,
+                                 num_std: float = 2.0, lookback: int = 5) -> Signal:
+    """Detect Bollinger Band squeeze (narrowing) or expansion (widening)."""
+    n = len(close)
+    # Compute bandwidth for recent bars
+    bws = []
+    for i in range(max(0, n - lookback - 1), n):
+        seg = close[max(0, i - period + 1): i + 1]
+        if len(seg) < period:
+            continue
+        mid = seg.mean()
+        std = seg.std(ddof=0)
+        bw = (2 * num_std * std) / mid if mid > 0 else 0
+        bws.append(bw)
+
+    if len(bws) < 2:
+        return Signal(dimension="技术指标", name="布林缩口", value=None,
+                      signal="neutral", detail="数据不足")
+
+    curr_bw = bws[-1]
+    prev_bw = bws[0]
+    bw_chg = (curr_bw - prev_bw) / prev_bw if prev_bw > 0 else 0
+
+    # Historical percentile of current bandwidth
+    all_bws = []
+    for i in range(period, n):
+        seg = close[i - period + 1: i + 1]
+        mid = seg.mean()
+        std = seg.std(ddof=0)
+        all_bws.append((2 * num_std * std) / mid if mid > 0 else 0)
+
+    pct = sum(1 for b in all_bws if b < curr_bw) / len(all_bws) if all_bws else 0.5
+
+    if pct < 0.1:
+        return Signal(dimension="技术指标", name="布林缩口", value=round(curr_bw, 4),
+                      signal="bullish", detail=f"带宽{curr_bw:.4f}处于历史{pct:.0%}分位, 极度缩口, 变盘在即")
+    if pct < 0.25 and bw_chg < -0.1:
+        return Signal(dimension="技术指标", name="布林缩口", value=round(curr_bw, 4),
+                      signal="neutral", detail=f"带宽收窄中({bw_chg:+.0%}), 处于{pct:.0%}分位, 关注突破方向")
+    if pct > 0.9:
+        return Signal(dimension="技术指标", name="布林缩口", value=round(curr_bw, 4),
+                      signal="bearish", detail=f"带宽{curr_bw:.4f}处于历史{pct:.0%}分位, 极度开口, 波动率偏高")
+    if bw_chg > 0.3:
+        return Signal(dimension="技术指标", name="布林缩口", value=round(curr_bw, 4),
+                      signal="neutral", detail=f"布林开口扩张({bw_chg:+.0%}), 趋势展开中")
+
+    return Signal(dimension="技术指标", name="布林缩口", value=round(curr_bw, 4),
+                  signal="neutral", detail=f"带宽{curr_bw:.4f}, {pct:.0%}分位, 正常范围")
+
+
+# === MA Crossover & Alignment (均线金叉/死叉/多空排列) ===
+
+def _sma(data: np.ndarray, period: int) -> np.ndarray:
+    """Simple moving average."""
+    out = np.full_like(data, np.nan, dtype=float)
+    for i in range(period - 1, len(data)):
+        out[i] = data[i - period + 1: i + 1].mean()
+    return out
+
+
+def _interpret_ma_system(close: np.ndarray) -> Signal:
+    """Detect MA crossover and alignment using MA5/MA10/MA20/MA60."""
+    n = len(close)
+    ma5 = _sma(close, 5)
+    ma10 = _sma(close, 10)
+    ma20 = _sma(close, 20)
+
+    # Check MA5/MA20 crossover (recent 2 bars)
+    if n >= 21:
+        cross_bull = ma5[-2] <= ma20[-2] and ma5[-1] > ma20[-1]
+        cross_bear = ma5[-2] >= ma20[-2] and ma5[-1] < ma20[-1]
+    else:
+        cross_bull = cross_bear = False
+
+    # Check alignment
+    if n >= 60:
+        ma60 = _sma(close, 60)
+        bull_align = ma5[-1] > ma10[-1] > ma20[-1] > ma60[-1]
+        bear_align = ma5[-1] < ma10[-1] < ma20[-1] < ma60[-1]
+    elif n >= 20:
+        bull_align = ma5[-1] > ma10[-1] > ma20[-1]
+        bear_align = ma5[-1] < ma10[-1] < ma20[-1]
+        ma60 = None
+    else:
+        bull_align = bear_align = False
+        ma60 = None
+
+    if cross_bull:
+        return Signal(dimension="技术指标", name="均线系统", value=round(float(ma5[-1]), 2),
+                      signal="bullish", detail="MA5上穿MA20金叉" + (", 多头排列" if bull_align else ""))
+    if cross_bear:
+        return Signal(dimension="技术指标", name="均线系统", value=round(float(ma5[-1]), 2),
+                      signal="bearish", detail="MA5下穿MA20死叉" + (", 空头排列" if bear_align else ""))
+    if bull_align:
+        return Signal(dimension="技术指标", name="均线系统", value=round(float(ma5[-1]), 2),
+                      signal="bullish", detail="多头排列 (MA5>MA10>MA20" + (">MA60)" if ma60 is not None else ")"))
+    if bear_align:
+        return Signal(dimension="技术指标", name="均线系统", value=round(float(ma5[-1]), 2),
+                      signal="bearish", detail="空头排列 (MA5<MA10<MA20" + ("<MA60)" if ma60 is not None else ")"))
+
+    return Signal(dimension="技术指标", name="均线系统", value=round(float(ma5[-1]), 2),
+                  signal="neutral", detail="均线交织, 无明确方向")
+
+
 # === N-day New High / New Low ===
 
 def _interpret_new_high_low(close: np.ndarray, high: np.ndarray, low: np.ndarray) -> Signal:
@@ -271,5 +433,16 @@ def compute_all_technical_signals(
 
     if n >= 10:
         signals.append(_interpret_gaps(open_arr, high, low, close, lookback=10))
+
+    # --- New pattern signals ---
+
+    if n >= 60:
+        signals.append(_interpret_macd_divergence(close))
+
+    if n >= 30:
+        signals.append(_interpret_bollinger_squeeze(close))
+
+    if n >= 20:
+        signals.append(_interpret_ma_system(close))
 
     return signals

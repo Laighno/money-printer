@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from ..risk.manager import RiskManager, RiskParams
+from ..account.broker import FeeSchedule, SimulatedBroker
+from ..risk.manager import PositionState, RiskGuard, RiskParams
 from ..rotation.signals import generate_rotation_signals
 
 
@@ -20,7 +21,8 @@ def _get_rebalance_dates(dates: pd.DatetimeIndex, freq: str) -> list[pd.Timestam
     if freq == "daily":
         return dates.tolist()
     elif freq == "weekly":
-        return dates.to_series().groupby(dates.isocalendar().week).last().tolist()
+        iso = dates.isocalendar()
+        return dates.to_series().groupby([iso.year, iso.week]).last().tolist()
     elif freq == "monthly":
         return dates.to_series().groupby(dates.to_period("M")).last().tolist()
     else:
@@ -35,14 +37,35 @@ def _build_close_map(industry_bars: pd.DataFrame) -> dict[tuple[str, any], float
     ))
 
 
+
 def _precompute_signals(industry_bars: pd.DataFrame, rebalance_dates: set) -> dict:
-    """Pre-compute rotation signals for each rebalance date."""
+    """Pre-compute rotation signals for each rebalance date.
+
+    Uses data strictly before the rebalance date (date < dt) to avoid
+    look-ahead bias — signals should not include the rebalance day's close.
+    """
     signals_cache = {}
     sorted_dates = sorted(rebalance_dates)
     for dt in sorted_dates:
-        hist = industry_bars[industry_bars["date"] <= dt]
+        hist = industry_bars[industry_bars["date"] < dt]
         signals_cache[dt] = generate_rotation_signals(hist)
     return signals_cache
+
+
+def _build_risk_positions(broker: SimulatedBroker) -> dict[str, PositionState]:
+    """Bridge BrokerPosition → PositionState for RiskGuard checks."""
+    total = broker.total_value
+    return {
+        code: PositionState(
+            board_name=code,
+            entry_price=pos.avg_cost,
+            entry_date=pos.entry_date,
+            current_price=pos.current_price,
+            peak_price=pos.peak_price,
+            weight=pos.market_value / total if total > 0 else 0,
+        )
+        for code, pos in broker.positions.items()
+    }
 
 
 def run_backtest(
@@ -53,6 +76,8 @@ def run_backtest(
     close_map: dict | None = None,
     signals_cache: dict | None = None,
     silent: bool = False,
+    initial_capital: float = 1_000_000,
+    fees: FeeSchedule | None = None,
 ) -> pd.DataFrame:
     """Run industry rotation backtest.
 
@@ -63,6 +88,8 @@ def run_backtest(
         risk_params: risk management parameters
         close_map: pre-built close price lookup (optimization for repeated calls)
         signals_cache: pre-built signals per rebalance date (optimization for repeated calls)
+        initial_capital: starting cash for the broker
+        fees: fee schedule (defaults to zero fees for backward compatibility)
 
     Returns:
         DataFrame with date, daily_return, nav, cumulative_return
@@ -70,7 +97,12 @@ def run_backtest(
     if risk_params is None:
         risk_params = RiskParams(max_sectors=top_n)
 
-    risk_mgr = RiskManager(risk_params, silent=silent)
+    if fees is None:
+        fees = FeeSchedule(slippage_bps=0, commission_bps=0,
+                           stamp_tax_bps_old=0, stamp_tax_bps_new=0)
+
+    broker = SimulatedBroker(initial_capital, fees, silent=silent)
+    guard = RiskGuard(risk_params)
 
     all_dates = sorted(industry_bars["date"].unique())
     rebalance_dates = set(_get_rebalance_dates(pd.DatetimeIndex(all_dates), rebalance_freq))
@@ -82,45 +114,61 @@ def run_backtest(
         signals_cache = _precompute_signals(industry_bars, rebalance_dates)
 
     portfolio_returns = []
-    prev_date = None
+    prev_total: float | None = None
+    nav_peak: float = initial_capital
 
     for dt in all_dates:
         is_rebalance = dt in rebalance_dates
+        dt_str = str(dt.date()) if hasattr(dt, 'date') else str(dt)[:10]
 
-        # --- Daily: update prices and check stops ---
-        current_prices = {}
-        for board_name in list(risk_mgr.positions.keys()):
-            price = close_map.get((board_name, dt))
+        # --- 1. Update prices to today's close ---
+        close_prices = {}
+        for code in list(broker.positions.keys()):
+            price = close_map.get((code, dt))
             if price is not None:
-                current_prices[board_name] = price
+                close_prices[code] = price
+        if close_prices:
+            broker.update_prices(close_prices)
 
-        if current_prices:
-            risk_mgr.update_prices(current_prices)
+        # --- 2. Record daily return BEFORE any trading ---
+        if prev_total is not None and prev_total > 0:
+            day_return = broker.total_value / prev_total - 1
+            portfolio_returns.append({"date": dt, "daily_return": day_return})
 
-        # Check stop-loss / trailing stop for each position
-        for board_name in list(risk_mgr.positions.keys()):
-            should_exit, reason = risk_mgr.check_exit(board_name)
+        # --- 3. Check stops ---
+        risk_positions = _build_risk_positions(broker)
+        for code in list(risk_positions.keys()):
+            should_exit, reason = guard.check_exit(code, risk_positions)
             if should_exit:
-                risk_mgr.exit_position(board_name, reason)
+                sell_price = close_prices.get(code)
+                if sell_price and sell_price > 0:
+                    broker.sell(code, sell_price, date=dt_str)
 
-        # --- Rebalance: generate signals and rotate ---
-        if is_rebalance and not risk_mgr.circuit_breaker_active:
+        # --- 4. Update nav peak and circuit breaker ---
+        nav_peak = max(nav_peak, broker.total_value)
+        drawdown = broker.total_value / nav_peak - 1 if nav_peak > 0 else 0
+        guard.check_circuit_breaker(drawdown, silent)
+
+        # --- 5. Rebalance: signals use data < dt (no look-ahead); all execution at close ---
+        if is_rebalance and not guard.circuit_breaker_active:
             signals = signals_cache.get(dt)
             if signals is None:
-                hist = industry_bars[industry_bars["date"] <= dt]
+                hist = industry_bars[industry_bars["date"] < dt]
                 signals = generate_rotation_signals(hist)
 
-            # Target sectors: top N by composite score with positive score
             target_sectors = signals[signals["composite_score"] > 0].head(top_n).index.tolist()
 
-            # Exit sectors no longer in target
-            for board_name in list(risk_mgr.positions.keys()):
-                if board_name not in target_sectors:
-                    risk_mgr.exit_position(board_name, "Rotation: no longer in top-N")
+            # Sell rotated-out positions at close
+            for code in list(broker.positions.keys()):
+                if code not in target_sectors:
+                    sell_price = close_prices.get(code)
+                    if sell_price and sell_price > 0:
+                        broker.sell(code, sell_price, date=dt_str)
 
-            # Enter new sectors
+            # Buy new entries at close
+            risk_positions = _build_risk_positions(broker)
             for board_name in target_sectors:
-                can_enter, msg = risk_mgr.check_entry(board_name)
+                can_enter, msg = guard.check_entry(board_name, risk_positions)
                 if not can_enter:
                     continue
 
@@ -129,22 +177,11 @@ def run_backtest(
                     continue
 
                 vol = signals.loc[board_name, "volatility_20d"] if "volatility_20d" in signals.columns else 20.0
-                weight = risk_mgr.calc_position_size(board_name, vol)
-                risk_mgr.enter_position(board_name, price, weight, str(dt.date()))
+                weight = guard.calc_position_size(len(broker.positions), vol)
+                target_value = weight * broker.total_value
+                broker.buy(board_name, price, target_value=target_value, date=dt_str)
 
-        # --- Calc daily return ---
-        if prev_date is not None and risk_mgr.positions:
-            day_return = 0.0
-            for pos in risk_mgr.positions.values():
-                prev_price = close_map.get((pos.board_name, prev_date))
-                cur_price = close_map.get((pos.board_name, dt))
-                if prev_price and cur_price and prev_price > 0:
-                    stock_ret = (cur_price / prev_price - 1) * pos.weight
-                    day_return += stock_ret
-
-            portfolio_returns.append({"date": dt, "daily_return": day_return})
-
-        prev_date = dt
+        prev_total = broker.total_value
 
     result = pd.DataFrame(portfolio_returns)
     if not result.empty:
@@ -156,6 +193,8 @@ def run_backtest(
 def optimize_params(
     industry_bars: pd.DataFrame,
     metric: str = "sharpe",
+    initial_capital: float = 1_000_000,
+    fees: FeeSchedule | None = None,
 ) -> dict:
     """Grid search over parameter combinations, return the best set.
 
@@ -212,6 +251,8 @@ def optimize_params(
                             close_map=close_map,
                             signals_cache=signals_cache,
                             silent=True,
+                            initial_capital=initial_capital,
+                            fees=fees,
                         )
                         if result.empty:
                             continue

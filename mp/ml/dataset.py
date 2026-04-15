@@ -162,6 +162,40 @@ FUNDAMENTAL_COLUMNS: List[str] = [
 # All factor columns
 FACTOR_COLUMNS: List[str] = TECHNICAL_COLUMNS + FUNDAMENTAL_COLUMNS
 
+# Label column names
+EXCESS_LABEL = "excess_ret"
+
+# Curated factors selected by cross-sectional IC analysis (|ICIR| >= 0.15).
+# 34 noise factors removed — improves out-of-sample generalization.
+CURATED_COLUMNS: List[str] = [
+    # STRONG (|ICIR| >= 0.5)
+    "amihud_illiq",
+    # MODERATE (|ICIR| >= 0.3)
+    "vwap_dev",
+    # WEAK (0.15 <= |ICIR| < 0.3)
+    "amount_volatility",
+    "ma_alignment",
+    "close_ma60_dev",
+    "low_distance_60d",
+    "volume_volatility",
+    "mom_20d",
+    "volatility_20d",
+    "price_range_10d",
+    "upper_shadow",
+    "mom_accel",
+    "lower_shadow",
+    "turnover_5d",
+    "mom_60d",
+    "atr_14",
+    "obv_slope",
+    "gap_5d",
+    "rsi_14",
+    "close_ma20_dev",
+    "turnover_pctile",
+    "boll_bandwidth",
+    "intraday_intensity",
+]
+
 
 def _compute_technical_factors(
     close: np.ndarray,
@@ -305,36 +339,149 @@ def _align_fundamentals_to_dates(
     return result
 
 
+def _fetch_pe_pb_baidu(code: str) -> Dict[str, float]:
+    """Fetch latest PE(TTM) and PB from Baidu Finance (per-stock, ~0.5s each)."""
+    import akshare as ak
+    result: Dict[str, float] = {}
+    try:
+        pe_df = ak.stock_zh_valuation_baidu(symbol=code, indicator="市盈率(TTM)", period="近一年")
+        if not pe_df.empty:
+            result["pe_ttm"] = float(pe_df.iloc[-1]["value"])
+    except Exception:
+        pass
+    try:
+        pb_df = ak.stock_zh_valuation_baidu(symbol=code, indicator="市净率", period="近一年")
+        if not pb_df.empty:
+            result["pb"] = float(pb_df.iloc[-1]["value"])
+    except Exception:
+        pass
+    return result
+
+
 def _fetch_valuation_snapshot_map(codes: List[str]) -> Dict[str, Dict[str, float]]:
     """Fetch today's PE/PB/market_cap for live prediction (not training).
 
-    Tries EM first (fast, has PE/PB), falls back to Sina (slow, no PE/PB).
-    For small code lists, skips the full snapshot and fetches per-stock.
+    Uses SQLite cache (valuation table) for today's data first, then falls
+    back to API (EM → Sina → Baidu) for codes not yet cached. Successful
+    API results are written back to cache for subsequent calls.
     """
+    from datetime import date as _date
+    from mp.data.store import DataStore
+
+    today_str = _date.today().strftime("%Y-%m-%d")
+    store = DataStore()
     result: Dict[str, Dict[str, float]] = {}
 
-    # For small lists (<20 stocks), skip the 5500-stock full snapshot
-    if len(codes) < 20:
-        logger.info("Small code list ({}), fetching per-stock financials only", len(codes))
-        return result  # PE/PB will be NaN, but ROE/growth are more important anyway
-
+    # --- Step 1: load from SQLite cache ---
     try:
-        from mp.data.fetcher import get_valuation_snapshot
-        snap = get_valuation_snapshot()
-        if not snap.empty:
-            snap["code"] = snap["code"].astype(str).str.zfill(6)
-            code_set = set(codes)
-            for _, row in snap.iterrows():
+        cached = store.load_valuation(codes=codes, date_str=today_str)
+        if not cached.empty:
+            cached["code"] = cached["code"].astype(str).str.zfill(6)
+            for _, row in cached.iterrows():
                 code = row["code"]
-                if code in code_set:
-                    mv = row.get("total_mv")
-                    result[code] = {
-                        "pe_ttm": float(row["pe_ttm"]) if pd.notna(row.get("pe_ttm")) else np.nan,
-                        "pb": float(row["pb"]) if pd.notna(row.get("pb")) else np.nan,
-                        "total_mv_log": float(np.log(mv)) if pd.notna(mv) and mv > 0 else np.nan,
-                    }
+                mv = row.get("total_mv")
+                entry = {
+                    "pe_ttm": float(row["pe_ttm"]) if pd.notna(row.get("pe_ttm")) else np.nan,
+                    "pb": float(row["pb"]) if pd.notna(row.get("pb")) else np.nan,
+                    "total_mv_log": float(np.log(mv)) if pd.notna(mv) and mv > 0 else np.nan,
+                }
+                # Only use cache if PE/PB are actually present
+                if not np.isnan(entry["pe_ttm"]) or not np.isnan(entry["pb"]):
+                    result[code] = entry
+            if result:
+                logger.info("Valuation cache hit: {}/{} stocks from SQLite", len(result), len(codes))
     except Exception as e:
-        logger.warning("Valuation snapshot failed: {}", e)
+        logger.debug("Valuation cache read failed: {}", e)
+
+    # --- Step 2: API fetch for codes not in cache ---
+    uncached = [c for c in codes if c not in result]
+    api_fetched: Dict[str, Dict[str, float]] = {}
+
+    if uncached:
+        try:
+            from mp.data.fetcher import get_valuation_snapshot
+            snap = get_valuation_snapshot()
+            if not snap.empty:
+                snap["code"] = snap["code"].astype(str).str.zfill(6)
+                uncached_set = set(uncached)
+                for _, row in snap.iterrows():
+                    code = row["code"]
+                    if code in uncached_set:
+                        mv = row.get("total_mv")
+                        entry = {
+                            "pe_ttm": float(row["pe_ttm"]) if pd.notna(row.get("pe_ttm")) else np.nan,
+                            "pb": float(row["pb"]) if pd.notna(row.get("pb")) else np.nan,
+                            "total_mv_log": float(np.log(mv)) if pd.notna(mv) and mv > 0 else np.nan,
+                        }
+                        result[code] = entry
+                        api_fetched[code] = {
+                            "pe_ttm": entry["pe_ttm"],
+                            "pb": entry["pb"],
+                            "total_mv": float(mv) if pd.notna(mv) else np.nan,
+                        }
+        except Exception as e:
+            logger.warning("Valuation snapshot failed: {}", e)
+
+    # --- Step 3: Baidu fallback for codes missing PE/PB ---
+    # Raised limit: use concurrent fetch for large batches (no longer cap at 20)
+    missing_pepb = [c for c in codes if
+                    c not in result or
+                    np.isnan(result[c].get("pe_ttm", np.nan)) or
+                    np.isnan(result[c].get("pb", np.nan))]
+    if missing_pepb:
+        logger.info("Baidu fallback: fetching PE/PB for {} stocks (concurrent)", len(missing_pepb))
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+        def _baidu_one(code):
+            return code, _fetch_pe_pb_baidu(code)
+        workers = min(15, len(missing_pepb))
+        with ThreadPoolExecutor(max_workers=workers) as _pool:
+            futs = {_pool.submit(_baidu_one, c): c for c in missing_pepb}
+            for fut in _as_completed(futs):
+                code, baidu = fut.result()
+                if not baidu:
+                    continue
+                if code not in result:
+                    result[code] = {"pe_ttm": np.nan, "pb": np.nan, "total_mv_log": np.nan}
+                if "pe_ttm" in baidu:
+                    result[code]["pe_ttm"] = baidu["pe_ttm"]
+                if "pb" in baidu:
+                    result[code]["pb"] = baidu["pb"]
+                if code not in api_fetched:
+                    api_fetched[code] = {"pe_ttm": np.nan, "pb": np.nan, "total_mv": np.nan}
+                if "pe_ttm" in baidu:
+                    api_fetched[code]["pe_ttm"] = baidu["pe_ttm"]
+                if "pb" in baidu:
+                    api_fetched[code]["pb"] = baidu["pb"]
+        baidu_ok = sum(1 for c in missing_pepb if c in result and not np.isnan(result[c].get("pe_ttm", np.nan)))
+        logger.info("Baidu PE/PB: {}/{} recovered", baidu_ok, len(missing_pepb))
+
+    # --- Step 4: write back newly fetched data to SQLite cache ---
+    # Only persist entries that have at least PE or PB — never cache NULL PE/PB rows,
+    # as that would poison the cache and block future real-data fetches.
+    if api_fetched:
+        try:
+            rows = []
+            for code, vals in api_fetched.items():
+                pe = vals.get("pe_ttm", np.nan)
+                pb = vals.get("pb", np.nan)
+                if np.isnan(pe) and np.isnan(pb):
+                    continue  # skip: no useful valuation data to cache
+                rows.append({
+                    "code": code,
+                    "date": today_str,
+                    "name": "",
+                    "close": np.nan,
+                    "pe_ttm": pe,
+                    "pb": pb,
+                    "total_mv": vals.get("total_mv", np.nan),
+                })
+            if rows:
+                cache_df = pd.DataFrame(rows)
+                store.save_valuation(cache_df)
+                logger.info("Valuation cache saved: {} stocks for {}", len(rows), today_str)
+        except Exception as e:
+            logger.warning("Valuation cache write failed: {}", e)
+
     return result
 
 
@@ -345,6 +492,7 @@ def _process_single_stock(
     horizon: Optional[int],
     fin_hist: Optional[pd.DataFrame] = None,
     valuation_row: Optional[Dict[str, float]] = None,
+    intraday_bar: Optional[Dict] = None,
 ) -> Optional[pd.DataFrame]:
     """Fetch bars and build factor rows for one stock.
 
@@ -373,6 +521,23 @@ def _process_single_stock(
 
     df = df.sort_values("date").reset_index(drop=True)
 
+    # Inject intraday partial bar (e.g. morning session data for midday report)
+    if intraday_bar is not None:
+        today_dt = pd.Timestamp(intraday_bar["date"])
+        df = df[df["date"] < today_dt]  # remove any stale today row
+        today_row = pd.DataFrame([{
+            "code": code,
+            "date": today_dt,
+            "open": intraday_bar["open"],
+            "high": intraday_bar["high"],
+            "low": intraday_bar["low"],
+            "close": intraday_bar["close"],
+            "volume": intraday_bar["volume"],
+            "amount": intraday_bar["amount"],
+            "turnover": float("nan"),
+        }])
+        df = pd.concat([df, today_row], ignore_index=True)
+
     close = df["close"].values.astype(float)
     high = df["high"].values.astype(float)
     low = df["low"].values.astype(float)
@@ -397,6 +562,16 @@ def _process_single_stock(
     for col in FUNDAMENTAL_COLUMNS:
         result[col] = fund_aligned[col]
 
+    # Derive total_mv_log from daily bars (close * volume / turnover).
+    # Only overwrite the valuation-cache value when the bar-derived estimate is valid;
+    # Sina daily bars lack turnover, so we fall back to the cached total_mv_log
+    # rather than replacing it with NaN.
+    valid_t = turnover > 0
+    float_mv = np.where(valid_t, close * volume / turnover, np.nan)
+    bars_mv_log = np.where(float_mv > 0, np.log(float_mv), np.nan)
+    cached_mv_log = result["total_mv_log"].values.copy()
+    result["total_mv_log"] = np.where(~np.isnan(bars_mv_log), bars_mv_log, cached_mv_log)
+
     # --- forward return (optional) ---
     if horizon is not None:
         n = len(close)
@@ -407,6 +582,47 @@ def _process_single_stock(
         result["fwd_ret"] = fwd
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Benchmark (ZZ500) forward returns
+# ---------------------------------------------------------------------------
+
+def _compute_benchmark_fwd_ret(
+    dates: pd.Series, horizon: int = 20
+) -> pd.DataFrame:
+    """Compute ZZ500 forward return for each trading date.
+
+    Returns DataFrame with columns ``date`` and ``bench_fwd_ret``, one row per
+    unique date in *dates*.
+    """
+    import akshare as ak
+
+    idx = ak.stock_zh_index_daily(symbol="sh000905")
+    idx["date"] = pd.to_datetime(idx["date"])
+    idx = idx.sort_values("date").reset_index(drop=True)
+    close = idx.set_index("date")["close"]
+
+    unique_dates = pd.Series(sorted(dates.unique()))
+    bench = []
+    for dt in unique_dates:
+        # Find the closest date <= dt in the index
+        mask = close.index <= dt
+        if not mask.any():
+            bench.append({"date": dt, "bench_fwd_ret": np.nan})
+            continue
+        t_close = close.loc[mask].iloc[-1]
+
+        # Forward date: find the trading date ~horizon days ahead
+        future_mask = close.index > dt
+        future_closes = close.loc[future_mask]
+        if len(future_closes) < horizon:
+            bench.append({"date": dt, "bench_fwd_ret": np.nan})
+            continue
+        t_fwd_close = future_closes.iloc[horizon - 1]
+        bench.append({"date": dt, "bench_fwd_ret": t_fwd_close / t_close - 1.0})
+
+    return pd.DataFrame(bench)
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +709,18 @@ def build_dataset(
         dataset = dataset.dropna(subset=["fwd_ret"])
         logger.debug("Dropped {} tail rows (fwd_ret NaN)", before - len(dataset))
 
+    # Compute excess return (fwd_ret - ZZ500 fwd_ret)
+    if "fwd_ret" in dataset.columns and len(dataset) > 0:
+        try:
+            bench = _compute_benchmark_fwd_ret(dataset["date"], horizon=horizon)
+            dataset = dataset.merge(bench, on="date", how="left")
+            dataset[EXCESS_LABEL] = dataset["fwd_ret"] - dataset["bench_fwd_ret"]
+            dataset.drop(columns=["bench_fwd_ret"], inplace=True)
+            n_valid = dataset[EXCESS_LABEL].notna().sum()
+            logger.info("Excess return computed: {}/{} rows with valid bench", n_valid, len(dataset))
+        except Exception as e:
+            logger.warning("Failed to compute benchmark fwd_ret, excess_ret unavailable: {}", e)
+
     logger.info(
         "build_dataset complete: {} rows, {} stocks, {} factors, date range {} ~ {}",
         len(dataset),
@@ -504,11 +732,59 @@ def build_dataset(
     return dataset
 
 
+def add_excess_ret(df: pd.DataFrame, horizon: int = 20) -> pd.DataFrame:
+    """Add ``excess_ret`` column to a panel that already has ``fwd_ret``.
+
+    Useful for cached datasets (e.g. ``data/wf_cache/factors.parquet``) that
+    were built before benchmark subtraction was implemented.
+    """
+    if EXCESS_LABEL in df.columns:
+        logger.debug("excess_ret already present, skipping")
+        return df
+    if "fwd_ret" not in df.columns:
+        logger.warning("No fwd_ret column, cannot compute excess_ret")
+        return df
+    try:
+        bench = _compute_benchmark_fwd_ret(df["date"], horizon=horizon)
+        df = df.merge(bench, on="date", how="left")
+        df[EXCESS_LABEL] = df["fwd_ret"] - df["bench_fwd_ret"]
+        df.drop(columns=["bench_fwd_ret"], inplace=True)
+        logger.info("Added excess_ret to {} rows", df[EXCESS_LABEL].notna().sum())
+    except Exception as e:
+        logger.warning("Failed to add excess_ret: {}", e)
+    return df
+
+
+def filter_universe(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove noisy samples: extreme illiquidity and micro-cap.
+
+    Drops the top 5 % by ``amihud_illiq`` and bottom 5 % by ``total_mv_log``
+    within each date cross-section.  These are per-date cutoffs so the filter
+    adapts to changing market conditions.
+    """
+    n_before = len(df)
+
+    # 1. Extreme illiquidity (top 5 % per date)
+    if "amihud_illiq" in df.columns and df["amihud_illiq"].notna().any():
+        thr = df.groupby("date")["amihud_illiq"].transform(lambda x: x.quantile(0.95))
+        df = df[df["amihud_illiq"] <= thr].reset_index(drop=True)
+
+    # 2. Micro-cap (bottom 5 % per date)
+    if "total_mv_log" in df.columns and df["total_mv_log"].notna().any():
+        thr = df.groupby("date")["total_mv_log"].transform(lambda x: x.quantile(0.05))
+        df = df[df["total_mv_log"] >= thr].reset_index(drop=True)
+
+    logger.info("filter_universe: {} → {} rows ({} removed)",
+                n_before, len(df), n_before - len(df))
+    return df
+
+
 def build_latest_features(
     codes: List[str],
     start: str = "20230101",
     include_fundamentals: bool = True,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    intraday_bars: Optional[Dict[str, Dict]] = None,
 ) -> pd.DataFrame:
     """Return the latest feature row per stock for live prediction.
 
@@ -538,8 +814,10 @@ def build_latest_features(
         try:
             fin_hist = fin_hist_map.get(code) if include_fundamentals else None
             val_row = valuation_map.get(code) if include_fundamentals else None
+            bar = intraday_bars.get(code) if intraday_bars else None
             part = _process_single_stock(code, start, None, horizon=None,
-                                         fin_hist=fin_hist, valuation_row=val_row)
+                                         fin_hist=fin_hist, valuation_row=val_row,
+                                         intraday_bar=bar)
             if part is not None:
                 clean = part.dropna(subset=core_cols)
                 if not clean.empty:
@@ -558,5 +836,19 @@ def build_latest_features(
         return pd.DataFrame()
 
     result = pd.concat(rows, ignore_index=True)
+
+    # --- Data quality warnings: flag missing fundamental columns per row ---
+    def _make_warning(row):
+        missing = [c for c in FUNDAMENTAL_COLUMNS if pd.isna(row.get(c))]
+        return ",".join(missing) if missing else ""
+    result["_data_warnings"] = result.apply(_make_warning, axis=1)
+    n_warn = (result["_data_warnings"] != "").sum()
+    # Store global data quality ratio in DataFrame attrs
+    result.attrs["_data_quality"] = 1.0 - (n_warn / len(result)) if len(result) > 0 else 0.0
+    if n_warn > 0:
+        logger.warning("⚠ {}/{} 股票存在基本面数据缺失，预测可能不准", n_warn, len(result))
+    if n_warn > len(result) * 0.5:
+        logger.warning("⚠ 超过50%股票缺少基本面数据(PE/PB等)，数据源可能异常")
+
     logger.info("build_latest_features complete: {} stocks, {} factors", len(result), len(FACTOR_COLUMNS))
     return result

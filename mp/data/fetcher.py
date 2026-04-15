@@ -342,18 +342,52 @@ def _get_industry_constituents_em(board_name: str) -> pd.DataFrame:
 # === Stock bars ===
 
 def get_daily_bars(code: str, start: str, end: str | None = None) -> pd.DataFrame:
-    """Fetch daily OHLCV bars. Sina primary, eastmoney fallback."""
+    """Fetch daily OHLCV bars. Sina primary, eastmoney fallback, local DB supplement.
+
+    If the API returns data ending before what's in the local DB, the local DB
+    rows are appended so that manually-ingested bars (e.g. from Sina realtime)
+    are picked up by downstream feature computation.
+    """
     if end is None:
         end = date.today().strftime("%Y%m%d")
 
     # Try Sina first
+    df = None
     try:
-        return _get_daily_bars_sina(code, start, end)
+        df = _get_daily_bars_sina(code, start, end)
     except Exception as e:
         logger.debug(f"Sina bars for {code} failed: {e}, trying eastmoney...")
 
     # Fallback to eastmoney
-    return _get_daily_bars_em(code, start, end)
+    if df is None or df.empty:
+        try:
+            df = _get_daily_bars_em(code, start, end)
+        except Exception as e:
+            logger.debug(f"EM bars for {code} failed: {e}, trying local DB...")
+
+    # Supplement from local DB if API data is stale
+    try:
+        from mp.data.store import DataStore
+        store = DataStore()
+        db_df = store.load_bars(codes=[code], start=start, end=end)
+        if not db_df.empty:
+            db_df["date"] = pd.to_datetime(db_df["date"])
+            if df is None or df.empty:
+                return db_df
+            api_max = df["date"].max()
+            db_extra = db_df[db_df["date"] > api_max]
+            if not db_extra.empty:
+                # Align columns
+                cols = df.columns.tolist()
+                for c in cols:
+                    if c not in db_extra.columns:
+                        db_extra[c] = float("nan")
+                df = pd.concat([df, db_extra[cols]], ignore_index=True)
+                logger.debug(f"{code}: supplemented {len(db_extra)} bars from local DB")
+    except Exception as e:
+        logger.debug(f"DB supplement for {code} failed: {e}")
+
+    return df if df is not None else pd.DataFrame()
 
 
 def _code_to_sina(code: str) -> str:

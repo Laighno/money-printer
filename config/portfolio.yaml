@@ -1,27 +1,59 @@
-# 我的持仓 - 用于多维度信号监控
-# type: stock (A股个股) / board (行业板块) / us_stock (美股)
+# 我的持仓 - 用于多维度信号监控 + 盈亏跟踪
+# type: stock (A股个股) / board (行业板块) / us_stock (美股) / etf (场内ETF)
+# shares / avg_cost / entry_date: 可选，填写后 Tab4 显示浮动盈亏
+# 更新方式: 发券商截图给 Claude，自动识别并更新
+# 最后更新: 2026-04-15 (OCR截图识别)
 
 holdings:
-  - name: 方正电机
-    code: "002196"
-    type: stock
-    board: 电机
-
-  - name: 襄阳轴承
-    code: "000678"
-    type: stock
-    board: 汽车零部件
-
-  - name: 国防军工
-    code: null
-    type: board
-    board: 军工装备
-
-  - name: 华友钴业
-    code: "603799"
-    type: stock
-    board: 能源金属
-
-  - name: 理想汽车
-    code: "LI"
-    type: us_stock
+- name: 军工ETF
+  code: '512660'
+  type: stock
+  board: 军工装备
+  shares: 28500
+  avg_cost: 1.455
+  entry_date: ''
+- name: 豫园股份
+  code: '600655'
+  type: stock
+  board: ''
+  shares: 7000
+  avg_cost: 0.0
+  entry_date: ''
+- name: 粤电力A
+  code: 000539
+  type: stock
+  board: ''
+  shares: 1200
+  avg_cost: 5.42
+  entry_date: ''
+- name: 航天电器
+  code: '002025'
+  type: stock
+  board: ''
+  shares: 0
+  avg_cost: 78.62
+  entry_date: ''
+- name: 襄阳轴承
+  code: 000678
+  type: stock
+  board: 汽车零部件
+  shares: 0
+  avg_cost: 15.401
+  entry_date: ''
+- name: 海格通信
+  code: '002465'
+  type: stock
+  board: 通信设备
+  shares: 0
+  avg_cost: 14.96
+  entry_date: '2026-04-09'
+- name: 国防军工
+  code: null
+  type: board
+  board: 军工装备
+- name: 理想汽车
+  code: LI
+  type: us_stock
+  shares: 0
+  avg_cost: 0.0
+  entry_date: ''

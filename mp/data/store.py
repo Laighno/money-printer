@@ -60,6 +60,13 @@ class DataStore:
         df.to_sql("daily_bars", self.engine, if_exists="append", index=False, method="multi", chunksize=500)
         logger.info(f"Saved {len(df)} rows to daily_bars")
 
+    @staticmethod
+    def _normalize_date(d: str) -> str:
+        """Normalize YYYYMMDD to YYYY-MM-DD for consistent DB queries."""
+        if len(d) == 8 and "-" not in d:
+            return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        return d
+
     def load_bars(self, codes: list[str] | None = None, start: str | None = None, end: str | None = None) -> pd.DataFrame:
         query = "SELECT * FROM daily_bars WHERE 1=1"
         params: dict = {}
@@ -70,10 +77,10 @@ class DataStore:
                 params[f"c{i}"] = c
         if start:
             query += " AND date >= :start"
-            params["start"] = start
+            params["start"] = self._normalize_date(start)
         if end:
             query += " AND date <= :end"
-            params["end"] = end
+            params["end"] = self._normalize_date(end)
         query += " ORDER BY code, date"
         df = pd.read_sql(text(query), self.engine, params=params)
         if not df.empty:

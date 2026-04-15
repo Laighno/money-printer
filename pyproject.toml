@@ -17,6 +17,9 @@ dependencies = [
     "pyyaml>=6.0",
     "schedule>=1.2",
     "requests>=2.31",
+    "lightgbm>=4.0",
+    "scipy>=1.11",
+    "pyarrow>=14.0",
 ]
 
 [project.optional-dependencies]

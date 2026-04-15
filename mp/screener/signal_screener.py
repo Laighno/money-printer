@@ -31,31 +31,29 @@ from mp.backtest.ic_analysis import (
 )
 
 
-# === Default IC weights (IR-based, from 3-stock backtested avg |IR(20d)|) ===
-# Weights proportional to |IR| = |IC_mean / IC_std|, not raw |IC_mean|.
-# IR penalizes inconsistent factors — a factor with lower IC but stable
-# predictions outweighs one with higher IC but noisy predictions.
+# === IC weights from ZZ500 cross-sectional analysis (N=100, 20d horizon, 2026-04-08) ===
+# Weights proportional to |IR| = |IC_mean / IC_std|, normalized to sum=0.73.
+# Source: scripts/batch_ic_analysis.py on 100 random ZZ500 stocks, start=20230101.
 #
-# ic_sign: -1 = mean-reversion (most A-share factors), +1 = trend-following
-# Factors with avg |IR| < 0.3 are excluded (布林%B变化: 0.22)
+# ic_sign: -1 = mean-reversion, +1 = trend-following
+# Factors with |IR| < 0.3 excluded (量能趋势: 0.239, 量价比: 0.232)
 
 _IC_FACTOR_CONFIG = {
-    # Level factors
-    "动量60d":   (0.103, -1),  # |IR|=1.20
-    "RSI(14)":   (0.102, -1),  # |IR|=1.18
-    "布林%B":    (0.083, -1),  # |IR|=0.96
-    "动量20d":   (0.078, -1),  # |IR|=0.90
-    "KDJ-J":     (0.071, -1),  # |IR|=0.82
-    "MACD柱":    (0.053, -1),  # |IR|=0.61
-    "波动率20d":  (0.039, -1),  # |IR|=0.45
-    "量价比":     (0.034, -1),  # |IR|=0.40
+    # Level factors — top 4 all have |IR| > 1.0, extremely consistent across stocks
+    "RSI(14)":   (0.127, -1),  # |IR|=1.319, IC>0=0%, N=100
+    "动量60d":   (0.119, -1),  # |IR|=1.235, IC>0=0%, N=100
+    "动量20d":   (0.108, -1),  # |IR|=1.125, IC>0=0%, N=100
+    "布林%B":    (0.101, -1),  # |IR|=1.052, IC>0=0%, N=100
+    "KDJ-J":     (0.068, -1),  # |IR|=0.706, IC>0=1%, N=100
+    "MACD柱":    (0.058, -1),  # |IR|=0.598, IC>0=2%, N=100
+    "波动率20d":  (0.032, -1),  # |IR|=0.328, IC>0=12%, N=100
     # Derivative factors
-    "MACD柱变化": (0.046, -1),  # |IR|=0.53
-    "RSI变化":   (0.042, -1),  # |IR|=0.49
-    "动量加速度":  (0.041, +1),  # |IR|=0.47, only positive-IC factor
-    "量能趋势":   (0.038, -1),  # |IR|=0.44
+    "动量加速度":  (0.066, +1),  # |IR|=0.685, IC>0=100%, N=100 — only trend-following factor
+    "RSI变化":   (0.047, -1),  # |IR|=0.484, IC>0=2%, N=100
+    "布林%B变化": (0.030, -1),  # |IR|=0.316, IC>0=21%, N=100 — newly included
+    "MACD柱变化": (0.029, -1),  # |IR|=0.300, IC>0=24%, N=100
 }
-# Sum of weights: 0.73, remaining ~0.27 for external signal vote
+# Sum of weights: 0.785, remaining ~0.215 for external signal vote
 
 
 def _compute_factor_values(close: np.ndarray, high: np.ndarray,
@@ -105,13 +103,15 @@ def _compute_factor_values(close: np.ndarray, high: np.ndarray,
         rsi_d = rolling_rsi_delta(close)
         values["RSI变化"] = float(rsi_d[-1]) if not np.isnan(rsi_d[-1]) else np.nan
 
+    if n >= 25:
+        boll_d = rolling_bollinger_pctb(close)
+        if len(boll_d) >= 6:
+            delta = boll_d[-1] - boll_d[-6]
+            values["布林%B变化"] = float(delta) if not np.isnan(delta) else np.nan
+
     if n >= 40:
         macd_d = rolling_macd_hist_delta(close)
         values["MACD柱变化"] = float(macd_d[-1]) if not np.isnan(macd_d[-1]) else np.nan
-
-    if n >= 20:
-        vol_trend = rolling_volume_trend(volume)
-        values["量能趋势"] = float(vol_trend[-1]) if not np.isnan(vol_trend[-1]) else np.nan
 
     return values
 
@@ -126,14 +126,13 @@ def _normalize_factor(name: str, value: float) -> float:
         "MACD柱":   (0.0, 1.0),     # center=0, scale=1
         "布林%B":   (0.5, 0.5),     # center=0.5, half-range=0.5 → %B 0→-1, %B 1→+1
         "KDJ-J":    (50.0, 50.0),   # center=50, half-range=50
-        "量价比":    (1.0, 0.5),     # center=1, half-range=0.5
         "动量20d":  (0.0, 0.15),    # center=0, half-range=15%
         "动量60d":  (0.0, 0.25),    # center=0, half-range=25%
         "波动率20d": (0.3, 0.2),    # center=0.3, half-range=0.2
         "动量加速度": (0.0, 0.10),   # center=0, half-range=10% → positive = recovering
         "RSI变化":  (0.0, 15.0),   # center=0, half-range=15 RSI points
         "MACD柱变化": (0.0, 0.5),   # center=0, half-range=0.5
-        "量能趋势":  (1.0, 0.5),    # center=1.0, half-range=0.5 → >1 = volume increasing
+        "布林%B变化": (0.0, 0.5),   # center=0, half-range=0.5 → delta over 5 days
     }
     center, scale = ranges.get(name, (0.0, 1.0))
     return max(-1.0, min(1.0, (value - center) / scale)) if scale > 0 else 0.0
