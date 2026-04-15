@@ -43,9 +43,12 @@ from mp.ml.dataset import (
     CURATED_COLUMNS,
     FACTOR_COLUMNS,
     FUNDAMENTAL_COLUMNS,
+    FUNDAMENTAL_TREND_COLUMNS,
+    INDUSTRY_RANK_COLUMNS,
     TECHNICAL_COLUMNS,
     _fetch_financial_history,
     _align_fundamentals_to_dates,
+    _add_industry_relative_features,
 )
 from mp.ml.model import FEATURE_COLS, StockRanker
 
@@ -138,7 +141,7 @@ def _load_or_build_factors(
         fin_hist = _fetch_financial_history(code)
         code_dates = panel.loc[mask, "date"]
         fund = _align_fundamentals_to_dates(code_dates, fin_hist, None)
-        for col in FUNDAMENTAL_COLUMNS:
+        for col in FUNDAMENTAL_COLUMNS + FUNDAMENTAL_TREND_COLUMNS:
             panel.loc[mask, col] = fund[col]
 
     # Compute forward returns for each stock
@@ -166,6 +169,20 @@ def _load_or_build_factors(
     # Drop warm-up NaN rows
     core_cols = TECHNICAL_COLUMNS[:13]
     panel = panel.dropna(subset=core_cols)
+
+    # Industry-relative ranking features
+    logger.info("Computing industry-relative ranking features...")
+    try:
+        from mp.data.fetcher import get_industry_mapping
+        code_to_industry = get_industry_mapping(universe=codes)
+        panel = _add_industry_relative_features(panel, code_to_industry)
+        n_ranked = panel["pe_ind_rank"].notna().sum()
+        logger.info("Industry rank features: {}/{} rows", n_ranked, len(panel))
+    except Exception as e:
+        logger.warning("Industry rank features failed, skipping: {}", e)
+        for col in INDUSTRY_RANK_COLUMNS:
+            if col not in panel.columns:
+                panel[col] = np.nan
 
     # Cache
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
