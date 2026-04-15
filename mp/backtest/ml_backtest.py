@@ -348,17 +348,27 @@ def run_ml_backtest(
     )
 
     # ------------------------------------------------------------------
-    # 4. Build close/open price lookup for fast access
+    # 4. Build close/open/adv price lookup for fast access
     # ------------------------------------------------------------------
     # close_lookup[(code, date)] -> close price
     # open_lookup[(code, date)]  -> open price
+    # adv_lookup[(code, date)]   -> 20-day rolling mean of amount (no look-ahead)
+    _ADV_PERIOD = 20
     close_lookup: dict[tuple[str, pd.Timestamp], float] = {}
     open_lookup: dict[tuple[str, pd.Timestamp], float] = {}
+    adv_lookup: dict[tuple[str, pd.Timestamp], float] = {}
     for code, df in bars_map.items():
+        df = df.sort_values("date").reset_index(drop=True)
         for _, row in df.iterrows():
             d = row["date"]
             close_lookup[(code, d)] = float(row["close"])
             open_lookup[(code, d)] = float(row["open"])
+        if "amount" in df.columns:
+            rolling_adv = df["amount"].rolling(_ADV_PERIOD, min_periods=5).mean().shift(1)
+            for i, row in df.iterrows():
+                v = rolling_adv.iloc[i]
+                if not pd.isna(v) and v > 0:
+                    adv_lookup[(code, row["date"])] = float(v)
 
     # ------------------------------------------------------------------
     # 5. Main simulation loop
@@ -366,7 +376,8 @@ def run_ml_backtest(
     # Portfolio state — unified broker handles cash, positions, fees, trade log
     broker = SimulatedBroker(
         initial_capital,
-        FeeSchedule(slippage_bps=slippage_bps, commission_bps=commission_bps),
+        FeeSchedule(slippage_bps=slippage_bps, commission_bps=commission_bps,
+                    use_sqrt_impact=True, impact_alpha_bps=150.0, min_slippage_bps=3.0),
         silent=True,
     )
 
@@ -387,7 +398,8 @@ def run_ml_backtest(
             for code in list(broker.positions.keys()):
                 if code not in target_map:
                     price = open_lookup.get((code, dt), broker.positions[code].current_price)
-                    broker.sell(code, price, date=dt, action="SELL (rebalance)")
+                    broker.sell(code, price, date=dt, action="SELL (rebalance)",
+                                adv=adv_lookup.get((code, dt)))
 
             # Adjust / enter positions at today's open
             portfolio_value = broker.total_value
@@ -397,6 +409,7 @@ def run_ml_backtest(
                 price = open_lookup.get((code, dt))
                 if price is None or price <= 0:
                     continue
+                adv = adv_lookup.get((code, dt))
 
                 if code in broker.positions:
                     current_value = broker.positions[code].shares * price
@@ -404,14 +417,17 @@ def run_ml_backtest(
                     if abs(delta_value) < price * LOT_SIZE * 0.5:
                         continue
                     if delta_value > 0:
-                        broker.buy(code, price, target_value=target_value, date=dt, action="BUY (rebalance adjust)")
+                        broker.buy(code, price, target_value=target_value, date=dt,
+                                   action="BUY (rebalance adjust)", adv=adv)
                     else:
-                        sell_exec = broker.fees.sell_exec_price(price)
+                        sell_exec = broker.fees.sell_exec_price(price, notional=abs(delta_value), adv=adv)
                         sell_shares = int(abs(delta_value) / sell_exec / LOT_SIZE) * LOT_SIZE
                         sell_shares = min(sell_shares, broker.positions[code].shares)
-                        broker.sell(code, price, shares=sell_shares, date=dt, action="SELL (rebalance adjust)")
+                        broker.sell(code, price, shares=sell_shares, date=dt,
+                                    action="SELL (rebalance adjust)", adv=adv)
                 else:
-                    broker.buy(code, price, target_value=target_value, date=dt, action="BUY (rebalance)")
+                    broker.buy(code, price, target_value=target_value, date=dt,
+                               action="BUY (rebalance)", adv=adv)
 
             pending_rebalance = None  # consumed
 
@@ -443,7 +459,8 @@ def run_ml_backtest(
                     stop_loss_pct is not None
                     and pos.current_price <= pos.avg_cost * (1 - stop_loss_pct)
                 ) else "trailing_stop"
-                broker.sell(code, pos.current_price, date=dt, action=f"SELL ({reason})")
+                broker.sell(code, pos.current_price, date=dt, action=f"SELL ({reason})",
+                            adv=adv_lookup.get((code, dt)))
 
         # --- 4. Generate signal at close, store as pending for T+1 open ---
         if dt in rebalance_dates_set:
