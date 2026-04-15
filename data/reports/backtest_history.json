@@ -1,0 +1,24 @@
+[
+  {
+    "date": "2026-04-15",
+    "bt_metrics": {
+      "total_return": "899.60%",
+      "annual_return": "46.81%",
+      "sharpe_ratio": "1.54",
+      "max_drawdown": "-40.04%",
+      "win_rate": "52.81%"
+    },
+    "bt_benchmark": {
+      "total_return": 0.4195,
+      "annual_return": 0.0602
+    },
+    "model_ic": {
+      "20d": null,
+      "60d": 0.154
+    },
+    "model_hit_rate": {
+      "20d": null,
+      "60d": 0.55
+    }
+  }
+]

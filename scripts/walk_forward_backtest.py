@@ -578,6 +578,67 @@ def update_production_models(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Backtest history (for run-over-run comparison)
+# ──────────────────────────────────────────────────────────────────────
+
+BACKTEST_HISTORY_PATH = Path("data/reports/backtest_history.json")
+_MAX_HISTORY = 10  # keep at most this many snapshots
+
+
+def _save_backtest_snapshot(
+    bt_metrics: dict,
+    bt_benchmark: Optional[dict],
+    model_results: dict,
+) -> None:
+    """Append current run metrics to the history file (max _MAX_HISTORY entries)."""
+    import json
+
+    snapshot = {
+        "date": date.today().isoformat(),
+        "bt_metrics": bt_metrics,
+        "bt_benchmark": bt_benchmark,
+        "model_ic": {
+            h: model_results.get(h, {}).get("cv_ic_mean")
+            for h in ("20d", "60d")
+        },
+        "model_hit_rate": {
+            h: model_results.get(h, {}).get("cv_hit_rate_mean")
+            for h in ("20d", "60d")
+        },
+    }
+
+    history: list = []
+    if BACKTEST_HISTORY_PATH.exists():
+        try:
+            history = json.loads(BACKTEST_HISTORY_PATH.read_text())
+        except Exception:
+            history = []
+
+    history.append(snapshot)
+    history = history[-_MAX_HISTORY:]  # trim oldest
+
+    BACKTEST_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BACKTEST_HISTORY_PATH.write_text(json.dumps(history, indent=2, ensure_ascii=False))
+    logger.info("Backtest snapshot saved to {}", BACKTEST_HISTORY_PATH)
+
+
+def _load_prev_backtest_snapshot() -> Optional[dict]:
+    """Return the second-to-last snapshot (i.e. the previous run), or None."""
+    import json
+
+    if not BACKTEST_HISTORY_PATH.exists():
+        return None
+    try:
+        history = json.loads(BACKTEST_HISTORY_PATH.read_text())
+        # last entry is current run (already saved), second-to-last is previous
+        if len(history) >= 2:
+            return history[-2]
+    except Exception:
+        pass
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Feishu notification
 # ──────────────────────────────────────────────────────────────────────
 
@@ -667,6 +728,56 @@ def send_model_update_report(
                 lines.append(f"- **超额收益(alpha)**: {excess:+.2%}")
         lines.append("")
 
+        # --- Comparison with previous run ---
+        prev = _load_prev_backtest_snapshot()
+        if prev:
+            prev_date = prev.get("date", "上次")
+            lines.append(f"## 与上次回测对比（{prev_date}）")
+            lines.append("")
+
+            def _delta_str(cur_raw, prev_raw, is_pct: bool = False) -> str:
+                """Format current value and delta vs previous."""
+                try:
+                    cur = float(str(cur_raw).rstrip("%")) / (100 if is_pct else 1)
+                    prv = float(str(prev_raw).rstrip("%")) / (100 if is_pct else 1)
+                    delta = cur - prv
+                    arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "↔")
+                    cur_str = f"{cur:.2%}" if is_pct else f"{cur:.2f}"
+                    prv_str = f"{prv:.2%}" if is_pct else f"{prv:.2f}"
+                    delta_str = f"{delta:+.2%}" if is_pct else f"{delta:+.2f}"
+                    return f"{prv_str} → {cur_str} ({arrow} {delta_str})"
+                except Exception:
+                    return str(cur_raw)
+
+            prev_bt = prev.get("bt_metrics", {})
+            cmp_map = [
+                ("annual_return", "年化收益", True),
+                ("sharpe_ratio",  "夏普比率", False),
+                ("max_drawdown",  "最大回撤", True),
+                ("win_rate",      "胜率",     True),
+            ]
+            for k, label, is_pct in cmp_map:
+                cur_v = bt_metrics.get(k)
+                prv_v = prev_bt.get(k)
+                if cur_v is not None and prv_v is not None:
+                    lines.append(f"- **{label}**: {_delta_str(cur_v, prv_v, is_pct)}")
+
+            # Model IC & HitRate comparison
+            for horizon, label in [("20d", "20日模型"), ("60d", "60日模型")]:
+                m = model_results.get(horizon, {})
+                cur_ic = m.get("cv_ic_mean")
+                cur_hr = m.get("cv_hit_rate_mean")
+                prv_ic = prev.get("model_ic", {}).get(horizon)
+                prv_hr = prev.get("model_hit_rate", {}).get(horizon)
+                parts = []
+                if cur_ic is not None and prv_ic is not None:
+                    parts.append(f"IC {_delta_str(cur_ic, prv_ic, False)}")
+                if cur_hr is not None and prv_hr is not None:
+                    parts.append(f"HitRate@10 {_delta_str(cur_hr, prv_hr, False)}")
+                if parts:
+                    lines.append(f"- **{label}**: {' | '.join(parts)}")
+            lines.append("")
+
     # --- Footer ---
     lines.append("---")
     lines.append(f"*Money Printer 自动生成 | {now}*")
@@ -732,6 +843,7 @@ if __name__ == "__main__":
             model_results = update_production_models(codes, ranker_20d=last_ranker)
             elapsed_min = (time.time() - t1) / 60
             logger.info("Production models updated! ({:.1f} min)", elapsed_min)
+            _save_backtest_snapshot(metrics, bt_benchmark, model_results)
             send_model_update_report(
                 model_results=model_results,
                 bt_metrics=metrics,
