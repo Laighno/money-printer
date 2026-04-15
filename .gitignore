@@ -12,3 +12,4 @@ data/cache/
 .DS_Store
 .ruff_cache/
 .pytest_cache/
+data/training_dataset*.parquet
