@@ -576,18 +576,24 @@ class BlendRanker:
         self.extreme = StockRanker(
             feature_cols=self.feature_cols,
             objective="regression",
-            label_col="fwd_ret",
+            label_col="excess_ret",   # market-neutral: stable spread across bull/bear
             lgb_params=extreme_params,
         )
 
     def _filter_extremes(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Keep only top/bottom ``extreme_pctile`` per date by fwd_ret."""
+        """Keep only top/bottom ``extreme_pctile`` per date by excess_ret.
+
+        Uses excess_ret (vs ZZ500 benchmark) instead of raw fwd_ret so the
+        extremes represent true relative winners/losers regardless of market
+        regime.  Falls back to fwd_ret if excess_ret is unavailable.
+        """
         pct = self.extreme_pctile
+        rank_col = "excess_ret" if "excess_ret" in df.columns else "fwd_ret"
 
         def _keep(g: pd.DataFrame) -> pd.DataFrame:
-            lo = g["fwd_ret"].quantile(pct)
-            hi = g["fwd_ret"].quantile(1 - pct)
-            return g[(g["fwd_ret"] <= lo) | (g["fwd_ret"] >= hi)]
+            lo = g[rank_col].quantile(pct)
+            hi = g[rank_col].quantile(1 - pct)
+            return g[(g[rank_col] <= lo) | (g[rank_col] >= hi)]
 
         return df.groupby("date", group_keys=False).apply(_keep)
 
@@ -595,15 +601,16 @@ class BlendRanker:
         """Train both component models.
 
         1. Primary model: trained on all data with ``primary_label``.
-        2. Extreme model: trained on top/bottom extremes with ``fwd_ret``.
+        2. Extreme model: trained on top/bottom extremes with ``excess_ret``.
         """
         # Primary (excess_ret)
         m1 = self.primary.train_fast(df, val_frac)
         logger.info("BlendRanker primary: IC={:.3f}", m1.get("ic", 0))
 
-        # Extreme
+        # Extreme — filter requires excess_ret; fall back to fwd_ret rows only
+        filter_col = "excess_ret" if "excess_ret" in df.columns else "fwd_ret"
         extreme_df = self._filter_extremes(
-            df[df["fwd_ret"].notna()].copy()
+            df[df[filter_col].notna()].copy()
         )
         m2 = self.extreme.train_fast(extreme_df, val_frac)
         logger.info("BlendRanker extreme: IC={:.3f}, train rows={}",
