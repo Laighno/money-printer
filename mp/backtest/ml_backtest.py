@@ -241,6 +241,7 @@ def run_ml_backtest(
     trailing_stop_pct: float | None = None,
     min_score: float | None = None,
     sizing: str = "equal",
+    hold_bonus_bps: float = 30.0,
     progress_callback: Callable | None = None,
 ) -> dict:
     """Run an individual-stock ML backtest.
@@ -274,6 +275,11 @@ def run_ml_backtest(
     sizing : str
         Position sizing method: ``"equal"``, ``"score_weighted"``, or
         ``"risk_parity"``.
+    hold_bonus_bps : float
+        Score bonus (in basis points, converted to score-space) added to
+        currently-held stocks before top-K selection.  This prevents
+        unnecessary turnover when a newcomer's expected alpha barely
+        exceeds round-trip trading costs.  Set to 0 to disable.
     progress_callback : callable or None
         ``callback(step, total, msg)`` for progress reporting.
 
@@ -489,6 +495,23 @@ def run_ml_backtest(
                 scored = list(zip(codes_in_features, scores))
                 if min_score is not None:
                     scored = [(c, s) for c, s in scored if s >= min_score]
+
+                # Apply hold bonus: currently-held stocks get a score bump
+                # so they are only replaced when the newcomer's edge
+                # exceeds estimated round-trip trading cost.
+                # Calibration: 1 score_std ≈ ~100 bps expected return spread,
+                # so hold_bonus_bps=30 → bonus = 0.3 * score_std.
+                if hold_bonus_bps > 0 and broker.positions:
+                    held = set(broker.positions.keys())
+                    raw_scores = np.array([s for _, s in scored])
+                    if len(raw_scores) > 1:
+                        score_std = float(np.std(raw_scores))
+                        bonus = score_std * hold_bonus_bps / 100
+                        scored = [
+                            (c, s + bonus) if c in held else (c, s)
+                            for c, s in scored
+                        ]
+
                 scored.sort(key=lambda x: -x[1])
 
                 selected = scored[:top_k]
