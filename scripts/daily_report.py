@@ -224,14 +224,23 @@ def evaluate_holdings(ranker, regime: MarketRegime | None = None, intraday_bars:
     result = result.sort_values("ml_score", ascending=False).reset_index(drop=True)
 
     if is_rank:
-        # Percentile thresholds with regime shift (±5pp per unit of regime.score)
-        shift = regime.score * 0.05 if regime else 0.0
+        # Percentile thresholds with regime shift (±10pp per unit of regime.score)
+        # Larger shift so a bear market (score=-1) moves all thresholds up 10pp,
+        # preventing the ranker from recommending "持有" for bottom-half stocks.
+        shift = regime.score * 0.10 if regime else 0.0
+
+        # Hard floor: in confirmed bear market (score < -0.5) nothing below top-40%
+        # gets "持有" — BlendRanker only ranks relative performance; regime supplies
+        # the "should we be in the market at all" dimension.
+        bear_floor = (regime is not None and regime.score < -0.5)
 
         def suggest(rank):
+            if rank is None or (hasattr(rank, '__class__') and rank != rank):  # nan
+                return "减仓"
             if rank > 0.85 - shift:
                 return "加仓"
             elif rank > 0.55 - shift:
-                return "持有"
+                return "持有" if not bear_floor else "减仓"
             elif rank > 0.25 - shift:
                 return "减仓"
             else:
