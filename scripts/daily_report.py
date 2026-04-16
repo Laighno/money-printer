@@ -224,30 +224,42 @@ def evaluate_holdings(ranker, regime: MarketRegime | None = None, intraday_bars:
     result = result.sort_values("ml_score", ascending=False).reset_index(drop=True)
 
     if is_rank:
-        # Percentile thresholds with regime shift (±10pp per unit of regime.score)
-        # Larger shift so a bear market (score=-1) moves all thresholds up 10pp,
-        # preventing the ranker from recommending "持有" for bottom-half stocks.
-        shift = regime.score * 0.10 if regime else 0.0
+        # ── Absolute-return based recommendation ─────────────────────────────
+        # BlendRanker predicts excess_ret (market-relative); to answer "should
+        # I hold this stock?" we need estimated absolute return:
+        #
+        #   effective_ret = predicted_excess_ret + benchmark_expected_ret
+        #
+        # benchmark_expected_ret is estimated from RegimeDetector's composite
+        # score scaled by BENCH_MONTHLY_ADJ (≈ ZZ500 monthly vol / 2):
+        #   score=+1 (bull)  → +3%/month expected
+        #   score= 0 (flat)  →  0%
+        #   score=-1 (bear)  → -3%/month expected
+        #
+        # This lets the model independently judge individual stocks while
+        # naturally reflecting market conditions:
+        #   bear + stock excess +5% → abs +2% → 持有  ✓ (alpha overcomes tide)
+        #   bear + stock excess +1% → abs -2% → 减仓  ✓ (market drag dominates)
+        BENCH_MONTHLY_ADJ = 0.03   # 3% per unit of regime score
+        bench_adj = (regime.score if regime else 0.0) * BENCH_MONTHLY_ADJ
 
-        # Hard floor: in confirmed bear market (score < -0.5) nothing below top-40%
-        # gets "持有" — BlendRanker only ranks relative performance; regime supplies
-        # the "should we be in the market at all" dimension.
-        bear_floor = (regime is not None and regime.score < -0.5)
+        result["effective_return"] = result["raw_return"] + bench_adj
 
-        def suggest(rank):
-            if rank is None or (hasattr(rank, '__class__') and rank != rank):  # nan
+        def suggest(eff):
+            import math
+            if eff is None or (isinstance(eff, float) and math.isnan(eff)):
                 return "减仓"
-            if rank > 0.85 - shift:
+            if eff > 0.04:
                 return "加仓"
-            elif rank > 0.55 - shift:
-                return "持有" if not bear_floor else "减仓"
-            elif rank > 0.25 - shift:
+            elif eff > 0.00:
+                return "持有"
+            elif eff > -0.03:
                 return "减仓"
             else:
                 return "清仓"
 
-        result["suggestion"] = result["rank_pct"].apply(suggest)
-        result["predicted_return"] = (result["raw_return"] * 100).round(2)
+        result["suggestion"] = result["effective_return"].apply(suggest)
+        result["predicted_return"] = (result["effective_return"] * 100).round(2)
     else:
         # Original return-based thresholds with regime shift (±2pp)
         shift = regime.score * 0.02 if regime else 0.0
