@@ -92,6 +92,16 @@ class FeeSchedule:
             return self.stamp_tax_bps_new
         return self.stamp_tax_bps_old
 
+    def buy_cost_bps(self, notional: float | None = None, adv: float | None = None) -> float:
+        """One-way buy cost in bps: slippage + commission."""
+        return self._slippage_bps(notional, adv) + self.commission_bps
+
+    def sell_cost_bps(
+        self, date: str = "", notional: float | None = None, adv: float | None = None,
+    ) -> float:
+        """One-way sell cost in bps: slippage + commission + stamp tax."""
+        return self._slippage_bps(notional, adv) + self.commission_bps + self._stamp_tax_bps(date)
+
 
 LOT_SIZE = 100
 

@@ -224,6 +224,81 @@ def _calc_weights(
 
 
 # ---------------------------------------------------------------------------
+# Cost-aware stock selection
+# ---------------------------------------------------------------------------
+
+def _cost_aware_select(
+    scored: list[tuple[str, float]],
+    top_k: int,
+    broker,
+    dt,
+    adv_lookup: dict,
+) -> list[tuple[str, float]]:
+    """Select top-K stocks, keeping held positions unless the newcomer's
+    predicted excess return advantage exceeds the swap cost.
+
+    ``scored`` must already be sorted descending by score.  Scores are
+    predicted forward returns (regression objective), so the difference
+    between two scores IS the expected return difference — no conversion
+    needed.  We compare it directly against the actual swap cost computed
+    from the broker's fee schedule.
+    """
+    if not broker.positions:
+        return scored[:top_k]
+
+    held = set(broker.positions.keys())
+    pure_top = scored[:top_k]
+    score_map = dict(scored)
+
+    top_codes = {c for c, _ in pure_top}
+    newcomers = [c for c, _ in pure_top if c not in held]
+    dropouts = [c for c in held if c in score_map and c not in top_codes]
+
+    if not newcomers or not dropouts:
+        return pure_top
+
+    # Sort: worst dropout first, weakest newcomer first
+    dropouts.sort(key=lambda c: score_map[c])
+    newcomers.sort(key=lambda c: score_map[c])
+
+    position_value = broker.total_value / top_k
+    kept: set[str] = set()
+    dt_str = str(dt)
+
+    for dropout in dropouts:
+        if not newcomers:
+            break
+        weakest_new = newcomers[0]
+        # Score IS predicted return → difference IS expected return gap
+        gap_bps = (score_map[weakest_new] - score_map[dropout]) * 10_000
+
+        # Actual swap cost: sell dropout + buy newcomer
+        swap_cost_bps = (
+            broker.fees.sell_cost_bps(dt_str, position_value, adv_lookup.get((dropout, dt)))
+            + broker.fees.buy_cost_bps(position_value, adv_lookup.get((weakest_new, dt)))
+        )
+
+        if gap_bps < swap_cost_bps:
+            kept.add(dropout)
+            newcomers.pop(0)
+
+    if not kept:
+        return pure_top
+
+    # Rebuild: drop weakest newcomers, add back kept dropouts
+    newcomers_in_top = sorted(
+        [c for c, _ in pure_top if c not in held],
+        key=lambda c: score_map[c],
+    )
+    drop_set = set(newcomers_in_top[:len(kept)])
+
+    result = [(c, s) for c, s in pure_top if c not in drop_set]
+    result.extend((c, score_map[c]) for c in kept)
+    result.sort(key=lambda x: -x[1])
+    return result[:top_k]
+
+
+# ---------------------------------------------------------------------------
 # Core backtest loop
 # ---------------------------------------------------------------------------
 
@@ -241,7 +316,11 @@ def run_ml_backtest(
     trailing_stop_pct: float | None = None,
     min_score: float | None = None,
     sizing: str = "equal",
-    hold_bonus_bps: float = 30.0,
+    stop_loss_pct: float | None = None,
+    trailing_stop_pct: float | None = None,
+    min_score: float | None = None,
+    sizing: str = "equal",
+    cost_aware_rebalance: bool = True,
     progress_callback: Callable | None = None,
 ) -> dict:
     """Run an individual-stock ML backtest.
@@ -275,11 +354,10 @@ def run_ml_backtest(
     sizing : str
         Position sizing method: ``"equal"``, ``"score_weighted"``, or
         ``"risk_parity"``.
-    hold_bonus_bps : float
-        Score bonus (in basis points, converted to score-space) added to
-        currently-held stocks before top-K selection.  This prevents
-        unnecessary turnover when a newcomer's expected alpha barely
-        exceeds round-trip trading costs.  Set to 0 to disable.
+    cost_aware_rebalance : bool
+        When True, a held stock is only replaced by a newcomer if the
+        score gap is large enough to justify the round-trip trading cost
+        (computed from the broker's actual fee schedule).
     progress_callback : callable or None
         ``callback(step, total, msg)`` for progress reporting.
 
@@ -495,26 +573,11 @@ def run_ml_backtest(
                 scored = list(zip(codes_in_features, scores))
                 if min_score is not None:
                     scored = [(c, s) for c, s in scored if s >= min_score]
-
-                # Apply hold bonus: currently-held stocks get a score bump
-                # so they are only replaced when the newcomer's edge
-                # exceeds estimated round-trip trading cost.
-                # Calibration: 1 score_std ≈ ~100 bps expected return spread,
-                # so hold_bonus_bps=30 → bonus = 0.3 * score_std.
-                if hold_bonus_bps > 0 and broker.positions:
-                    held = set(broker.positions.keys())
-                    raw_scores = np.array([s for _, s in scored])
-                    if len(raw_scores) > 1:
-                        score_std = float(np.std(raw_scores))
-                        bonus = score_std * hold_bonus_bps / 100
-                        scored = [
-                            (c, s + bonus) if c in held else (c, s)
-                            for c, s in scored
-                        ]
-
                 scored.sort(key=lambda x: -x[1])
 
-                selected = scored[:top_k]
+                selected = _cost_aware_select(
+                    scored, top_k, broker, dt, adv_lookup,
+                ) if cost_aware_rebalance else scored[:top_k]
                 sel_codes = [c for c, _ in selected]
                 sel_scores = np.array([s for _, s in selected])
 

@@ -65,6 +65,7 @@ TOP_K = 10
 HORIZON = 20                    # forward return horizon in trading days
 SLIPPAGE_BPS = 5
 COMMISSION_BPS = 3
+COST_AWARE_REBALANCE = True      # skip swaps where score gap < round-trip cost
 
 CACHE_DIR = Path("data/wf_cache")
 REPORT_PATH = Path("data/reports/walk_forward_result.md")
@@ -417,7 +418,14 @@ def run_walk_forward():
                     codes_in = today_valid["code"].tolist()
                     scores = current_ranker.predict(today_valid)
                     scored = sorted(zip(codes_in, scores), key=lambda x: -x[1])
-                    pending_selection = scored[:TOP_K]
+
+                    if COST_AWARE_REBALANCE:
+                        from mp.backtest.ml_backtest import _cost_aware_select
+                        pending_selection = _cost_aware_select(
+                            scored, TOP_K, broker, dt, adv_lk,
+                        )
+                    else:
+                        pending_selection = scored[:TOP_K]
 
         # --- Daily NAV ---
         close_snap = {}
