@@ -305,8 +305,11 @@ def _fetch_financial_history(code: str) -> Optional[pd.DataFrame]:
     Sorted by publish_date ascending.  The *_qoq / *_accel columns are
     quarter-over-quarter differences computed from consecutive reports.
     """
+    # ETFs (fund codes) have no financial statements — skip entirely
+    from mp.data.fetcher import _is_etf_code, get_financial_data
+    if _is_etf_code(code):
+        return None
     try:
-        from mp.data.fetcher import get_financial_data
         fin = get_financial_data(code)
         if fin.empty:
             return None
@@ -401,10 +404,14 @@ def _fetch_valuation_snapshot_map(codes: List[str]) -> Dict[str, Dict[str, float
     """
     from datetime import date as _date
     from mp.data.store import DataStore
+    from mp.data.fetcher import _is_etf_code
 
     today_str = _date.today().strftime("%Y-%m-%d")
     store = DataStore()
     result: Dict[str, Dict[str, float]] = {}
+
+    # ETFs have no PE/PB — exclude from all valuation lookups upfront
+    codes = [c for c in codes if not _is_etf_code(c)]
 
     # --- Step 1: load from SQLite cache ---
     try:
@@ -488,6 +495,43 @@ def _fetch_valuation_snapshot_map(codes: List[str]) -> Dict[str, Dict[str, float
                     api_fetched[code]["pb"] = baidu["pb"]
         baidu_ok = sum(1 for c in missing_pepb if c in result and not np.isnan(result[c].get("pe_ttm", np.nan)))
         logger.info("Baidu PE/PB: {}/{} recovered", baidu_ok, len(missing_pepb))
+
+    # --- Step 3.5: yesterday's SQLite fallback for stocks still missing PE ---
+    # When EM/Baidu both fail (e.g. API outages during market hours), use the
+    # most recent valuation stored in SQLite as a proxy.  PE/PB don't move much
+    # day-to-day so yesterday's data is far better than NaN for scoring.
+    still_missing_pe = [c for c in codes if
+                        c not in result or np.isnan(result[c].get("pe_ttm", np.nan))]
+    if still_missing_pe:
+        try:
+            from datetime import timedelta, date as _date_cls
+            yesterday_str = (_date_cls.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+            # Query yesterday specifically: today may have partial writes (PB only, NaN PE)
+            # that would shadow good historical PE values via MAX(date).
+            hist_df = store.load_valuation(codes=still_missing_pe, date_str=yesterday_str)
+            if not hist_df.empty:
+                hist_df["code"] = hist_df["code"].astype(str).str.zfill(6)
+                recovered = 0
+                for _, row in hist_df.iterrows():
+                    code = row["code"]
+                    pe = float(row["pe_ttm"]) if pd.notna(row.get("pe_ttm")) else np.nan
+                    pb_val = float(row["pb"]) if pd.notna(row.get("pb")) else np.nan
+                    mv = row.get("total_mv")
+                    if code not in result:
+                        result[code] = {"pe_ttm": np.nan, "pb": np.nan, "total_mv_log": np.nan}
+                    # Only fill in values that are still missing
+                    if np.isnan(result[code].get("pe_ttm", np.nan)) and not np.isnan(pe):
+                        result[code]["pe_ttm"] = pe
+                        recovered += 1
+                    if np.isnan(result[code].get("pb", np.nan)) and not np.isnan(pb_val):
+                        result[code]["pb"] = pb_val
+                    if np.isnan(result[code].get("total_mv_log", np.nan)) and pd.notna(mv) and float(mv) > 0:
+                        result[code]["total_mv_log"] = float(np.log(float(mv)))
+                if recovered > 0:
+                    logger.info("SQLite历史估值兜底: {}/{} 股票PE从历史缓存恢复 (数据日期≤{})",
+                                recovered, len(still_missing_pe), yesterday_str)
+        except Exception as e:
+            logger.debug("SQLite历史估值兜底失败: {}", e)
 
     # --- Step 4: write back newly fetched data to SQLite cache ---
     # Only persist entries that have at least PE or PB — never cache NULL PE/PB rows,

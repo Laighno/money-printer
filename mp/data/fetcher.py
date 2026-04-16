@@ -521,16 +521,23 @@ def get_daily_bars(code: str, start: str, end: str | None = None) -> pd.DataFram
 
     # Step 3: incremental API fetch with retry
     api_df: pd.DataFrame | None = None
-    try:
-        api_df = _with_retry(lambda: _get_daily_bars_sina(code, fetch_start, end))
-    except Exception as e:
-        logger.debug(f"Sina bars for {code} ({fetch_start}~{end}): {e}, trying EM...")
-
-    if api_df is None or api_df.empty:
+    if _is_etf_code(code):
+        # ETF codes use a dedicated fund API; stock APIs return wrong data or fail
         try:
-            api_df = _with_retry(lambda: _get_daily_bars_em(code, fetch_start, end))
+            api_df = _with_retry(lambda: _get_daily_bars_etf(code, fetch_start, end))
         except Exception as e:
-            logger.debug(f"EM bars for {code}: {e}")
+            logger.debug(f"ETF bars for {code} ({fetch_start}~{end}): {e}")
+    else:
+        try:
+            api_df = _with_retry(lambda: _get_daily_bars_sina(code, fetch_start, end))
+        except Exception as e:
+            logger.debug(f"Sina bars for {code} ({fetch_start}~{end}): {e}, trying EM...")
+
+        if api_df is None or api_df.empty:
+            try:
+                api_df = _with_retry(lambda: _get_daily_bars_em(code, fetch_start, end))
+            except Exception as e:
+                logger.debug(f"EM bars for {code}: {e}")
 
     # Step 4: persist new rows to DB
     if api_df is not None and not api_df.empty:
@@ -569,6 +576,30 @@ def _code_to_sina(code: str) -> str:
     if code.startswith(("6", "9")):
         return f"sh{code}"
     return f"sz{code}"
+
+
+def _is_etf_code(code: str) -> bool:
+    """Return True if the code is an ETF (fund), not a regular A-share stock.
+
+    Shanghai ETFs: 51xxxx, 50xxxx
+    Shenzhen ETFs: 15xxxx, 16xxxx
+    """
+    return code.startswith(("50", "51", "15", "16"))
+
+
+def _get_daily_bars_etf(code: str, start: str, end: str) -> pd.DataFrame:
+    """Eastmoney ETF/fund daily bars via fund_etf_hist_em."""
+    df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+    df = df.rename(columns={
+        "日期": "date", "开盘": "open", "最高": "high", "最低": "low",
+        "收盘": "close", "成交量": "volume", "成交额": "amount",
+        "换手率": "turnover",
+    })
+    df["code"] = code
+    df["date"] = pd.to_datetime(df["date"])
+    if "turnover" not in df.columns:
+        df["turnover"] = float("nan")
+    return df[["code", "date", "open", "high", "low", "close", "volume", "amount", "turnover"]]
 
 
 def _get_daily_bars_sina(code: str, start: str, end: str) -> pd.DataFrame:
