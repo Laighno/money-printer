@@ -228,20 +228,15 @@ def evaluate_holdings(ranker, regime: MarketRegime | None = None, intraday_bars:
         # BlendRanker predicts excess_ret (market-relative); to answer "should
         # I hold this stock?" we need estimated absolute return:
         #
-        #   effective_ret = predicted_excess_ret + benchmark_expected_ret
+        #   effective_ret = predicted_excess_ret + bench_ret_20d
         #
-        # benchmark_expected_ret is estimated from RegimeDetector's composite
-        # score scaled by BENCH_MONTHLY_ADJ (≈ ZZ500 monthly vol / 2):
-        #   score=+1 (bull)  → +3%/month expected
-        #   score= 0 (flat)  →  0%
-        #   score=-1 (bear)  → -3%/month expected
+        # bench_ret_20d is ZZ500's actual 20-trading-day return fetched in
+        # real time by RegimeDetector — not a fixed constant.  This means:
+        #   bear market where ZZ500 dropped 8%: bench_adj = -8%
+        #   bull market where ZZ500 rose 5%:    bench_adj = +5%
         #
-        # This lets the model independently judge individual stocks while
-        # naturally reflecting market conditions:
-        #   bear + stock excess +5% → abs +2% → 持有  ✓ (alpha overcomes tide)
-        #   bear + stock excess +1% → abs -2% → 减仓  ✓ (market drag dominates)
-        BENCH_MONTHLY_ADJ = 0.03   # 3% per unit of regime score
-        bench_adj = (regime.score if regime else 0.0) * BENCH_MONTHLY_ADJ
+        # Falls back to 0 if regime is unavailable.
+        bench_adj = regime.bench_ret_20d if regime else 0.0
 
         result["effective_return"] = result["raw_return"] + bench_adj
 

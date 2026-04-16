@@ -32,6 +32,7 @@ class MarketRegime:
     signals: dict          # per-signal details
     label_cn: str          # "牛市" / "震荡" / "熊市"
     summary_cn: str        # human-readable summary
+    bench_ret_20d: float = 0.0   # ZZ500 actual 20-trading-day return (real-time)
 
 
 _REGIME_LABELS = {"bull": "牛市", "sideways": "震荡", "bear": "熊市"}
@@ -42,7 +43,7 @@ class RegimeDetector:
 
     def detect(self) -> MarketRegime:
         """Fetch live data and classify current market regime."""
-        trend_val, trend_detail = self._index_trend_signal()
+        trend_val, trend_detail, bench_ret_20d = self._index_trend_signal()
         nb_val, nb_detail = self._northbound_signal()
         margin_val, margin_detail = self._margin_signal()
 
@@ -78,14 +79,20 @@ class RegimeDetector:
             signals=signals,
             label_cn=_REGIME_LABELS[regime],
             summary_cn=summary_cn,
+            bench_ret_20d=round(bench_ret_20d, 4),
         )
 
     # ------------------------------------------------------------------
     # Sub-signals
     # ------------------------------------------------------------------
 
-    def _index_trend_signal(self) -> tuple[float, dict]:
-        """ZZ500 MA trend: close vs MA20, MA20 vs MA60."""
+    def _index_trend_signal(self) -> tuple[float, dict, float]:
+        """ZZ500 MA trend: close vs MA20, MA20 vs MA60.
+
+        Returns (signal, detail_dict, bench_ret_20d) where bench_ret_20d is
+        the actual 20-trading-day return of ZZ500, used as real-time benchmark
+        expected return for individual stock recommendations.
+        """
         try:
             idx = ak.stock_zh_index_daily(symbol="sh000905")
             idx["date"] = pd.to_datetime(idx["date"])
@@ -95,6 +102,9 @@ class RegimeDetector:
             ma20 = close.rolling(20).mean().iloc[-1]
             ma60 = close.rolling(60).mean().iloc[-1]
             last = close.iloc[-1]
+
+            # Actual 20-trading-day return as real-time benchmark expectation
+            bench_ret_20d = float(last / close.iloc[-21] - 1) if len(close) >= 21 else 0.0
 
             if last > ma20 and ma20 > ma60:
                 signal, direction = 1.0, "偏多"
@@ -106,11 +116,11 @@ class RegimeDetector:
                 signal, direction = 0.0, "中性"
                 detail_str = f"收盘{last:.0f}, MA20={ma20:.0f}, MA60={ma60:.0f}"
 
-            return signal, {"direction": direction, "detail": detail_str}
+            return signal, {"direction": direction, "detail": detail_str}, bench_ret_20d
 
         except Exception as e:
             logger.warning("Index trend signal failed: {}", e)
-            return 0.0, {"direction": "未知", "detail": f"获取失败: {e}", "error": str(e)}
+            return 0.0, {"direction": "未知", "detail": f"获取失败: {e}", "error": str(e)}, 0.0
 
     def _northbound_signal(self) -> tuple[float, dict]:
         """Northbound capital 5-day cumulative net buy (亿元)."""
