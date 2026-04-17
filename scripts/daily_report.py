@@ -789,6 +789,33 @@ def recommend_stocks(ranker, n_recommend: int = 5, intraday_bars: dict | None = 
 # Report Formatting
 # =====================================================================
 
+def _collect_data_timestamps(codes: list[str]) -> dict:
+    """Query DB for data freshness info to include in report footer."""
+    from datetime import datetime as _dt
+    result = {"generated_at": _dt.now().strftime("%H:%M"), "bar_date": "N/A", "valuation_date": "N/A"}
+    try:
+        from mp.data.store import DataStore
+        from sqlalchemy import text
+        store = DataStore()
+        with store.engine.connect() as conn:
+            if codes:
+                placeholders = ",".join(f":c{i}" for i in range(len(codes)))
+                params = {f"c{i}": c for i, c in enumerate(codes)}
+                row = conn.execute(
+                    text(f"SELECT MAX(date) FROM daily_bars WHERE code IN ({placeholders})"),
+                    params
+                ).scalar()
+                if row:
+                    result["bar_date"] = str(row)[:10]
+            val_row = conn.execute(text("SELECT MAX(date) FROM valuation")).scalar()
+            if val_row:
+                result["valuation_date"] = str(val_row)[:10]
+    except Exception as e:
+        from loguru import logger
+        logger.debug("Failed to collect data timestamps: {}", e)
+    return result
+
+
 def format_report(
     holdings_eval: pd.DataFrame,
     recommendations: pd.DataFrame,
@@ -803,6 +830,7 @@ def format_report(
     rebalance_advice: list[dict] | None = None,
     regime: MarketRegime | None = None,
     midday: bool = False,
+    data_timestamps: dict | None = None,
 ) -> str:
     """Format evaluation results as markdown string (saved to file)."""
     return _format_markdown(
@@ -810,6 +838,7 @@ def format_report(
         rec_60d, rec_name_map, holdings_60d_scores, rec_60d_scores,
         holdings_screen, rec_screen, rebalance_advice, regime,
         midday=midday,
+        data_timestamps=data_timestamps,
     )
 
 
@@ -818,6 +847,7 @@ def _format_markdown(
     rec_60d, rec_name_map, holdings_60d_scores, rec_60d_scores,
     holdings_screen, rec_screen, rebalance_advice=None, regime=None,
     midday: bool = False,
+    data_timestamps: dict | None = None,
 ) -> str:
     """Plain markdown format (for file saving)."""
     today = date.today().strftime("%Y-%m-%d")
@@ -969,10 +999,11 @@ def _format_markdown(
         lines.append("")
 
     lines.append("---")
-    if midday:
-        lines.append(f"*ML评分基于当日上午行情 | {datetime.now().strftime('%H:%M')}*")
-    else:
-        lines.append(f"*由 Money Printer ML 模型自动生成 | {datetime.now().strftime('%H:%M')}*")
+    ts = data_timestamps or {}
+    bar_d = ts.get("bar_date", "N/A")
+    val_d = ts.get("valuation_date", "N/A")
+    gen_t = ts.get("generated_at", datetime.now().strftime("%H:%M"))
+    lines.append(f"*行情数据: {bar_d} | 估值数据: {val_d} | 生成于: {gen_t}*")
     return "\n".join(lines)
 
 
@@ -990,6 +1021,7 @@ def format_feishu_card(
     rebalance_advice: list[dict] | None = None,
     regime: MarketRegime | None = None,
     midday: bool = False,
+    data_timestamps: dict | None = None,
 ) -> dict:
     """Format evaluation results as a Feishu interactive card JSON."""
     import json
@@ -1213,9 +1245,14 @@ def format_feishu_card(
 
     # --- Footer ---
     elements.append({"tag": "hr"})
+    ts = data_timestamps or {}
+    bar_d = ts.get("bar_date", "N/A")
+    val_d = ts.get("valuation_date", "N/A")
+    gen_t = ts.get("generated_at", datetime.now().strftime("%H:%M"))
+    prefix = "ML评分基于当日上午行情" if midday else "Money Printer ML"
     elements.append({
         "tag": "note",
-        "elements": [{"tag": "plain_text", "content": f"{'ML评分基于当日上午行情' if midday else 'Money Printer ML'} · {datetime.now().strftime('%H:%M')}"}],
+        "elements": [{"tag": "plain_text", "content": f"{prefix} · 行情: {bar_d} · 估值: {val_d} · {gen_t}"}],
     })
 
     card = {
@@ -1353,6 +1390,7 @@ def format_midday_markdown(
     holdings_data: List[dict],
     index_data: Optional[dict] = None,
     regime: MarketRegime | None = None,
+    data_timestamps: dict | None = None,
 ) -> str:
     """Format midday report as markdown."""
     today = date.today().strftime("%Y-%m-%d")
@@ -1410,7 +1448,11 @@ def format_midday_markdown(
     lines.append("")
 
     lines.append("---")
-    lines.append(f"*ML评分基于昨日收盘数据 | {datetime.now().strftime('%H:%M')}*")
+    ts = data_timestamps or {}
+    bar_d = ts.get("bar_date", "N/A")
+    val_d = ts.get("valuation_date", "N/A")
+    gen_t = ts.get("generated_at", datetime.now().strftime("%H:%M"))
+    lines.append(f"*行情数据: {bar_d} | 估值数据: {val_d} | 生成于: {gen_t}*")
     return "\n".join(lines)
 
 
@@ -1418,6 +1460,7 @@ def format_midday_feishu_card(
     holdings_data: List[dict],
     index_data: Optional[dict] = None,
     regime: MarketRegime | None = None,
+    data_timestamps: dict | None = None,
 ) -> dict:
     """Format midday report as Feishu interactive card."""
     today = date.today().strftime("%Y-%m-%d")
@@ -1478,9 +1521,13 @@ def format_midday_feishu_card(
 
     # Footer
     elements.append({"tag": "hr"})
+    ts = data_timestamps or {}
+    bar_d = ts.get("bar_date", "N/A")
+    val_d = ts.get("valuation_date", "N/A")
+    gen_t = ts.get("generated_at", datetime.now().strftime("%H:%M"))
     elements.append({
         "tag": "note",
-        "elements": [{"tag": "plain_text", "content": f"ML评分基于昨日收盘 | {datetime.now().strftime('%H:%M')}"}],
+        "elements": [{"tag": "plain_text", "content": f"ML评分基于昨日收盘 · 行情: {bar_d} · 估值: {val_d} · {gen_t}"}],
     })
 
     return {
@@ -1629,6 +1676,7 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     logger.info("Rebalance advice: {} actions ({} swaps/sells)", len(rebalance_advice), n_swaps)
 
     # 10. Format report (same as daily, with midday=True)
+    data_timestamps = _collect_data_timestamps(h_codes or [])
     report = format_report(
         holdings_eval, recommendations,
         holdings_60d=holdings_60d, name_map=name_map,
@@ -1640,6 +1688,7 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
         rebalance_advice=rebalance_advice,
         regime=regime,
         midday=True,
+        data_timestamps=data_timestamps,
     )
     logger.info("Midday report generated ({} chars)", len(report))
 
@@ -1654,6 +1703,7 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
         rebalance_advice=rebalance_advice,
         regime=regime,
         midday=True,
+        data_timestamps=data_timestamps,
     )
 
     # 11. Save & send
@@ -1760,6 +1810,7 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
     logger.info("Rebalance advice: {} actions ({} swaps/sells)", len(rebalance_advice), n_swaps)
 
     # 3. Format report
+    data_timestamps = _collect_data_timestamps(codes or [])
     report = format_report(
         holdings_eval, recommendations,
         holdings_60d=holdings_60d, name_map=name_map,
@@ -1770,6 +1821,7 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         rec_screen=rec_screen if not rec_screen.empty else None,
         rebalance_advice=rebalance_advice,
         regime=regime,
+        data_timestamps=data_timestamps,
     )
     logger.info("Report generated ({} chars)", len(report))
 
@@ -1791,6 +1843,7 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         rec_screen=rec_screen if not rec_screen.empty else None,
         rebalance_advice=rebalance_advice,
         regime=regime,
+        data_timestamps=data_timestamps,
     )
 
     # 4. Send to Feishu
