@@ -1000,15 +1000,17 @@ def build_latest_features(
     # prevents false degradation when EM is down but PE/PB are fine via Baidu.
     _QUALITY_GATE_COLS = [c for c in FUNDAMENTAL_COLUMNS if c != "total_mv_log"]
 
+    # Both the display warning [缺] and the quality gate use the same col set —
+    # total_mv_log is excluded from both so EM outages don't produce noisy [缺]
+    # tags on otherwise well-predicted stocks.
     def _make_warning(row):
-        missing = [c for c in FUNDAMENTAL_COLUMNS if pd.isna(row.get(c))]
+        missing = [c for c in _QUALITY_GATE_COLS if pd.isna(row.get(c))]
         return ",".join(missing) if missing else ""
     result["_data_warnings"] = result.apply(_make_warning, axis=1)
 
     existing_gate = [c for c in _QUALITY_GATE_COLS if c in result.columns]
     n_gate = int(result[existing_gate].isna().any(axis=1).sum()) if existing_gate else 0
-    n_warn = (result["_data_warnings"] != "").sum()
-    # _data_quality based only on gate cols (excludes total_mv_log)
+    n_warn = n_gate  # same set now
     result.attrs["_data_quality"] = 1.0 - (n_gate / len(result)) if len(result) > 0 else 0.0
     if n_warn > 0:
         logger.warning("⚠ {}/{} 股票存在基本面数据缺失，预测可能不准", n_warn, len(result))
