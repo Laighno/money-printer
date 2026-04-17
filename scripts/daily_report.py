@@ -789,31 +789,19 @@ def recommend_stocks(ranker, n_recommend: int = 5, intraday_bars: dict | None = 
 # Report Formatting
 # =====================================================================
 
-def _collect_data_timestamps(codes: list[str]) -> dict:
-    """Query DB for data freshness info to include in report footer."""
-    from datetime import datetime as _dt
-    result = {"generated_at": _dt.now().strftime("%H:%M"), "bar_date": "N/A", "valuation_date": "N/A"}
-    try:
-        from mp.data.store import DataStore
-        from sqlalchemy import text
-        store = DataStore()
-        with store.engine.connect() as conn:
-            if codes:
-                placeholders = ",".join(f":c{i}" for i in range(len(codes)))
-                params = {f"c{i}": c for i, c in enumerate(codes)}
-                row = conn.execute(
-                    text(f"SELECT MAX(date) FROM daily_bars WHERE code IN ({placeholders})"),
-                    params
-                ).scalar()
-                if row:
-                    result["bar_date"] = str(row)[:10]
-            val_row = conn.execute(text("SELECT MAX(date) FROM valuation")).scalar()
-            if val_row:
-                result["valuation_date"] = str(val_row)[:10]
-    except Exception as e:
-        from loguru import logger
-        logger.debug("Failed to collect data timestamps: {}", e)
-    return result
+def _make_data_timestamps(bar_fetched_at: "datetime", valuation_fetched_at: "datetime") -> dict:
+    """Build data_timestamps dict from actual fetch datetimes.
+
+    Callers record datetime.now() right after each data source is pulled,
+    giving hour-level precision instead of date-only DB values.
+    Format: "YYYY-MM-DD HH:MM"
+    """
+    fmt = "%Y-%m-%d %H:%M"
+    return {
+        "bar_date": bar_fetched_at.strftime(fmt),
+        "valuation_date": valuation_fetched_at.strftime(fmt),
+        "generated_at": datetime.now().strftime(fmt),
+    }
 
 
 def format_report(
@@ -1002,7 +990,7 @@ def _format_markdown(
     ts = data_timestamps or {}
     bar_d = ts.get("bar_date", "N/A")
     val_d = ts.get("valuation_date", "N/A")
-    gen_t = ts.get("generated_at", datetime.now().strftime("%H:%M"))
+    gen_t = ts.get("generated_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
     lines.append(f"*行情数据: {bar_d} | 估值数据: {val_d} | 生成于: {gen_t}*")
     return "\n".join(lines)
 
@@ -1248,7 +1236,7 @@ def format_feishu_card(
     ts = data_timestamps or {}
     bar_d = ts.get("bar_date", "N/A")
     val_d = ts.get("valuation_date", "N/A")
-    gen_t = ts.get("generated_at", datetime.now().strftime("%H:%M"))
+    gen_t = ts.get("generated_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
     prefix = "ML评分基于当日上午行情" if midday else "Money Printer ML"
     elements.append({
         "tag": "note",
@@ -1451,7 +1439,7 @@ def format_midday_markdown(
     ts = data_timestamps or {}
     bar_d = ts.get("bar_date", "N/A")
     val_d = ts.get("valuation_date", "N/A")
-    gen_t = ts.get("generated_at", datetime.now().strftime("%H:%M"))
+    gen_t = ts.get("generated_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
     lines.append(f"*行情数据: {bar_d} | 估值数据: {val_d} | 生成于: {gen_t}*")
     return "\n".join(lines)
 
@@ -1524,7 +1512,7 @@ def format_midday_feishu_card(
     ts = data_timestamps or {}
     bar_d = ts.get("bar_date", "N/A")
     val_d = ts.get("valuation_date", "N/A")
-    gen_t = ts.get("generated_at", datetime.now().strftime("%H:%M"))
+    gen_t = ts.get("generated_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
     elements.append({
         "tag": "note",
         "elements": [{"tag": "plain_text", "content": f"ML评分基于昨日收盘 · 行情: {bar_d} · 估值: {val_d} · {gen_t}"}],
@@ -1593,6 +1581,7 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     if not prices:
         logger.error("Failed to fetch realtime prices")
         return
+    bar_fetched_at = datetime.now()   # ← 行情数据拉取完成时刻
     logger.info("Got realtime data for {} stocks", len(prices))
 
     # 4. Build intraday_bars dict
@@ -1612,6 +1601,7 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     # 5. Evaluate holdings (with intraday bars → fresh ML)
     logger.info("--- Evaluating holdings (with intraday data) ---")
     holdings_eval = evaluate_holdings(ranker, regime=regime, intraday_bars=intraday_bars)
+    valuation_fetched_at = datetime.now()   # ← 估值数据（PE/PB）拉取完成时刻
 
     # 5b. Append realtime price/change to holdings_eval for display
     if not holdings_eval.empty:
@@ -1676,7 +1666,7 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     logger.info("Rebalance advice: {} actions ({} swaps/sells)", len(rebalance_advice), n_swaps)
 
     # 10. Format report (same as daily, with midday=True)
-    data_timestamps = _collect_data_timestamps(h_codes or [])
+    data_timestamps = _make_data_timestamps(bar_fetched_at, valuation_fetched_at)
     report = format_report(
         holdings_eval, recommendations,
         holdings_60d=holdings_60d, name_map=name_map,
@@ -1753,7 +1743,9 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
 
     # 1. Evaluate holdings
     logger.info("--- Evaluating holdings ---")
+    bar_fetched_at = datetime.now()   # ← 日报行情来自 DB（收盘后），记录此刻为拉取时刻
     holdings_eval = evaluate_holdings(ranker, regime=regime)
+    valuation_fetched_at = datetime.now()   # ← 估值数据拉取完成时刻
 
     # 1b. 60-day technical analysis for holdings
     holdings = load_holdings()
@@ -1810,7 +1802,7 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
     logger.info("Rebalance advice: {} actions ({} swaps/sells)", len(rebalance_advice), n_swaps)
 
     # 3. Format report
-    data_timestamps = _collect_data_timestamps(codes or [])
+    data_timestamps = _make_data_timestamps(bar_fetched_at, valuation_fetched_at)
     report = format_report(
         holdings_eval, recommendations,
         holdings_60d=holdings_60d, name_map=name_map,
