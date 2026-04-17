@@ -789,19 +789,50 @@ def recommend_stocks(ranker, n_recommend: int = 5, intraday_bars: dict | None = 
 # Report Formatting
 # =====================================================================
 
-def _make_data_timestamps(bar_fetched_at: "datetime", valuation_fetched_at: "datetime") -> dict:
-    """Build data_timestamps dict from actual fetch datetimes.
+def _make_data_timestamps(
+    bar_fetched_at: "datetime | None" = None,
+    intraday: bool = False,
+) -> dict:
+    """Build data_timestamps by querying actual data dates from DB.
 
-    Callers record datetime.now() right after each data source is pulled,
-    giving hour-level precision instead of date-only DB values.
-    Format: "YYYY-MM-DD HH:MM"
+    bar_fetched_at is only used for intraday (midday) reports where bars are
+    live real-time quotes — in that case we show the fetch time because the
+    data IS from right now.  For daily reports, bar data comes from DB close
+    prices and we show the DB date so stale data is visible.
+
+    Valuation date always comes from the DB (MAX date in valuation table) so
+    a cache hit from yesterday shows yesterday's date, not today's fetch time.
     """
-    fmt = "%Y-%m-%d %H:%M"
-    return {
-        "bar_date": bar_fetched_at.strftime(fmt),
-        "valuation_date": valuation_fetched_at.strftime(fmt),
-        "generated_at": datetime.now().strftime(fmt),
+    from mp.data.store import DataStore
+    from sqlalchemy import text as _text
+
+    fmt_dt = "%Y-%m-%d %H:%M"
+    result = {
+        "bar_date": "N/A",
+        "valuation_date": "N/A",
+        "generated_at": datetime.now().strftime(fmt_dt),
     }
+
+    try:
+        store = DataStore()
+        with store.engine.connect() as conn:
+            # Valuation: always show the actual date of the cached data
+            val_row = conn.execute(_text("SELECT MAX(date) FROM valuation")).scalar()
+            if val_row:
+                result["valuation_date"] = str(val_row)[:10]
+
+            if intraday and bar_fetched_at is not None:
+                # Midday: bars are live intraday quotes fetched right now
+                result["bar_date"] = bar_fetched_at.strftime(fmt_dt)
+            else:
+                # Daily: bars come from DB — show actual data date, not fetch time
+                bar_row = conn.execute(_text("SELECT MAX(date) FROM daily_bars")).scalar()
+                if bar_row:
+                    result["bar_date"] = str(bar_row)[:10]
+    except Exception as e:
+        logger.debug("Failed to collect data timestamps: {}", e)
+
+    return result
 
 
 def format_report(
@@ -1666,7 +1697,7 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     logger.info("Rebalance advice: {} actions ({} swaps/sells)", len(rebalance_advice), n_swaps)
 
     # 10. Format report (same as daily, with midday=True)
-    data_timestamps = _make_data_timestamps(bar_fetched_at, valuation_fetched_at)
+    data_timestamps = _make_data_timestamps(bar_fetched_at=bar_fetched_at, intraday=True)
     report = format_report(
         holdings_eval, recommendations,
         holdings_60d=holdings_60d, name_map=name_map,
@@ -1743,9 +1774,7 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
 
     # 1. Evaluate holdings
     logger.info("--- Evaluating holdings ---")
-    bar_fetched_at = datetime.now()   # ← 日报行情来自 DB（收盘后），记录此刻为拉取时刻
     holdings_eval = evaluate_holdings(ranker, regime=regime)
-    valuation_fetched_at = datetime.now()   # ← 估值数据拉取完成时刻
 
     # 1b. 60-day technical analysis for holdings
     holdings = load_holdings()
@@ -1802,7 +1831,7 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
     logger.info("Rebalance advice: {} actions ({} swaps/sells)", len(rebalance_advice), n_swaps)
 
     # 3. Format report
-    data_timestamps = _make_data_timestamps(bar_fetched_at, valuation_fetched_at)
+    data_timestamps = _make_data_timestamps()  # daily: both dates from DB
     report = format_report(
         holdings_eval, recommendations,
         holdings_60d=holdings_60d, name_map=name_map,
