@@ -496,22 +496,25 @@ def _fetch_valuation_snapshot_map(codes: List[str]) -> Dict[str, Dict[str, float
         baidu_ok = sum(1 for c in missing_pepb if c in result and not np.isnan(result[c].get("pe_ttm", np.nan)))
         logger.info("Baidu PE/PB: {}/{} recovered", baidu_ok, len(missing_pepb))
 
-    # --- Step 3.5: yesterday's SQLite fallback for stocks still missing PE ---
-    # When EM/Baidu both fail (e.g. API outages during market hours), use the
-    # most recent valuation stored in SQLite as a proxy.  PE/PB don't move much
-    # day-to-day so yesterday's data is far better than NaN for scoring.
-    still_missing_pe = [c for c in codes if
-                        c not in result or np.isnan(result[c].get("pe_ttm", np.nan))]
-    if still_missing_pe:
+    # --- Step 3.5: yesterday's SQLite fallback for any missing valuation field ---
+    # Covers three failure modes:
+    #   A) pe_ttm missing  — EM down AND Baidu failed
+    #   B) total_mv missing — EM down (only source); Sina/Baidu don't carry market cap
+    #      *** this is the common midday case: Baidu fills pe/pb but total_mv stays NaN,
+    #          causing _data_quality=0 and荐股降级 even though pe/pb are fine ***
+    #   C) pb missing  — rare fallback
+    still_missing_any = [c for c in codes if
+                         c not in result
+                         or np.isnan(result[c].get("pe_ttm", np.nan))
+                         or np.isnan(result[c].get("total_mv_log", np.nan))]
+    if still_missing_any:
         try:
             from datetime import timedelta, date as _date_cls
             yesterday_str = (_date_cls.today() - timedelta(days=1)).strftime("%Y-%m-%d")
-            # Query yesterday specifically: today may have partial writes (PB only, NaN PE)
-            # that would shadow good historical PE values via MAX(date).
-            hist_df = store.load_valuation(codes=still_missing_pe, date_str=yesterday_str)
+            hist_df = store.load_valuation(codes=still_missing_any, date_str=yesterday_str)
             if not hist_df.empty:
                 hist_df["code"] = hist_df["code"].astype(str).str.zfill(6)
-                recovered = 0
+                mv_recovered = pe_recovered = 0
                 for _, row in hist_df.iterrows():
                     code = row["code"]
                     pe = float(row["pe_ttm"]) if pd.notna(row.get("pe_ttm")) else np.nan
@@ -519,17 +522,17 @@ def _fetch_valuation_snapshot_map(codes: List[str]) -> Dict[str, Dict[str, float
                     mv = row.get("total_mv")
                     if code not in result:
                         result[code] = {"pe_ttm": np.nan, "pb": np.nan, "total_mv_log": np.nan}
-                    # Only fill in values that are still missing
                     if np.isnan(result[code].get("pe_ttm", np.nan)) and not np.isnan(pe):
                         result[code]["pe_ttm"] = pe
-                        recovered += 1
+                        pe_recovered += 1
                     if np.isnan(result[code].get("pb", np.nan)) and not np.isnan(pb_val):
                         result[code]["pb"] = pb_val
                     if np.isnan(result[code].get("total_mv_log", np.nan)) and pd.notna(mv) and float(mv) > 0:
                         result[code]["total_mv_log"] = float(np.log(float(mv)))
-                if recovered > 0:
-                    logger.info("SQLite历史估值兜底: {}/{} 股票PE从历史缓存恢复 (数据日期≤{})",
-                                recovered, len(still_missing_pe), yesterday_str)
+                        mv_recovered += 1
+                if pe_recovered or mv_recovered:
+                    logger.info("SQLite历史估值兜底({}): PE恢复{}只, total_mv恢复{}只",
+                                yesterday_str, pe_recovered, mv_recovered)
         except Exception as e:
             logger.debug("SQLite历史估值兜底失败: {}", e)
 
@@ -990,16 +993,26 @@ def build_latest_features(
     result = pd.concat(rows, ignore_index=True)
 
     # --- Data quality warnings: flag missing fundamental columns per row ---
+    # _data_quality drives the荐股降级 gate, so only count columns that truly
+    # signal a broken data source.  total_mv_log is a control variable (size
+    # factor) fetched only from EM; its absence during EM outages is expected
+    # and handled by yesterday's SQLite fallback.  Excluding it from the gate
+    # prevents false degradation when EM is down but PE/PB are fine via Baidu.
+    _QUALITY_GATE_COLS = [c for c in FUNDAMENTAL_COLUMNS if c != "total_mv_log"]
+
     def _make_warning(row):
         missing = [c for c in FUNDAMENTAL_COLUMNS if pd.isna(row.get(c))]
         return ",".join(missing) if missing else ""
     result["_data_warnings"] = result.apply(_make_warning, axis=1)
+
+    existing_gate = [c for c in _QUALITY_GATE_COLS if c in result.columns]
+    n_gate = int(result[existing_gate].isna().any(axis=1).sum()) if existing_gate else 0
     n_warn = (result["_data_warnings"] != "").sum()
-    # Store global data quality ratio in DataFrame attrs
-    result.attrs["_data_quality"] = 1.0 - (n_warn / len(result)) if len(result) > 0 else 0.0
+    # _data_quality based only on gate cols (excludes total_mv_log)
+    result.attrs["_data_quality"] = 1.0 - (n_gate / len(result)) if len(result) > 0 else 0.0
     if n_warn > 0:
         logger.warning("⚠ {}/{} 股票存在基本面数据缺失，预测可能不准", n_warn, len(result))
-    if n_warn > len(result) * 0.5:
+    if n_gate > len(result) * 0.5:
         logger.warning("⚠ 超过50%股票缺少基本面数据(PE/PB等)，数据源可能异常")
 
     # --- Industry-relative ranking features ---
