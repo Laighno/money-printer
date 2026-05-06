@@ -329,16 +329,29 @@ def _fetch_financial_history(code: str) -> Optional[pd.DataFrame]:
 def _align_fundamentals_to_dates(
     dates: pd.Series,
     fin_hist: Optional[pd.DataFrame],
-    valuation_row: Optional[Dict[str, float]],
+    valuation_row: Optional[Dict[str, float]] = None,
+    valuation_hist: Optional[pd.DataFrame] = None,
 ) -> Dict[str, np.ndarray]:
     """Align fundamental data to a date series using publish_date (no look-ahead).
 
-    For ROE/growth: uses merge_asof on publish_date — each trading day sees
-    only the most recent report published BEFORE that date.
+    Parameters
+    ----------
+    dates : pd.Series
+        Trading dates for this stock (any order; index is used for mapping).
+    fin_hist : DataFrame or None
+        Quarterly financial reports with ``publish_date``. Aligned via
+        ``merge_asof(direction="backward")`` so each trading day only sees
+        reports already announced.
+    valuation_row : dict or None
+        Latest PE/PB/market-cap snapshot, used **only** for live prediction
+        (``build_latest_features``).  Written to the last row of the panel.
+    valuation_hist : DataFrame or None
+        Historical daily PE/PB/market-cap for this stock
+        (columns: ``date``, ``pe_ttm``, ``pb``, ``total_mv``).  When provided,
+        PE/PB/total_mv_log are aligned day-by-day (training path).  This takes
+        precedence over ``valuation_row`` for the last row as well.
 
-    For PE/PB/market_cap: these are price-derived and change daily. Currently
-    we only have today's snapshot, so we fill them only for the latest row
-    (used by build_latest_features). For training, these columns will be NaN.
+    Returns a dict of column -> np.ndarray aligned to *dates*.
     """
     n = len(dates)
     _fund_cols = FUNDAMENTAL_COLUMNS + FUNDAMENTAL_TREND_COLUMNS
@@ -366,11 +379,44 @@ def _align_fundamentals_to_dates(
                     if col in row and pd.notna(row.get(col)):
                         result[col][idx] = float(row[col])
 
-    # --- PE / PB / market cap: snapshot only (for latest features) ---
+    # --- PE / PB / market cap: historical alignment (training) ---
+    # valuation_hist may be sparse (e.g. Baidu returns ~biweekly samples).
+    # Use merge_asof(backward) to forward-fill without look-ahead: each
+    # trading day sees only the most recent observation published on or
+    # before it.
+    if valuation_hist is not None and not valuation_hist.empty:
+        vh = valuation_hist.copy()
+        vh["date"] = pd.to_datetime(vh["date"])
+        vh = vh.sort_values("date").reset_index(drop=True)
+
+        dates_df = pd.DataFrame({
+            "_orig_idx": np.arange(len(dates)),
+            "date": pd.to_datetime(dates),
+        }).sort_values("date").reset_index(drop=True)
+
+        merged = pd.merge_asof(
+            dates_df, vh, on="date", direction="backward",
+        )
+
+        if "pe_ttm" in merged.columns:
+            pe_vals = merged["pe_ttm"].to_numpy(dtype=float)
+            result["pe_ttm"][merged["_orig_idx"].to_numpy()] = pe_vals
+        if "pb" in merged.columns:
+            pb_vals = merged["pb"].to_numpy(dtype=float)
+            result["pb"][merged["_orig_idx"].to_numpy()] = pb_vals
+        if "total_mv" in merged.columns:
+            mv_vals = merged["total_mv"].to_numpy(dtype=float)
+            safe = np.where((~np.isnan(mv_vals)) & (mv_vals > 0), mv_vals, np.nan)
+            result["total_mv_log"][merged["_orig_idx"].to_numpy()] = np.log(safe)
+
+    # --- PE / PB / market cap: snapshot only (live prediction path) ---
+    # ``valuation_hist`` has already populated historical rows; the snapshot is
+    # still useful to cover "today" when the historical table hasn't caught up
+    # yet. We only write it when the last row is still NaN to avoid clobbering
+    # authoritative historical data.
     if valuation_row:
-        # Only set the last row (latest date) to avoid broadcasting future info
         for col in ["pe_ttm", "pb", "total_mv_log"]:
-            if col in valuation_row and pd.notna(valuation_row.get(col)):
+            if np.isnan(result[col][-1]) and col in valuation_row and pd.notna(valuation_row.get(col)):
                 result[col][-1] = valuation_row[col]
 
     return result
@@ -496,13 +542,18 @@ def _fetch_valuation_snapshot_map(codes: List[str]) -> Dict[str, Dict[str, float
         baidu_ok = sum(1 for c in missing_pepb if c in result and not np.isnan(result[c].get("pe_ttm", np.nan)))
         logger.info("Baidu PE/PB: {}/{} recovered", baidu_ok, len(missing_pepb))
 
-    # --- Step 3.5: yesterday's SQLite fallback for any missing valuation field ---
+    # --- Step 3.5: SQLite historical fallback for any missing valuation field ---
     # Covers three failure modes:
     #   A) pe_ttm missing  — EM down AND Baidu failed
     #   B) total_mv missing — EM down (only source); Sina/Baidu don't carry market cap
     #      *** this is the common midday case: Baidu fills pe/pb but total_mv stays NaN,
     #          causing _data_quality=0 and荐股降级 even though pe/pb are fine ***
     #   C) pb missing  — rare fallback
+    #
+    # IMPORTANT: We do NOT hardcode yesterday — EM can be down multiple consecutive days.
+    # Instead, for each code we pick its most recent row where total_mv IS NOT NULL,
+    # going back up to 30 calendar days.  Market cap changes slowly; a few-day-old
+    # value is almost always accurate enough to serve as a control variable.
     still_missing_any = [c for c in codes if
                          c not in result
                          or np.isnan(result[c].get("pe_ttm", np.nan))
@@ -510,11 +561,32 @@ def _fetch_valuation_snapshot_map(codes: List[str]) -> Dict[str, Dict[str, float
     if still_missing_any:
         try:
             from datetime import timedelta, date as _date_cls
-            yesterday_str = (_date_cls.today() - timedelta(days=1)).strftime("%Y-%m-%d")
-            hist_df = store.load_valuation(codes=still_missing_any, date_str=yesterday_str)
+            from sqlalchemy import text as _text
+            cutoff_str = (_date_cls.today() - timedelta(days=30)).strftime("%Y-%m-%d")
+            # Per-code: find the most recent row where total_mv IS NOT NULL AND total_mv > 0
+            placeholders = ",".join(f":c{i}" for i in range(len(still_missing_any)))
+            sql = f"""
+                SELECT v.*
+                FROM valuation v
+                INNER JOIN (
+                    SELECT code, MAX(date) AS best_date
+                    FROM valuation
+                    WHERE total_mv IS NOT NULL AND total_mv > 0
+                      AND date >= :cutoff
+                      AND code IN ({placeholders})
+                    GROUP BY code
+                ) best ON v.code = best.code AND v.date = best.best_date
+            """
+            params: dict = {"cutoff": cutoff_str}
+            for i, c in enumerate(still_missing_any):
+                params[f"c{i}"] = c
+            with store.engine.connect() as _conn:
+                hist_df = pd.read_sql(_text(sql), _conn, params=params)
+
             if not hist_df.empty:
                 hist_df["code"] = hist_df["code"].astype(str).str.zfill(6)
                 mv_recovered = pe_recovered = 0
+                best_dates: dict = {}
                 for _, row in hist_df.iterrows():
                     code = row["code"]
                     pe = float(row["pe_ttm"]) if pd.notna(row.get("pe_ttm")) else np.nan
@@ -525,14 +597,18 @@ def _fetch_valuation_snapshot_map(codes: List[str]) -> Dict[str, Dict[str, float
                     if np.isnan(result[code].get("pe_ttm", np.nan)) and not np.isnan(pe):
                         result[code]["pe_ttm"] = pe
                         pe_recovered += 1
+                        best_dates[code] = row.get("date", "?")
                     if np.isnan(result[code].get("pb", np.nan)) and not np.isnan(pb_val):
                         result[code]["pb"] = pb_val
                     if np.isnan(result[code].get("total_mv_log", np.nan)) and pd.notna(mv) and float(mv) > 0:
                         result[code]["total_mv_log"] = float(np.log(float(mv)))
                         mv_recovered += 1
+                        best_dates[code] = row.get("date", "?")
                 if pe_recovered or mv_recovered:
-                    logger.info("SQLite历史估值兜底({}): PE恢复{}只, total_mv恢复{}只",
-                                yesterday_str, pe_recovered, mv_recovered)
+                    # Log the actual dates used so we can verify the fallback worked
+                    date_range = sorted(set(str(v) for v in best_dates.values()))
+                    logger.info("SQLite历史估值兜底(最近有效日期): PE恢复{}只, total_mv恢复{}只, 数据日期={}",
+                                pe_recovered, mv_recovered, date_range)
         except Exception as e:
             logger.debug("SQLite历史估值兜底失败: {}", e)
 
@@ -573,6 +649,7 @@ def _process_single_stock(
     horizon: Optional[int],
     fin_hist: Optional[pd.DataFrame] = None,
     valuation_row: Optional[Dict[str, float]] = None,
+    valuation_hist: Optional[pd.DataFrame] = None,
     intraday_bar: Optional[Dict] = None,
 ) -> Optional[pd.DataFrame]:
     """Fetch bars and build factor rows for one stock.
@@ -590,6 +667,10 @@ def _process_single_stock(
         Historical financial reports with publish_date for time-alignment.
     valuation_row : dict or None
         Today's PE/PB/market_cap snapshot (only used for latest features).
+    valuation_hist : DataFrame or None
+        Pre-filtered (single-stock) daily PE/PB/market_cap history
+        (columns: ``date``, ``pe_ttm``, ``pb``, ``total_mv``).  When provided,
+        used to populate training-set fundamentals day by day.
 
     Returns
     -------
@@ -639,7 +720,9 @@ def _process_single_stock(
         result[col] = factors[col]
 
     # --- fundamental factors (time-aligned via publish_date) ---
-    fund_aligned = _align_fundamentals_to_dates(df["date"], fin_hist, valuation_row)
+    fund_aligned = _align_fundamentals_to_dates(
+        df["date"], fin_hist, valuation_row=valuation_row, valuation_hist=valuation_hist,
+    )
     for col in FUNDAMENTAL_COLUMNS + FUNDAMENTAL_TREND_COLUMNS:
         result[col] = fund_aligned[col]
 
@@ -712,7 +795,7 @@ def _compute_benchmark_fwd_ret(
 
 def _add_industry_relative_features(
     df: pd.DataFrame,
-    code_to_industry: Dict[str, str],
+    code_to_industry,
 ) -> pd.DataFrame:
     """Add industry-relative percentile rank columns to a cross-sectional panel.
 
@@ -725,20 +808,53 @@ def _add_industry_relative_features(
     df : pd.DataFrame
         Panel with columns ``code``, ``date``, ``pe_ttm``, ``pb``,
         ``roe``, ``mom_20d``.
-    code_to_industry : dict
-        {code: industry_name} mapping from ``get_industry_mapping()``.
+    code_to_industry : dict[str, str] | pd.DataFrame
+        Either:
+        - ``{code: industry_name}`` dict from :func:`get_industry_mapping` —
+          every date uses the same (current) label.  **Introduces mild
+          look-ahead** for stocks that changed industry; fine for live
+          inference, unsafe for training.
+        - DataFrame ``(code, start_date, board_name)`` from
+          :func:`get_industry_history` — for each (code, date) we use the
+          label in effect on that date via ``merge_asof(backward)``.
+          Look-ahead-free; preferred for training / backtest.
 
     Returns
     -------
     The same DataFrame with INDUSTRY_RANK_COLUMNS added in-place.
     """
-    if df.empty or not code_to_industry:
+    if df.empty or code_to_industry is None or (
+        hasattr(code_to_industry, "__len__") and len(code_to_industry) == 0
+    ):
         for col in INDUSTRY_RANK_COLUMNS:
             df[col] = np.nan
         return df
 
     df = df.copy()
-    df["_industry"] = df["code"].map(code_to_industry)
+
+    if isinstance(code_to_industry, pd.DataFrame):
+        # Point-in-time: merge_asof(backward) picks the industry in effect as of `date`.
+        hist = code_to_industry[["code", "start_date", "board_name"]].copy()
+        hist["start_date"] = pd.to_datetime(hist["start_date"])
+        hist = hist.sort_values(["code", "start_date"]).reset_index(drop=True)
+
+        left = df[["code", "date"]].copy()
+        left["date"] = pd.to_datetime(left["date"])
+        left["_row"] = np.arange(len(left))
+
+        # merge_asof requires both sides sorted on the `on` key.
+        left_sorted = left.sort_values(["date"]).reset_index(drop=True)
+        merged = pd.merge_asof(
+            left_sorted,
+            hist.rename(columns={"start_date": "date"}).sort_values(["date"]).reset_index(drop=True),
+            on="date",
+            by="code",
+            direction="backward",
+        )
+        merged = merged.sort_values("_row").reset_index(drop=True)
+        df["_industry"] = merged["board_name"].to_numpy()
+    else:
+        df["_industry"] = df["code"].map(code_to_industry)
 
     _rank_map = {
         "pe_ind_rank": "pe_ttm",
@@ -813,12 +929,36 @@ def build_dataset(
         n_ok = sum(1 for v in fin_hist_map.values() if v is not None)
         logger.info("Got financial history for {}/{} stocks", n_ok, total)
 
+    # Pre-load historical PE/PB/market-cap in one SQL query, then split per code.
+    # Falls back silently when the valuation table is empty (legacy behaviour).
+    val_hist_map: Dict[str, pd.DataFrame] = {}
+    if include_fundamentals:
+        try:
+            from mp.data.store import DataStore as _DS
+            _start_iso = pd.to_datetime(str(start)).strftime("%Y-%m-%d")
+            _end_iso = (
+                pd.to_datetime(str(end)).strftime("%Y-%m-%d")
+                if end else None
+            )
+            vh_all = _DS().load_valuation_history(codes=codes, start=_start_iso, end=_end_iso)
+            if not vh_all.empty:
+                for code, grp in vh_all.groupby("code"):
+                    val_hist_map[code] = grp[["date", "pe_ttm", "pb", "total_mv"]].copy()
+                logger.info("Loaded historical valuation for {}/{} stocks", len(val_hist_map), total)
+            else:
+                logger.info("Valuation table is empty; PE/PB/market_cap will be NaN in training")
+        except Exception as e:
+            logger.warning("Failed to load historical valuation: {}", e)
+
     frames: List[pd.DataFrame] = []
     for idx, code in enumerate(codes):
         try:
             fin_hist = fin_hist_map.get(code) if include_fundamentals else None
+            val_hist = val_hist_map.get(code) if include_fundamentals else None
             part = _process_single_stock(code, start, end, horizon,
-                                         fin_hist=fin_hist, valuation_row=None)
+                                         fin_hist=fin_hist,
+                                         valuation_row=None,
+                                         valuation_hist=val_hist)
             if part is not None:
                 frames.append(part)
         except Exception:
@@ -865,11 +1005,11 @@ def build_dataset(
     # --- Industry-relative ranking features (cross-sectional post-processing) ---
     if include_fundamentals and len(dataset) > 0:
         try:
-            from mp.data.fetcher import get_industry_mapping
-            code_to_industry = get_industry_mapping(universe=codes)
-            dataset = _add_industry_relative_features(dataset, code_to_industry)
+            from mp.data.fetcher import get_industry_history
+            ind_hist = get_industry_history(universe=codes)
+            dataset = _add_industry_relative_features(dataset, ind_hist)
             n_ranked = dataset["pe_ind_rank"].notna().sum()
-            logger.info("Industry rank features added: {}/{} rows", n_ranked, len(dataset))
+            logger.info("Industry rank features added (PIT): {}/{} rows", n_ranked, len(dataset))
         except Exception as e:
             logger.warning("Industry rank features failed, skipping: {}", e)
             for col in INDUSTRY_RANK_COLUMNS:
@@ -1003,13 +1143,22 @@ def build_latest_features(
     # Both the display warning [缺] and the quality gate use the same col set —
     # total_mv_log is excluded from both so EM outages don't produce noisy [缺]
     # tags on otherwise well-predicted stocks.
+    # ETFs legitimately lack PE/PB/ROE (they track an index, not a company) —
+    # exclude them from the quality gate and per-row warning, otherwise e.g.
+    # holding 军工ETF (512660) alongside normal stocks always trips the
+    # "数据源异常" banner even when every real stock has full fundamentals.
+    from mp.data.fetcher import _is_etf_code
+
     def _make_warning(row):
+        if _is_etf_code(str(row.get("code", ""))):
+            return ""
         missing = [c for c in _QUALITY_GATE_COLS if pd.isna(row.get(c))]
         return ",".join(missing) if missing else ""
     result["_data_warnings"] = result.apply(_make_warning, axis=1)
 
     existing_gate = [c for c in _QUALITY_GATE_COLS if c in result.columns]
-    n_gate = int(result[existing_gate].isna().any(axis=1).sum()) if existing_gate else 0
+    _nonetf_mask = ~result["code"].astype(str).map(_is_etf_code)
+    n_gate = int(result.loc[_nonetf_mask, existing_gate].isna().any(axis=1).sum()) if existing_gate else 0
     n_warn = n_gate  # same set now
     result.attrs["_data_quality"] = 1.0 - (n_gate / len(result)) if len(result) > 0 else 0.0
     if n_warn > 0:

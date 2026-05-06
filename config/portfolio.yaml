@@ -2,29 +2,38 @@
 # type: stock (A股个股) / board (行业板块) / us_stock (美股) / etf (场内ETF)
 # shares / avg_cost / entry_date: 可选，填写后 Tab4 显示浮动盈亏
 # 更新方式: 发券商截图给 Claude，自动识别并更新
-# 最后更新: 2026-04-15 (OCR截图识别)
+# 最后更新: 2026-04-20 (OCR截图识别)
+# 账户快照: 总资产 83,052.60 / 总市值 82,686.00 / 可用 366.60 / 仓位 99.6%
+# 浮动盈亏 +3,179.92 / 当日盈亏 -86.70 (-0.10%)
 
 holdings:
-- name: 军工ETF
-  code: '512660'
+- name: 山东出版
+  code: '601019'
   type: stock
-  board: 军工装备
-  shares: 28500
-  avg_cost: 1.455
-  entry_date: ''
+  board: ''
+  shares: 6200
+  avg_cost: 7.68   # 当日新建仓，成本临时按现价；券商系统尚未显示实际均价
+  entry_date: '2026-04-20'
 - name: 豫园股份
   code: '600655'
   type: stock
   board: ''
   shares: 7000
-  avg_cost: 0.0
+  avg_cost: 4.861
   entry_date: ''
 - name: 粤电力A
   code: 000539
   type: stock
   board: ''
-  shares: 1200
-  avg_cost: 5.42
+  shares: 0    # 已清仓（实现盈利 +2,157.32 / +5.04%）
+  avg_cost: 5.531
+  entry_date: ''
+- name: 军工ETF
+  code: '512660'
+  type: stock
+  board: 军工装备
+  shares: 0    # 已清仓
+  avg_cost: 1.455
   entry_date: ''
 - name: 航天电器
   code: '002025'

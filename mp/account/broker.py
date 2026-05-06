@@ -188,9 +188,16 @@ class SimulatedBroker:
                 entry_date=str(date),
             )
 
+        # Friction breakdown for transparent reporting
+        slippage_cost = (exec_price - price) * buy_shares  # always >= 0 for buy
         trade = {
             "date": date, "code": code, "action": action,
             "shares": buy_shares, "price": exec_price, "value": total_cost,
+            "raw_price": price,
+            "slippage_cost": slippage_cost,
+            "commission": fee,
+            "stamp_tax": 0.0,
+            "total_friction": slippage_cost + fee,
         }
         self.trade_log.append(trade)
         if not self.silent:
@@ -229,7 +236,11 @@ class SimulatedBroker:
             return None
 
         proceeds = sell_shares * exec_price
-        fee = self.fees.sell_fee(proceeds, str(date))
+        # Compute commission + stamp tax separately for friction breakdown
+        commission = proceeds * self.fees.commission_bps / 10_000
+        stamp_rate = self.fees._stamp_tax_bps(str(date))
+        stamp_tax = proceeds * stamp_rate / 10_000
+        fee = commission + stamp_tax  # equivalent to self.fees.sell_fee(proceeds, str(date))
         net_proceeds = proceeds - fee
 
         self.cash += net_proceeds
@@ -238,9 +249,16 @@ class SimulatedBroker:
         if pos.shares <= 0:
             del self.positions[code]
 
+        # Friction breakdown for transparent reporting
+        slippage_cost = (price - exec_price) * sell_shares  # >= 0 for sell (exec < price)
         trade = {
             "date": date, "code": code, "action": action,
             "shares": sell_shares, "price": exec_price, "value": net_proceeds,
+            "raw_price": price,
+            "slippage_cost": slippage_cost,
+            "commission": commission,
+            "stamp_tax": stamp_tax,
+            "total_friction": slippage_cost + commission + stamp_tax,
         }
         self.trade_log.append(trade)
         if not self.silent:

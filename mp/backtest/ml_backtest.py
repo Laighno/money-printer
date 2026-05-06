@@ -1,4 +1,32 @@
-"""Individual-stock ML backtesting engine.
+"""Individual-stock ML backtesting engine  [⚠ LIGHTWEIGHT DEMO ONLY ⚠].
+
+.. warning::
+    **This module is NOT the canonical backtest pipeline.**  Use
+    ``scripts/walk_forward_backtest.py`` for any research / evaluation use.
+
+    Known gaps vs the canonical walk-forward pipeline:
+
+    1. **Survivorship bias**: ``_resolve_universe`` calls
+       ``get_index_constituents`` which returns today's index members — not
+       the Point-in-Time snapshot for each rebalance date.  The walk-forward
+       pipeline uses ``get_index_constituents_at`` across historical snapshots
+       (see ``scripts/walk_forward_backtest.py:295``).
+
+    2. **Feature mismatch**: this file computes technical + fundamental
+       factors but does NOT add industry-relative rank features.  The
+       production model (trained by walk-forward) uses the full
+       ``FACTOR_COLUMNS`` set including industry ranks, so at inference
+       those columns are NaN and the model ends up running on a degraded
+       feature set.
+
+    3. **Universe (snapshot + features)** drift: as snapshots accumulate the
+       walk-forward evaluator stays correct; this path does not.
+
+    Retained because it is **fast and useful for ad-hoc single-model
+    visualizations** (e.g. a quick "how does this saved .lgb behave on
+    2024-25 data").  Treat any quantitative comparison against
+    walk-forward with suspicion — the two pipelines are not the same
+    experiment.
 
 Runs a top-K stock-picking strategy driven by a pre-trained LightGBM model.
 On each rebalance date the engine:
@@ -11,7 +39,7 @@ On each rebalance date the engine:
 4. Between rebalance dates, tracks daily NAV and checks per-stock stop-loss
    / trailing-stop triggers.
 
-Usage::
+Usage (demo only)::
 
     from mp.backtest.ml_backtest import run_ml_backtest
 
@@ -40,8 +68,12 @@ from mp.backtest.engine import calc_performance
 from mp.data.fetcher import get_daily_bars, get_index_constituents
 from mp.ml.dataset import (
     FACTOR_COLUMNS,
+    FUNDAMENTAL_COLUMNS,
+    FUNDAMENTAL_TREND_COLUMNS,
     TECHNICAL_COLUMNS,
+    _align_fundamentals_to_dates,
     _compute_technical_factors,
+    _fetch_financial_history,
 )
 from mp.ml.model import FEATURE_COLS, StockRanker
 
@@ -125,17 +157,52 @@ def _prefetch_bars(
 
 def _build_factor_panel(
     bars_map: dict[str, pd.DataFrame],
+    include_fundamentals: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """Compute rolling technical factors for every stock over the full date range.
 
     Returns ``{code: factors_df}`` where *factors_df* is indexed like the
     bars and contains columns ``[date] + TECHNICAL_COLUMNS``.
 
-    Fundamental factors are filled with NaN here; they are quasi-static and
-    the model was trained with them potentially missing (especially PE/PB
-    which are snapshot-only).  For backtesting, the technical signal is the
-    primary alpha driver and this avoids any forward-looking financial data.
+    When ``include_fundamentals=True`` (default), also merges historical PE/PB/
+    total_mv from the valuation table and quarterly financials (ROE, growth,
+    trends) using ``merge_asof(backward)`` for look-ahead-free alignment. This
+    keeps the feature distribution consistent with ``build_dataset`` used in
+    training — otherwise the model sees NaN for fundamentals at serving time
+    and suffers training-serving skew.
+
+    When ``include_fundamentals=False``, fundamentals are NaN. total_mv_log
+    always has the derived float-mv fallback from daily bars so the column is
+    never completely empty.
     """
+    # Pre-load historical valuation once if fundamentals requested
+    val_hist_map: dict[str, pd.DataFrame] = {}
+    fin_hist_map: dict[str, pd.DataFrame | None] = {}
+    if include_fundamentals and bars_map:
+        try:
+            from mp.data.store import DataStore as _DS
+            codes = list(bars_map.keys())
+            date_min = min(df["date"].min() for df in bars_map.values() if len(df))
+            date_max = max(df["date"].max() for df in bars_map.values() if len(df))
+            vh_all = _DS().load_valuation_history(
+                codes=codes,
+                start=pd.Timestamp(date_min).strftime("%Y-%m-%d"),
+                end=pd.Timestamp(date_max).strftime("%Y-%m-%d"),
+            )
+            if not vh_all.empty:
+                for c, grp in vh_all.groupby("code"):
+                    val_hist_map[c] = grp[["date", "pe_ttm", "pb", "total_mv"]].copy()
+                logger.info(
+                    "Loaded historical valuation for {}/{} stocks",
+                    len(val_hist_map), len(codes),
+                )
+            else:
+                logger.warning(
+                    "Valuation table empty — PE/PB/total_mv will be NaN in factor panel"
+                )
+        except Exception as e:
+            logger.warning("Failed to load historical valuation: {}", e)
+
     factor_map: dict[str, pd.DataFrame] = {}
     for code, df in bars_map.items():
         if len(df) < _MIN_WARMUP_BARS:
@@ -164,19 +231,45 @@ def _build_factor_panel(
             fdf = pd.DataFrame({"date": df["date"].values})
             for col in TECHNICAL_COLUMNS:
                 fdf[col] = tech[col]
-            # Fill fundamental columns with NaN (model handles missing)
+            # Initialise all factor columns to NaN
             for col in FACTOR_COLUMNS:
                 if col not in fdf.columns:
                     fdf[col] = np.nan
-            # Derive total_mv_log from daily bars (close * volume / turnover)
+            # Derived float_mv fallback for total_mv_log (works even without
+            # valuation-table coverage).
             valid_t = turnover > 0
             float_mv = np.where(valid_t, close * volume / turnover, np.nan)
             fdf["total_mv_log"] = np.where(float_mv > 0, np.log(float_mv), np.nan)
             fdf["code"] = code
+
+            # --- Merge historical fundamentals (training-serving parity) ---
+            if include_fundamentals:
+                try:
+                    if code not in fin_hist_map:
+                        fin_hist_map[code] = _fetch_financial_history(code)
+                    fin_hist = fin_hist_map[code]
+                    val_hist = val_hist_map.get(code)
+                    fund = _align_fundamentals_to_dates(
+                        fdf["date"], fin_hist,
+                        valuation_row=None, valuation_hist=val_hist,
+                    )
+                    for col in FUNDAMENTAL_COLUMNS + FUNDAMENTAL_TREND_COLUMNS:
+                        new_vals = fund[col]
+                        if col == "total_mv_log":
+                            # Keep derived float-mv when historical valuation
+                            # has no coverage for that date.
+                            existing = fdf[col].to_numpy()
+                            fdf[col] = np.where(np.isnan(new_vals), existing, new_vals)
+                        else:
+                            fdf[col] = new_vals
+                except Exception as e:
+                    logger.debug("Fundamental alignment failed for {}: {}", code, e)
+
             factor_map[code] = fdf
         except Exception:
             logger.debug("Factor computation failed for {}", code)
-    logger.info("Built factor panel for {} stocks", len(factor_map))
+    logger.info("Built factor panel for {} stocks (fundamentals={})",
+                len(factor_map), include_fundamentals)
     return factor_map
 
 
@@ -316,14 +409,17 @@ def run_ml_backtest(
     trailing_stop_pct: float | None = None,
     min_score: float | None = None,
     sizing: str = "equal",
-    stop_loss_pct: float | None = None,
-    trailing_stop_pct: float | None = None,
-    min_score: float | None = None,
-    sizing: str = "equal",
     cost_aware_rebalance: bool = True,
     progress_callback: Callable | None = None,
 ) -> dict:
-    """Run an individual-stock ML backtest.
+    """Run an individual-stock ML backtest  [⚠ LIGHTWEIGHT DEMO].
+
+    .. warning::
+        This is **not** the canonical backtest.  Use
+        ``scripts/walk_forward_backtest.py`` for research / evaluation.
+        Known gaps: survivorship bias in the universe, missing
+        industry-relative features at inference.  See the module-level
+        docstring for details.
 
     Parameters
     ----------
@@ -373,6 +469,11 @@ def run_ml_backtest(
     # ------------------------------------------------------------------
     # 0. Setup
     # ------------------------------------------------------------------
+    logger.warning(
+        "run_ml_backtest() is a LIGHTWEIGHT DEMO — survivorship bias + "
+        "missing industry-relative features.  Use "
+        "scripts/walk_forward_backtest.py for research / evaluation."
+    )
     model_path = str(model_path)
     start_fmt = _normalize_date(start)
     end_fmt = _normalize_date(end)

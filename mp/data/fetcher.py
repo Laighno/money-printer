@@ -539,12 +539,26 @@ def get_daily_bars(code: str, start: str, end: str | None = None) -> pd.DataFram
             except Exception as e:
                 logger.debug(f"EM bars for {code}: {e}")
 
-    # Step 4: persist new rows to DB
+    # Step 4: filter & persist new rows to DB.
+    #
+    # CRITICAL: Sina/EM/ETF endpoints will sometimes return TODAY's intraday
+    # bar (using the current price as a fake "close") even when asked for an
+    # earlier end date.  Persisting that row makes downstream factor
+    # computation use a partial-bar as if it were EOD — a subtle PIT leak
+    # and the cause of the "行情: today" header glitch.  Filter out anything
+    # past _last_expected_trading_day() before save.
     if api_df is not None and not api_df.empty:
-        try:
-            store.save_bars_upsert(api_df)
-        except Exception as e:
-            logger.warning(f"Failed to save bars for {code} to DB: {e}")
+        last_expected = pd.Timestamp(_last_expected_trading_day())
+        before = len(api_df)
+        api_df = api_df[api_df["date"] <= last_expected]
+        if before != len(api_df):
+            logger.debug(f"{code}: dropped {before - len(api_df)} partial-bar row(s) "
+                         f"after {last_expected.date()}")
+        if not api_df.empty:
+            try:
+                store.save_bars_upsert(api_df)
+            except Exception as e:
+                logger.warning(f"Failed to save bars for {code} to DB: {e}")
 
     # Step 5: merge and return
     if not db_df.empty and api_df is not None and not api_df.empty:
@@ -588,7 +602,11 @@ def _is_etf_code(code: str) -> bool:
 
 
 def _get_daily_bars_etf(code: str, start: str, end: str) -> pd.DataFrame:
-    """Eastmoney ETF/fund daily bars via fund_etf_hist_em."""
+    """Eastmoney ETF/fund daily bars via fund_etf_hist_em.
+
+    Like _get_daily_bars_em, EM returns volume in 手 (100 shares) — normalize
+    to 股 (shares) at fetch time to match Sina convention storage-wide.
+    """
     df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
     df = df.rename(columns={
         "日期": "date", "开盘": "open", "最高": "high", "最低": "low",
@@ -597,6 +615,8 @@ def _get_daily_bars_etf(code: str, start: str, end: str) -> pd.DataFrame:
     })
     df["code"] = code
     df["date"] = pd.to_datetime(df["date"])
+    # Convert volume from 手 (100 shares) → 股 to match Sina convention
+    df["volume"] = df["volume"].astype(float) * 100
     if "turnover" not in df.columns:
         df["turnover"] = float("nan")
     return df[["code", "date", "open", "high", "low", "close", "volume", "amount", "turnover"]]
@@ -618,7 +638,15 @@ def _get_daily_bars_sina(code: str, start: str, end: str) -> pd.DataFrame:
 
 
 def _get_daily_bars_em(code: str, start: str, end: str) -> pd.DataFrame:
-    """Eastmoney daily bars."""
+    """Eastmoney daily bars.
+
+    UNIT NORMALIZATION (2026-04-28): Eastmoney returns 成交量 in 手 (lots,
+    1 手 = 100 shares), while Sina returns it in 股 (shares).  We normalize
+    EM to Sina convention (shares) at fetch time so all rows in daily_bars
+    share the same unit.  Otherwise volume-based factors (vwap_dev,
+    obv_slope, vol_price_corr, intraday_intensity, …) get contaminated when
+    a stock's row happens to come from EM fallback.
+    """
     df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
     df = df.rename(columns={
         "日期": "date", "开盘": "open", "最高": "high", "最低": "low",
@@ -627,6 +655,8 @@ def _get_daily_bars_em(code: str, start: str, end: str) -> pd.DataFrame:
     })
     df["code"] = code
     df["date"] = pd.to_datetime(df["date"])
+    # Convert volume from 手 (100 shares) → 股 (shares) to match Sina convention
+    df["volume"] = df["volume"].astype(float) * 100
     if "turnover" not in df.columns:
         df["turnover"] = float("nan")
     return df[["code", "date", "open", "high", "low", "close", "volume", "amount", "turnover"]]
@@ -795,24 +825,71 @@ def get_financial_data_batch(codes: list[str]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def get_industry_mapping(universe: list[str] | None = None) -> dict[str, str]:
-    """Return a {stock_code: industry_name} mapping for the given universe.
+def get_industry_history(universe: list[str] | None = None) -> pd.DataFrame:
+    """Return the full SW (申万) industry classification history.
 
-    Fetches all THS/EM industry board constituent lists concurrently and builds
-    the mapping.  Results are cached to disk for 7 days (industry membership
-    changes rarely).
-
-    Parameters
-    ----------
-    universe : list[str] or None
-        If provided, only codes in this list are included in the result.
-        If None, all codes found across all boards are returned.
+    Unlike :func:`get_industry_mapping` which flattens to one label per stock,
+    this returns every classification change event so callers can do
+    point-in-time lookup (critical to avoid look-ahead leakage in training).
 
     Returns
     -------
-    dict mapping 6-digit code → board_name string.  Empty dict on total failure.
+    pd.DataFrame
+        Columns: ``code``, ``start_date`` (datetime), ``board_name`` (str, SW L2
+        4-digit code).  Sorted by (code, start_date).  Empty if the upstream
+        call fails.
     """
-    cache_key = "industry_mapping_v1"
+    cache_key = "industry_history_v1"
+    cached = cache_get(cache_key, ttl=60 * 60 * 24 * 7)
+    if cached is not None and not cached.empty:
+        hist = cached.copy()
+        hist["start_date"] = pd.to_datetime(hist["start_date"], errors="coerce")
+        if universe:
+            hist = hist[hist["code"].isin(set(universe))]
+        return hist.sort_values(["code", "start_date"]).reset_index(drop=True)
+
+    try:
+        df = ak.stock_industry_clf_hist_sw()
+    except Exception as e:
+        logger.warning(f"stock_industry_clf_hist_sw failed: {e}")
+        return pd.DataFrame(columns=["code", "start_date", "board_name"])
+    if df is None or df.empty or not {"symbol", "start_date", "industry_code"}.issubset(df.columns):
+        return pd.DataFrame(columns=["code", "start_date", "board_name"])
+
+    df = df.copy()
+    df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce")
+    df = df.dropna(subset=["start_date", "industry_code", "symbol"])
+    df = df[df["start_date"] <= pd.Timestamp.today()]
+    df["code"] = df["symbol"].astype(str).str.zfill(6)
+    df["board_name"] = df["industry_code"].astype(str).str[:4]
+    result = (df[["code", "start_date", "board_name"]]
+              .sort_values(["code", "start_date"])
+              .reset_index(drop=True))
+    cache_put(cache_key, result)
+    logger.info(f"Industry history built: {len(result)} rows, "
+                f"{result['code'].nunique()} stocks, "
+                f"{result['board_name'].nunique()} L2 boards")
+    if universe:
+        result = result[result["code"].isin(set(universe))].reset_index(drop=True)
+    return result
+
+
+def get_industry_mapping(universe: list[str] | None = None) -> dict[str, str]:
+    """Return a {stock_code: industry_name} mapping for the given universe.
+
+    Primary source: ``ak.stock_industry_clf_hist_sw`` — a single API call that
+    returns the full historical SW (申万) classification for every A-share
+    (~12K rows, ~5800 stocks). We pick the most recent row per stock to get
+    the current industry.  Uses SW L2 (first 4 digits of the industry_code) as
+    the board name — L2 has ~130 groups, which is the right granularity for
+    cross-sectional ``pe_ind_rank``-style features.
+
+    Fallback: if the single call fails, walk the 90 THS boards one-by-one
+    (slow + incomplete due to blocked EM path, but keeps some functionality).
+
+    Results are cached to disk for 7 days (SW taxonomy changes rarely).
+    """
+    cache_key = "industry_mapping_v2"
     cached = cache_get(cache_key, ttl=60 * 60 * 24 * 7)  # 7 days
     if cached is not None and not cached.empty:
         mapping = dict(zip(cached["code"], cached["board_name"]))
@@ -821,7 +898,35 @@ def get_industry_mapping(universe: list[str] | None = None) -> dict[str, str]:
         logger.debug(f"Industry mapping served from cache ({len(mapping)} stocks)")
         return mapping
 
-    logger.info("Fetching industry mapping (all boards)...")
+    # --- Primary: SW historical classification (full A-share in one call) ---
+    logger.info("Fetching industry mapping from SW historical classification...")
+    try:
+        df = ak.stock_industry_clf_hist_sw()
+        if df is not None and not df.empty and {"symbol", "start_date", "industry_code"}.issubset(df.columns):
+            df = df.copy()
+            df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce")
+            df = df.dropna(subset=["start_date", "industry_code", "symbol"])
+            # Only keep classifications that have started (some entries may be future-dated)
+            df = df[df["start_date"] <= pd.Timestamp.today()]
+            # Latest row per stock → current industry
+            latest = (df.sort_values(["symbol", "start_date"])
+                        .groupby("symbol", as_index=False)
+                        .tail(1))
+            latest["code"] = latest["symbol"].astype(str).str.zfill(6)
+            # SW L2: first 4 digits of industry_code (e.g. 480301 → 4803 = 银行)
+            latest["board_name"] = latest["industry_code"].astype(str).str[:4]
+            result_df = latest[["code", "board_name"]].drop_duplicates(subset=["code"], keep="last")
+            cache_put(cache_key, result_df)
+            logger.info(f"Industry mapping built from SW clf_hist: {len(result_df)} stocks, "
+                        f"{result_df['board_name'].nunique()} L2 boards")
+            mapping = dict(zip(result_df["code"], result_df["board_name"]))
+            if universe:
+                mapping = {c: v for c, v in mapping.items() if c in set(universe)}
+            return mapping
+    except Exception as e:
+        logger.warning(f"SW clf_hist fetch failed ({e}), falling back to per-board sweep")
+
+    # --- Fallback: per-board sweep (slow, incomplete) ---
     try:
         boards_df = get_industry_list()
         if boards_df.empty:
@@ -857,7 +962,7 @@ def get_industry_mapping(universe: list[str] | None = None) -> dict[str, str]:
 
     result_df = pd.DataFrame(rows).drop_duplicates(subset=["code"], keep="first")
     cache_put(cache_key, result_df)
-    logger.info(f"Industry mapping built: {len(result_df)} stocks across {len(board_names)} boards")
+    logger.info(f"Industry mapping (fallback): {len(result_df)} stocks across {len(board_names)} boards")
 
     mapping = dict(zip(result_df["code"], result_df["board_name"]))
     if universe:

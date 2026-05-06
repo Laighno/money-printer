@@ -13,3 +13,6 @@ data/cache/
 .ruff_cache/
 .pytest_cache/
 data/training_dataset*.parquet
+data/backup_pre_volume_fix/
+data/wf_cache/
+data/paper_trade/
