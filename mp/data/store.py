@@ -1,17 +1,39 @@
 """Local data storage with SQLite."""
 
+import os
 from pathlib import Path
 
 import pandas as pd
 from loguru import logger
 from sqlalchemy import create_engine, text
 
+DEFAULT_DB_URL = "sqlite:///data/market.db"
+
+
+def _resolve_db_url(explicit: str | None = None) -> str:
+    """Resolve the DB URL with this priority:
+
+    1. ``explicit`` argument (highest)
+    2. ``MP_DB_PATH`` environment variable (path or sqlite:/// URL)
+    3. ``DEFAULT_DB_URL`` (production default)
+
+    Tests can monkeypatch ``MP_DB_PATH`` to redirect the store to a temp file
+    without modifying call sites.
+    """
+    if explicit:
+        return explicit
+    env = os.environ.get("MP_DB_PATH")
+    if env:
+        return env if env.startswith("sqlite") else f"sqlite:///{env}"
+    return DEFAULT_DB_URL
+
 
 class DataStore:
-    def __init__(self, db_url: str = "sqlite:///data/market.db"):
-        db_path = db_url.replace("sqlite:///", "")
+    def __init__(self, db_url: str | None = None):
+        url = _resolve_db_url(db_url)
+        db_path = url.replace("sqlite:///", "")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.engine = create_engine(db_url)
+        self.engine = create_engine(url)
         self._init_tables()
 
     def _init_tables(self):
@@ -55,6 +77,15 @@ class DataStore:
                     PRIMARY KEY (code, report_date)
                 )
             """))
+            # Idempotent migration: older DBs created before publish_date was
+            # added will silently drop it on insert and corrupt point-in-time
+            # alignment on DB-fallback paths.  Add it if missing.
+            try:
+                conn.execute(text("ALTER TABLE financial ADD COLUMN publish_date TEXT"))
+                conn.commit()
+                logger.info("Migrated financial table: added publish_date column")
+            except Exception:
+                pass  # column already exists
             # Constituent snapshots: one row per (index, date, stock_code).
             # Accumulates quarterly over time; used to build a time-varying
             # backtest universe and mitigate survivorship bias.
@@ -82,6 +113,11 @@ class DataStore:
         """Insert or replace bars — safe for incremental updates without duplicates.
 
         Returns the number of rows written.
+
+        Sanity check (2026-04-28): rows where amount/(volume*close) is far
+        from 1.0 indicate a unit mismatch (e.g. EM lots-vs-shares).  Such
+        rows are dropped with a warning rather than written, to prevent
+        feature contamination downstream.
         """
         if df.empty:
             return 0
@@ -92,6 +128,30 @@ class DataStore:
             if c not in df.columns:
                 df[c] = None
         df = df[cols]
+
+        # Drop rows with obvious volume-unit mismatch.  Allow some slack
+        # (0.3 ~ 3.0) for legitimate floating-point + price-vs-VWAP variance.
+        try:
+            v = df["volume"].astype(float)
+            a = df["amount"].astype(float)
+            c = df["close"].astype(float)
+            ratio = a / (v * c)
+            valid = (ratio > 0.3) & (ratio < 3.0)
+            # Allow rows where any of v/a/c is missing (NaN) — sanity check is best-effort
+            valid = valid | v.isna() | a.isna() | c.isna() | (v == 0) | (c == 0)
+            n_bad = (~valid).sum()
+            if n_bad > 0:
+                logger.warning(
+                    "save_bars_upsert: dropping {} rows with amount/(volume*close) "
+                    "out of [0.3, 3.0] (likely volume unit mismatch). Sample: {}",
+                    n_bad,
+                    df.loc[~valid, ["code", "date", "volume", "amount", "close"]].head(3).to_dict("records"),
+                )
+                df = df[valid].reset_index(drop=True)
+                if df.empty:
+                    return 0
+        except Exception as e:
+            logger.debug(f"Sanity check skipped: {e}")
 
         written = 0
         with self.engine.connect() as conn:
@@ -215,16 +275,41 @@ class DataStore:
     # --- valuation ---
 
     def save_valuation(self, df: pd.DataFrame):
+        """Upsert valuation rows by (code, date).
+
+        Previously this method deleted ALL rows for each date before inserting,
+        which was safe only when the caller passed a full cross-sectional
+        snapshot. For per-stock historical backfills the old behaviour would
+        wipe previously-saved stocks.  We now delete by (code, date) pair.
+        """
         if df.empty:
             return
         df = df.copy()
         df["date"] = df["date"].astype(str)
+        df["code"] = df["code"].astype(str).str.zfill(6)
+        pairs = df[["code", "date"]].drop_duplicates()
         with self.engine.connect() as conn:
-            for d in df["date"].unique():
-                conn.execute(text("DELETE FROM valuation WHERE date = :d"), {"d": d})
+            # Batch delete by (code, date) — chunked to keep SQL param count sane.
+            rows = list(pairs.itertuples(index=False, name=None))
+            CHUNK = 500
+            for i in range(0, len(rows), CHUNK):
+                chunk = rows[i : i + CHUNK]
+                placeholders = ",".join(
+                    f"(:c{j}, :d{j})" for j in range(len(chunk))
+                )
+                params: dict = {}
+                for j, (code, d) in enumerate(chunk):
+                    params[f"c{j}"] = code
+                    params[f"d{j}"] = d
+                conn.execute(
+                    text(
+                        f"DELETE FROM valuation WHERE (code, date) IN ({placeholders})"
+                    ),
+                    params,
+                )
             conn.commit()
         df.to_sql("valuation", self.engine, if_exists="append", index=False, method="multi", chunksize=500)
-        logger.info(f"Saved {len(df)} valuation rows")
+        logger.info(f"Saved {len(df)} valuation rows ({len(pairs)} unique (code,date))")
 
     def load_valuation(self, codes: list[str] | None = None, date_str: str | None = None) -> pd.DataFrame:
         query = "SELECT * FROM valuation WHERE 1=1"
@@ -244,6 +329,37 @@ class DataStore:
     def has_valuation_data(self) -> bool:
         with self.engine.connect() as conn:
             return conn.execute(text("SELECT COUNT(*) FROM valuation")).scalar() > 0
+
+    def load_valuation_history(
+        self,
+        codes: list[str] | None = None,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> pd.DataFrame:
+        """Load valuation rows across a date range.
+
+        Used for training-time alignment of daily PE/PB/market-cap, in contrast
+        to :meth:`load_valuation` which only returns a single date's snapshot.
+        """
+        query = "SELECT code, date, pe_ttm, pb, total_mv FROM valuation WHERE 1=1"
+        params: dict = {}
+        if start:
+            query += " AND date >= :start"
+            params["start"] = str(start)
+        if end:
+            query += " AND date <= :end"
+            params["end"] = str(end)
+        if codes:
+            # Normalise to 6-digit strings on both sides of the IN clause.
+            codes = [str(c).zfill(6) for c in codes]
+            placeholders = ",".join(f":c{i}" for i in range(len(codes)))
+            query += f" AND code IN ({placeholders})"
+            for i, c in enumerate(codes):
+                params[f"c{i}"] = c
+        df = pd.read_sql(text(query), self.engine, params=params)
+        if not df.empty:
+            df["code"] = df["code"].astype(str).str.zfill(6)
+        return df
 
     # --- financial (with publish_date for time-alignment) ---
 

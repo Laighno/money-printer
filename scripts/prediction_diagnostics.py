@@ -43,6 +43,7 @@ BT_START = "20200101"
 BT_END = "20260401"
 HORIZON = 20
 TOP_K = 10
+UNIVERSE = "zz500"  # must match walk_forward_backtest.py
 
 CACHE_DIR = Path("data/wf_cache")
 FACTORS_CACHE = CACHE_DIR / "factors.parquet"
@@ -107,6 +108,104 @@ def _get_monthly_retrain_dates(panel: pd.DataFrame) -> List[pd.Timestamp]:
     return monthly.tolist()
 
 
+# ──────────────────────────────────────────────────────────────────────
+# PIT universe filters — mirror walk_forward_backtest.py
+#
+# The evaluation panel includes the union of historical index members
+# (so look-back features are computable).  Without a PIT filter, scoring
+# and training leak into periods when a stock was not yet in the index,
+# inflating metrics vs what the strategy could actually trade.
+# ──────────────────────────────────────────────────────────────────────
+
+_PIT_CACHE: dict[int, tuple[set, dict]] = {}  # id(panel) -> (membership, month_universe)
+
+
+def _build_pit_filters(panel: pd.DataFrame,
+                       universe: str = UNIVERSE,
+                       silent: bool = False,
+                       ) -> tuple[set[tuple[str, pd.Period]], dict[pd.Period, frozenset]]:
+    """Return (membership, month_universe) built from DB constituent snapshots.
+
+    membership: set of (code, month_period) pairs — O(1) per-row PIT training filter.
+    month_universe: {month_period -> frozenset(codes)} for per-date scoring filter.
+
+    If fewer than 2 snapshots exist, returns empty structures (caller should
+    fall back to no filter and log a survivorship warning).
+    """
+    pid = id(panel)
+    if pid in _PIT_CACHE:
+        return _PIT_CACHE[pid]
+
+    from mp.data.fetcher import get_index_constituents_at
+    from mp.data.store import DataStore
+
+    try:
+        snap_dates = DataStore().list_constituent_snapshot_dates(universe)
+    except Exception as e:
+        logger.warning("PIT snapshot lookup failed ({}); no filter applied.", e)
+        _PIT_CACHE[pid] = (set(), {})
+        return _PIT_CACHE[pid]
+
+    if len(snap_dates) < 2:
+        if not silent:
+            logger.warning(
+                "PIT filter: only {} constituent snapshot(s) for {} — "
+                "no PIT filter applied (survivorship bias present).  "
+                "Run scripts/backfill_constituents.py to accumulate snapshots.",
+                len(snap_dates), universe)
+        _PIT_CACHE[pid] = (set(), {})
+        return _PIT_CACHE[pid]
+
+    # Build per-month universe across TRAIN_START .. today
+    months = pd.period_range(
+        start=pd.Timestamp(TRAIN_START).to_period("M"),
+        end=pd.Timestamp.today().to_period("M"),
+        freq="M",
+    )
+    month_universe: dict[pd.Period, frozenset] = {}
+    membership: set[tuple[str, pd.Period]] = set()
+    for pm in months:
+        asof = pm.to_timestamp(how="end").strftime("%Y-%m-%d")
+        snap = get_index_constituents_at(universe, asof)
+        if snap:
+            codes_set = frozenset(snap)
+            month_universe[pm] = codes_set
+            for c in codes_set:
+                membership.add((c, pm))
+    if not silent:
+        logger.info("PIT filter: {} (code, month) pairs across {} months from {} {} snapshots",
+                    len(membership), len(month_universe), len(snap_dates), universe)
+    _PIT_CACHE[pid] = (membership, month_universe)
+    return _PIT_CACHE[pid]
+
+
+def _pit_filter_training(train_df: pd.DataFrame, membership: set) -> pd.DataFrame:
+    """Filter training rows to PIT index members.  No-op if membership is empty."""
+    if not membership:
+        return train_df
+    months = train_df["date"].dt.to_period("M")
+    keep = [(c, p) in membership
+            for c, p in zip(train_df["code"].to_numpy(), months.to_numpy())]
+    return train_df.loc[keep]
+
+
+def _pit_filter_scoring(today_df: pd.DataFrame,
+                         month_universe: dict,
+                         dt: pd.Timestamp) -> pd.DataFrame:
+    """Filter scoring rows to the index universe known at ``dt``.
+
+    No-op if month_universe is empty.
+    """
+    if not month_universe:
+        return today_df
+    pm = pd.Timestamp(dt).to_period("M")
+    codes_set = month_universe.get(pm)
+    if codes_set is None:
+        # No snapshot for this month — fall back to no filter for this date.
+        return today_df
+    return today_df[today_df["code"].isin(codes_set)]
+
+
 def run_scoring_loop(force: bool = False) -> pd.DataFrame:
     """Monthly retrain + full-universe scoring → diagnostics.parquet.
 
@@ -137,6 +236,8 @@ def run_scoring_loop(force: bool = False) -> pd.DataFrame:
     records: List[dict] = []
     current_ranker: Optional[StockRanker] = None
 
+    membership, month_universe = _build_pit_filters(panel)
+
     for i, dt in enumerate(retrain_dates):
         logger.info("[{}/{}] Retrain & score: {}", i + 1, len(retrain_dates),
                     dt.strftime("%Y-%m-%d"))
@@ -145,6 +246,7 @@ def run_scoring_loop(force: bool = False) -> pd.DataFrame:
         label_cutoff = _label_cutoff(panel, dt)
         train_mask = (panel["date"] < label_cutoff) & panel["fwd_ret"].notna()
         train_df = panel.loc[train_mask]
+        train_df = _pit_filter_training(train_df, membership)
 
         if len(train_df) < 500:
             logger.warning("  Too few training rows ({}), skipping", len(train_df))
@@ -160,8 +262,9 @@ def run_scoring_loop(force: bool = False) -> pd.DataFrame:
             logger.error("  Training failed: {}", e)
             continue
 
-        # --- Score all stocks on this date ---
+        # --- Score stocks that were PIT members on this date ---
         today_df = panel.loc[panel["date"] == dt].copy()
+        today_df = _pit_filter_scoring(today_df, month_universe, dt)
         today_valid = today_df.dropna(subset=core_cols)
 
         if today_valid.empty:
@@ -249,6 +352,7 @@ def run_scoring_loop_experiment(
     core_cols = TECHNICAL_COLUMNS[:13]
     records: List[dict] = []
     current_ranker: Optional[StockRanker] = None
+    membership, month_universe = _build_pit_filters(panel)
 
     for i, dt in enumerate(retrain_dates):
         logger.info("[{}/{}] {}: retrain {}", i + 1, len(retrain_dates), tag,
@@ -257,6 +361,7 @@ def run_scoring_loop_experiment(
         label_cutoff = _label_cutoff(panel, dt)
         train_mask = (panel["date"] < label_cutoff) & panel[label_col].notna()
         train_df = panel.loc[train_mask]
+        train_df = _pit_filter_training(train_df, membership)
 
         # Filter training data to mid/large caps if requested
         if train_cap_pctile > 0 and "total_mv_log" in train_df.columns:
@@ -282,6 +387,7 @@ def run_scoring_loop_experiment(
             continue
 
         today_df = panel.loc[panel["date"] == dt].copy()
+        today_df = _pit_filter_scoring(today_df, month_universe, dt)
         today_valid = today_df.dropna(subset=core_cols)
         if today_valid.empty:
             continue
@@ -1394,6 +1500,7 @@ def run_scoring_loop_tuned(
     core_cols = TECHNICAL_COLUMNS[:13]
     records: List[dict] = []
     current_ranker: Optional[StockRanker] = None
+    membership, month_universe = _build_pit_filters(panel)
 
     for i, dt in enumerate(retrain_dates):
         logger.info("[{}/{}] {}: retrain {}", i + 1, len(retrain_dates), tag,
@@ -1402,6 +1509,7 @@ def run_scoring_loop_tuned(
         label_cutoff = _label_cutoff(panel, dt)
         train_mask = (panel["date"] < label_cutoff) & panel[label_col].notna()
         train_df = panel.loc[train_mask]
+        train_df = _pit_filter_training(train_df, membership)
 
         # Extreme training: keep only top/bottom pctile per date
         if extreme_pctile > 0:
@@ -1430,6 +1538,7 @@ def run_scoring_loop_tuned(
             continue
 
         today_df = panel.loc[panel["date"] == dt].copy()
+        today_df = _pit_filter_scoring(today_df, month_universe, dt)
         today_valid = today_df.dropna(subset=core_cols)
         if today_valid.empty:
             continue
@@ -1807,6 +1916,7 @@ def run_scoring_loop_blend(
 
     core_cols = TECHNICAL_COLUMNS[:13]
     records: List[dict] = []
+    membership, month_universe = _build_pit_filters(panel)
 
     for i, dt in enumerate(retrain_dates):
         logger.info("[{}/{}] {}: retrain {}", i + 1, len(retrain_dates), tag,
@@ -1819,6 +1929,7 @@ def run_scoring_loop_blend(
             & panel[primary_label].notna()
         )
         train_df = panel.loc[train_mask]
+        train_df = _pit_filter_training(train_df, membership)
 
         if len(train_df) < 500:
             continue
@@ -1838,17 +1949,23 @@ def run_scoring_loop_blend(
             continue
 
         today_df = panel.loc[panel["date"] == dt].copy()
+        today_df = _pit_filter_scoring(today_df, month_universe, dt)
         today_valid = today_df.dropna(subset=core_cols)
         if today_valid.empty:
             continue
 
         scores = ranker.predict(today_valid)
+        # Also capture raw component scores so we can sweep weights post-hoc.
+        s_primary = ranker.primary.predict(today_valid)
+        s_extreme = ranker.extreme.predict(today_valid)
         for idx_row, (_, row) in enumerate(today_valid.iterrows()):
             fwd = row["fwd_ret"] if pd.notna(row.get("fwd_ret")) else np.nan
             records.append({
                 "score_date": dt,
                 "code": row["code"],
                 "pred_score": float(scores[idx_row]),
+                "primary_score": float(s_primary[idx_row]),
+                "extreme_score": float(s_extreme[idx_row]),
                 "fwd_ret": float(fwd),
             })
 
@@ -2572,6 +2689,10 @@ def main():
         "blend_best": None,             # walk-forward blend: excess_ret(0.80) + extreme30(0.20)
         "blend_posthoc": None,          # post-hoc blend from cached diagnostics
         "blend_82_18": None,            # walk-forward blend: excess_ret(0.82) + extreme30(0.18)
+        "blend_70_30": None,            # walk-forward blend: 0.70/0.30
+        "blend_75_25": None,            # walk-forward blend: 0.75/0.25
+        "blend_85_15": None,            # walk-forward blend: 0.85/0.15
+        "blend_90_10": None,            # walk-forward blend: 0.90/0.10
     }
 
     # Tuned experiment configs: tag -> (lgb_params, extreme_pctile)
@@ -2744,6 +2865,22 @@ def main():
             diag_df = run_scoring_loop_blend(
                 force=args.force, tag="blend_82_18",
                 weight_primary=0.82, extreme_pctile=0.30)
+        elif args.experiment == "blend_75_25":
+            diag_df = run_scoring_loop_blend(
+                force=args.force, tag="blend_75_25",
+                weight_primary=0.75, extreme_pctile=0.30)
+        elif args.experiment == "blend_85_15":
+            diag_df = run_scoring_loop_blend(
+                force=args.force, tag="blend_85_15",
+                weight_primary=0.85, extreme_pctile=0.30)
+        elif args.experiment == "blend_90_10":
+            diag_df = run_scoring_loop_blend(
+                force=args.force, tag="blend_90_10",
+                weight_primary=0.90, extreme_pctile=0.30)
+        elif args.experiment == "blend_70_30":
+            diag_df = run_scoring_loop_blend(
+                force=args.force, tag="blend_70_30",
+                weight_primary=0.70, extreme_pctile=0.30)
         elif args.experiment == "blend_posthoc":
             diag_df = run_posthoc_blend(
                 tag_a="excess_ret", tag_b="extreme30",

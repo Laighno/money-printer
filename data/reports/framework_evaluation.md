@@ -1,8 +1,90 @@
 # Money Printer 量化框架评估报告
 
-**生成时间**: 2026-04-13
+**生成时间**: 2026-04-13（原版）/ 2026-04-22（研究收敛后定稿）
 **评估范围**: 2020-01 ~ 2026-03 (75个月)
 **基准**: 中证500 (ZZ500)
+
+> 📌 **单页基线速查 → [`BASELINE.md`](BASELINE.md)**
+> 本报告是研究过程档案；日常决策看 BASELINE。本报告"已否决 / 已验证"两节的结论都已搬进去，更便于查阅。
+
+---
+
+## ⚠ 结论分层索引（2026-04-21 更新）
+
+### ✅ 已确认 — evidence-based，PIT-clean 数据支持
+
+- **策略显著跑赢基准**：主回测 Sharpe=1.62、年化 49.34%，vs ZZ500 年化 6.02%。
+- **"on_change" 再平衡策略优于 drift_threshold=10%**：A/B 结果（见文末 A/B section）每个维度都占优（年化 +1.58pp / Sharpe +0.03 / 回撤 -0.42pp），换手只低 0.8% — 结构性结论，不是噪声。
+- **Extreme head 在牛熊 regime 里仍有独立信号**：per-regime ICIR 分别 1.105 / 1.190，明显高于 primary 单独使用。
+- **PIT 修正后，主回测数字才是真数**：修完 survivorship + 非 PIT industry + PIT scoring universe 三处口径问题后，最终 Sharpe 稳定在 **1.62**（旧数据 2.54 / 过程值 2.14 都含泄漏）。
+
+### 📝 已修正 — 先前口径问题或快判失误
+
+- **诊断链路（prediction_diagnostics.py）先前未做 PIT universe 过滤**，导致 top-K / ICIR 被 survivorship 高估约 30-40%。修复后 ICIR 从 ~0.93 → ~0.63（数据见 §三 更新）。
+- **"extreme head 可退役" 的快判错了**：基于单期 train-val IC（0.027）下的结论没考虑跨 regime 聚合信号。per-regime 数据显示 extreme 在牛熊里 ICIR > 1.0，震荡市稀释了总体表现。
+- **辅助回测链路（mp/backtest/ml_backtest.py）口径长期落后**：survivorship + 缺少 industry-relative 特征。已降级为 demo-only（docstring + runtime warning），不再作为研究级回测。
+- **本报告原版中"0.80/0.20 vs 50/50 vs posthoc"的对比结论基于 survivorship-inflated 数据**。现在 PIT-clean 数据显示 blend weight 在 [0.60, 1.00] 区间是 flat plateau，差异多在 <0.3pp，不是稳定的"最优点"。建议维持 0.80 默认，任何切换都应以 A/B 证据而非参数搜索为准。
+
+### 🔬 待验证 — open questions，需要新实验
+
+- ~~**Regime-aware blend / regime proxy as feature**~~ → **已否定**，见下方 ❌ 段 A/B #2。
+- ~~**drift_threshold 在更大 Top-K 下是否仍劣**~~ → **已验证：会反转**。见下方 ✅ 段"Top-K × rebalance 矩阵"。
+- ~~**更高费率假设下的脆弱性**~~ → **已验证：不敏感**。见下方 ✅ 段"SLIPPAGE_BPS 敏感性"。
+- ~~**Intraday 盘中打分的泄漏面**~~：已审计，**无泄漏**。详见 [`intraday_leak_audit.md`](intraday_leak_audit.md)。审计结论：午间报告只使用快照时点已知数据；但存在 **分布漂移**（morning-partial 特征 vs 训练用 EOD 特征），可解释粤电力A 等午后排名跳变现象。未造成 look-ahead，不需修复。
+- **残留**：mp.backtest.ic_analysis 的 RuntimeWarning（invalid value in divide）、diagnostics 剩余 10 个非关键 scoring loops 还没补 PIT（机械工作，非阻塞）。
+
+### ✅ 已验证 (sensitivity) — 追加结论
+
+**SLIPPAGE_BPS 敏感性（5→10 bps, 2x）：策略不敏感**
+
+| Metric | SLIPPAGE=5 | SLIPPAGE=10 | Δ |
+|---|---:|---:|---:|
+| annual | 48.52% | 49.55% | +1.03pp (noise 级) |
+| sharpe | 1.60 | 1.63 | +0.03 |
+| max_dd | -26.04% | -26.25% | -0.21pp |
+| total_return | 971.44% | 1017.06% | ~noise |
+
+差异全部落在 LGBM 随机种子的噪声带（~1% annual）内。**结论**：对真实交易的费率假设具有稳健性；5-10 bps 区间里费率不是决定性因素。
+
+**Top-K × rebalance policy 矩阵**：on_change 与 drift 的优劣在不同 K 下**反转**
+
+| Top-K | Policy | Annual | Sharpe | Max DD | Calmar |
+|---|---|---:|---:|---:|---:|
+| **10** | on_change | **48.52%** | 1.60 | **-26.04%** | **1.86** |
+| 10 | drift (10%) | 47.76% | 1.59 | -26.54% | 1.80 |
+| 30 | on_change | 39.39% | 1.60 | -31.24% | 1.26 |
+| **30** | **drift (10%)** | **40.12%** | **1.63** | -31.42% | **1.28** |
+
+**观察**：
+1. **Top-K 越大，年化越低**（48.5% → 39.4%）但波动也降（30.4% → 24.6%）—— 典型的分散化 trade-off；Sharpe 基本不变。
+2. **在 Top-K=10 时 on_change 胜**（名单变化频繁，自然换手已充分；drift 触发的额外再平衡是噪声交易）。
+3. **在 Top-K=30 时 drift 胜**（名单更稳定，靠 drift 触发的权重再平衡能恢复等权），Top-K=30 drift 在 Sharpe 和 Calmar 上双优。
+4. **策略选择原则**：Top-K ≤ 15 维持 `on_change`；Top-K ≥ 25 开启 `drift_threshold=0.10`。中间 Top-K=15-25 未测试，待需要时再做。
+5. **生产当前 Top-K=10 → 保持 `on_change` 不变**，这个结论没动摇。
+
+运行记录：`data/reports/sensitivity/{slippage10,topk30_on_change,topk30_drift}.md`。
+
+### ❌ 已否定 — A/B 证据显示该方向反而更差
+
+- **Regime proxy 作为训练 feature（#3a）**：把 5 个 per-date 特征（ZZ500 20d/60d 动量、20d 波动率、60d 回撤、横截面 breadth）加入 LGBM 训练集，**全面显著恶化**：
+
+  | Metric | Baseline | +Regime | Δ |
+  |---|---:|---:|---:|
+  | total_return | 971.44% | 595.59% | **-375.85pp** |
+  | annual | 48.52% | 38.19% | **-10.33pp** |
+  | sharpe | 1.60 | 1.30 | **-0.30** |
+  | max_dd | -26.04% | -35.60% | **-9.56pp** |
+  | calmar | 1.86 | 1.07 | **-0.79** |
+
+  **原因**：label `excess_ret = fwd_ret - bench_fwd_ret` 是横截面 ranking 目标。regime 特征在同一 date 内对所有 stock 取同一值 —— **对排序本身 0 信息**。模型只能通过 tree split 把它们当"日期 indicator"与其他 per-stock 特征 cross，等价于给 2022/2024 等特定日期的横截面噪声**颁发 overfit 许可证**。
+  事后 IC 分析里看到的"`amihud_illiq` bull IC 比 flat 高 40%"是真的，但 marginal 提升远小于引入日期级过拟合的成本。
+
+  **衍生结论**：
+  1. Regime-aware **blend**（#3b）大概率也负贡献 —— 数学上只是 regime feature 的受限版本（硬阈值切换 vs 树学软规则），且 hindsight regime 标签会让 PIT 成本更高。**不再追**。
+  2. 想让模型用 regime 信息，正确方向是把 regime 信号**乘进 stock-level 特征**（例如 `mom_20d × (1 + zz500_dd_60d)`），让它本身就是横截面变量。先存这个想法，非本轮优先级。
+  3. 代码 `USE_REGIME_FEATURES` 开关留着（默认 OFF），作为本次否定性实验的可复现 artefact。`mp/ml/regime_features.py` 保留，可能对未来的非 ML 信号过滤有用。
+
+  运行记录：`data/reports/ab_regime/{baseline,regime}.md`（分别 3.9/4.0 min）。
 
 ---
 

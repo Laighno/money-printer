@@ -1,24 +1,236 @@
 [
   {
-    "date": "2026-04-15",
+    "date": "2026-04-18",
     "bt_metrics": {
-      "total_return": "899.60%",
-      "annual_return": "46.81%",
-      "sharpe_ratio": "1.54",
-      "max_drawdown": "-40.04%",
-      "win_rate": "52.81%"
+      "total_return": "1328.39%",
+      "annual_return": "55.81%",
+      "annual_volatility": "29.33%",
+      "sharpe_ratio": "1.90",
+      "calmar_ratio": "1.51",
+      "max_drawdown": "-37.00%",
+      "win_rate": "53.74%",
+      "trading_days": 1511
     },
     "bt_benchmark": {
-      "total_return": 0.4195,
-      "annual_return": 0.0602
+      "total_return": 0.4195173512123618,
+      "annual_return": 0.06016525204010459,
+      "days": 1511
     },
     "model_ic": {
       "20d": null,
-      "60d": 0.154
+      "60d": 0.1943408440935017
     },
     "model_hit_rate": {
       "20d": null,
-      "60d": 0.55
+      "60d": 0.5980357142857142
+    }
+  },
+  {
+    "date": "2026-04-19",
+    "bt_metrics": {
+      "total_return": "1328.39%",
+      "annual_return": "55.81%",
+      "annual_volatility": "29.33%",
+      "sharpe_ratio": "1.90",
+      "calmar_ratio": "1.51",
+      "max_drawdown": "-37.02%",
+      "win_rate": "53.81%",
+      "trading_days": 1511
+    },
+    "bt_benchmark": {
+      "total_return": 0.4195173512123618,
+      "annual_return": 0.06016525204010459,
+      "days": 1511
+    },
+    "model_ic": {
+      "20d": null,
+      "60d": 0.1943408440935017
+    },
+    "model_hit_rate": {
+      "20d": null,
+      "60d": 0.5980357142857142
+    }
+  },
+  {
+    "date": "2026-04-19",
+    "bt_metrics": {
+      "total_return": "2775.64%",
+      "annual_return": "75.10%",
+      "annual_volatility": "29.62%",
+      "sharpe_ratio": "2.54",
+      "calmar_ratio": "2.30",
+      "max_drawdown": "-32.67%",
+      "win_rate": "55.00%",
+      "trading_days": 1511
+    },
+    "bt_benchmark": {
+      "total_return": 0.4195173512123618,
+      "annual_return": 0.06016525204010459,
+      "days": 1511
+    },
+    "model_ic": {
+      "20d": null,
+      "60d": 0.19256147109246285
+    },
+    "model_hit_rate": {
+      "20d": null,
+      "60d": 0.6283928571428572
+    }
+  },
+  {
+    "date": "2026-04-19",
+    "bt_metrics": {
+      "total_return": "1724.51%",
+      "annual_return": "62.30%",
+      "annual_volatility": "29.10%",
+      "sharpe_ratio": "2.14",
+      "calmar_ratio": "2.08",
+      "max_drawdown": "-29.92%",
+      "win_rate": "55.06%",
+      "trading_days": 1511
+    },
+    "bt_benchmark": {
+      "total_return": 0.4195173512123618,
+      "annual_return": 0.06016525204010459,
+      "days": 1511
+    },
+    "model_ic": {
+      "20d": null,
+      "60d": 0.19801081085880973
+    },
+    "model_hit_rate": {
+      "20d": null,
+      "60d": 0.6230357142857144
+    }
+  },
+  {
+    "date": "2026-04-19",
+    "bt_metrics": {
+      "total_return": "3499.24%",
+      "annual_return": "81.78%",
+      "annual_volatility": "32.93%",
+      "sharpe_ratio": "2.48",
+      "calmar_ratio": "2.45",
+      "max_drawdown": "-33.41%",
+      "win_rate": "54.67%",
+      "trading_days": 1511
+    },
+    "bt_benchmark": {
+      "total_return": 0.4195173512123618,
+      "annual_return": 0.06016525204010459,
+      "days": 1511
+    },
+    "model_ic": {
+      "20d": null,
+      "60d": 0.19801081085880973
+    },
+    "model_hit_rate": {
+      "20d": null,
+      "60d": 0.6230357142857144
+    }
+  },
+  {
+    "date": "2026-04-19",
+    "bt_metrics": {
+      "total_return": "1005.06%",
+      "annual_return": "49.28%",
+      "annual_volatility": "30.40%",
+      "sharpe_ratio": "1.62",
+      "calmar_ratio": "1.89",
+      "max_drawdown": "-26.08%",
+      "win_rate": "54.00%",
+      "trading_days": 1511
+    },
+    "bt_benchmark": {
+      "total_return": 0.4195173512123618,
+      "annual_return": 0.06016525204010459,
+      "days": 1511
+    },
+    "model_ic": {
+      "20d": null,
+      "60d": 0.19801081085880973
+    },
+    "model_hit_rate": {
+      "20d": null,
+      "60d": 0.6230357142857144
+    }
+  },
+  {
+    "date": "2026-04-21",
+    "bt_metrics": {
+      "total_return": "1007.76%",
+      "annual_return": "49.34%",
+      "annual_volatility": "30.38%",
+      "sharpe_ratio": "1.62",
+      "calmar_ratio": "1.89",
+      "max_drawdown": "-26.12%",
+      "win_rate": "54.00%",
+      "trading_days": 1511
+    },
+    "bt_benchmark": {
+      "total_return": 0.4195173512123618,
+      "annual_return": 0.06016525204010459,
+      "days": 1511
+    },
+    "model_ic": {
+      "20d": null,
+      "60d": 0.19506352232496516
+    },
+    "model_hit_rate": {
+      "20d": null,
+      "60d": 0.6058928571428572
+    }
+  },
+  {
+    "date": "2026-04-21",
+    "bt_metrics": {
+      "total_return": "595.59%",
+      "annual_return": "38.19%",
+      "annual_volatility": "29.32%",
+      "sharpe_ratio": "1.30",
+      "calmar_ratio": "1.07",
+      "max_drawdown": "-35.60%",
+      "win_rate": "52.81%",
+      "trading_days": 1511
+    },
+    "bt_benchmark": {
+      "total_return": 0.4195173512123618,
+      "annual_return": 0.06016525204010459,
+      "days": 1511
+    },
+    "model_ic": {
+      "20d": null,
+      "60d": 0.1926941327726825
+    },
+    "model_hit_rate": {
+      "20d": null,
+      "60d": 0.6174999999999999
+    }
+  },
+  {
+    "date": "2026-04-28",
+    "bt_metrics": {
+      "total_return": "1400.65%",
+      "annual_return": "57.10%",
+      "annual_volatility": "31.50%",
+      "sharpe_ratio": "1.81",
+      "calmar_ratio": "2.08",
+      "max_drawdown": "-27.44%",
+      "win_rate": "53.81%",
+      "trading_days": 1511
+    },
+    "bt_benchmark": {
+      "total_return": 0.4195173512123618,
+      "annual_return": 0.06016525204010459,
+      "days": 1511
+    },
+    "model_ic": {
+      "20d": null,
+      "60d": 0.19348643104503688
+    },
+    "model_hit_rate": {
+      "20d": null,
+      "60d": 0.6054867256637168
     }
   }
 ]

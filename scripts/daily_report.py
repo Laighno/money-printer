@@ -224,37 +224,45 @@ def evaluate_holdings(ranker, regime: MarketRegime | None = None, intraday_bars:
     result = result.sort_values("ml_score", ascending=False).reset_index(drop=True)
 
     if is_rank:
-        # ── Absolute-return based recommendation ─────────────────────────────
-        # BlendRanker predicts excess_ret (market-relative); to answer "should
-        # I hold this stock?" we need estimated absolute return:
+        # ── Display + suggestion口径（2026-04-28 修正）─────────────────────────
+        # 旧实现把模型预测超额（forward 20d）与中证500 trailing 20d 实际涨跌相加，
+        # 概念混淆（forward + backward 时间窗），且在趋势市严重失真——大涨时
+        # 几乎所有票显示正预测、大跌时全部显示负预测，全部被建议加仓/清仓。
         #
-        #   effective_ret = predicted_excess_ret + bench_ret_20d
+        # 修正后：
+        #   • bench_adj = 长期均值常数（中证500 年化 ~6% / 12 ≈ +0.5%/月）
+        #     —— 不假装能预测短期市场方向，给一个无偏的参考基线
+        #   • suggestion 阈值改回基于 raw_return（即模型预测的 excess_ret），
+        #     与回测的换仓决策口径一致（横截面排名 + 超额）
+        #   • effective_return 仍然显示，作为绝对收益参考，但不进入决策
         #
-        # bench_ret_20d is ZZ500's actual 20-trading-day return fetched in
-        # real time by RegimeDetector — not a fixed constant.  This means:
-        #   bear market where ZZ500 dropped 8%: bench_adj = -8%
-        #   bull market where ZZ500 rose 5%:    bench_adj = +5%
-        #
-        # Falls back to 0 if regime is unavailable.
-        bench_adj = regime.bench_ret_20d if regime else 0.0
+        # 历史数据（2015-2026）证实 A 股的简单"跌 X% 空仓"规则**不可靠**
+        # （详见 BASELINE.md），故不加任何择时空仓信号。市场风险敞口由
+        # broker 层的止损 / 追踪止损 / 组合熔断兜底。
+        LONG_TERM_BENCH_20D = 0.005   # 中证500 长期年化 ~6% / 12 个月 ≈ 0.5%
 
-        result["effective_return"] = result["raw_return"] + bench_adj
+        result["bench_adj_long_term"] = LONG_TERM_BENCH_20D
+        result["effective_return"] = result["raw_return"] + LONG_TERM_BENCH_20D
 
-        def suggest(eff):
+        def suggest(excess):
+            """基于模型预测超额（raw_return）做换仓建议。
+            阈值与回测换仓口径一致：超额排序是首要决策依据。"""
             import math
-            if eff is None or (isinstance(eff, float) and math.isnan(eff)):
+            if excess is None or (isinstance(excess, float) and math.isnan(excess)):
                 return "减仓"
-            if eff > 0.04:
+            if excess > 0.03:        # 模型看好（超额 > 3%）
                 return "加仓"
-            elif eff > 0.00:
+            elif excess > 0.00:      # 模型看平偏多
                 return "持有"
-            elif eff > -0.03:
+            elif excess > -0.03:     # 模型小幅看空
                 return "减仓"
-            else:
+            else:                    # 模型明显看空
                 return "清仓"
 
-        result["suggestion"] = result["effective_return"].apply(suggest)
+        # suggestion 用 raw_return（excess），不用 effective_return（绝对预期）
+        result["suggestion"] = result["raw_return"].apply(suggest)
         result["predicted_return"] = (result["effective_return"] * 100).round(2)
+        result["predicted_excess"] = (result["raw_return"] * 100).round(2)
     else:
         # Original return-based thresholds with regime shift (±2pp)
         shift = regime.score * 0.02 if regime else 0.0
@@ -621,7 +629,7 @@ def generate_rebalance_advice(
                 "action": "清仓",
                 "sell_code": h["code"], "sell_name": h["name"], "sell_score": h_ret,
                 "buy_code": None, "buy_name": None, "buy_score": None,
-                "reason": f"预测收益 {h_ret:+.2f}%，模型看空",
+                "reason": f"绝对参考 {h_ret:+.2f}%，模型看空",
             }
             # If there's a candidate that beats cost, upgrade to 换仓
             if candidate_idx < len(candidates):
@@ -630,7 +638,7 @@ def generate_rebalance_advice(
                     entry.update({
                         "action": "换仓",
                         "buy_code": c["code"], "buy_name": c["name"], "buy_score": c["predicted_return"],
-                        "reason": f"预测收益 {h_ret:+.2f}% → {c['predicted_return']:+.2f}%（扣除交易成本后仍有优势）",
+                        "reason": f"绝对参考 {h_ret:+.2f}% → {c['predicted_return']:+.2f}%（扣除交易成本后仍有优势）",
                     })
                     candidate_idx += 1
             advice.append(entry)
@@ -643,9 +651,9 @@ def generate_rebalance_advice(
                     if is_rank:
                         c_rank = c.get("rank_pct", c["ml_score"])
                         h_rank = h.get("rank_pct", h_score)
-                        reason = f"排名提升 前{(1-h_rank)*100:.0f}% → 前{(1-c_rank)*100:.0f}%，预测收益 {h_ret:+.2f}% → {c['predicted_return']:+.2f}%"
+                        reason = f"排名提升 前{(1-h_rank)*100:.0f}% → 前{(1-c_rank)*100:.0f}%，绝对参考 {h_ret:+.2f}% → {c['predicted_return']:+.2f}%"
                     else:
-                        reason = f"预测收益 {h_ret:+.2f}% → {c['predicted_return']:+.2f}%，扣费后净提升 {c['predicted_return'] - h_ret - ROUND_TRIP_COST * 100:+.2f}pp"
+                        reason = f"绝对参考 {h_ret:+.2f}% → {c['predicted_return']:+.2f}%，扣费后净提升 {c['predicted_return'] - h_ret - ROUND_TRIP_COST * 100:+.2f}pp"
                     advice.append({
                         "action": "换仓",
                         "sell_code": h["code"], "sell_name": h["name"], "sell_score": h_ret,
@@ -676,7 +684,7 @@ def generate_rebalance_advice(
                     if is_rank:
                         c_rank = c.get("rank_pct", c["ml_score"])
                         h_rank = h.get("rank_pct", h_score)
-                        reason = f"发现更优标的: 排名 前{(1-h_rank)*100:.0f}% → 前{(1-c_rank)*100:.0f}%，预测收益 {h_ret:+.2f}% → {c['predicted_return']:+.2f}%"
+                        reason = f"发现更优标的: 排名 前{(1-h_rank)*100:.0f}% → 前{(1-c_rank)*100:.0f}%，绝对参考 {h_ret:+.2f}% → {c['predicted_return']:+.2f}%"
                     else:
                         reason = f"发现更优标的: {h_ret:+.2f}% → {c['predicted_return']:+.2f}%，扣费后净提升 {c['predicted_return'] - h_ret - ROUND_TRIP_COST * 100:+.2f}pp"
                     advice.append({
@@ -691,14 +699,14 @@ def generate_rebalance_advice(
                         "action": "保持",
                         "sell_code": h["code"], "sell_name": h["name"], "sell_score": h_ret,
                         "buy_code": None, "buy_name": None, "buy_score": None,
-                        "reason": f"预测收益 {h_ret:+.2f}%，{suggestion}",
+                        "reason": f"绝对参考 {h_ret:+.2f}%，{suggestion}",
                     })
             else:
                 advice.append({
                     "action": "保持",
                     "sell_code": h["code"], "sell_name": h["name"], "sell_score": h_ret,
                     "buy_code": None, "buy_name": None, "buy_score": None,
-                    "reason": f"预测收益 {h_ret:+.2f}%，{suggestion}",
+                    "reason": f"绝对参考 {h_ret:+.2f}%，{suggestion}",
                 })
 
     return advice
@@ -749,8 +757,16 @@ def recommend_stocks(ranker, n_recommend: int = 5, intraday_bars: dict | None = 
 
     is_rank = getattr(ranker, "score_type", "predicted_return") == "rank_percentile"
     if is_rank:
+        # BlendRanker: predict_raw 返回 primary 模型的 excess_ret 预测（小数）
+        # 显示口径与 evaluate_holdings 保持一致：
+        #   • predicted_excess = 模型超额预测百分比（决策依据）
+        #   • predicted_return = predicted_excess + 长期均值 0.5%（绝对参考）
+        # 不再用 trailing 20d 作为基准加项（详见 BASELINE.md）
+        LONG_TERM_BENCH_20D = 0.005
         raw = ranker.predict_raw(features)
-        result["predicted_return"] = (pd.Series(raw) * 100).round(2)
+        raw_pct = pd.Series(raw)
+        result["predicted_excess"] = (raw_pct * 100).round(2)
+        result["predicted_return"] = ((raw_pct + LONG_TERM_BENCH_20D) * 100).round(2)
         result["rank_pct"] = result["ml_score"].round(4)
     else:
         result["predicted_return"] = (result["ml_score"] * 100).round(2)
@@ -800,11 +816,19 @@ def _make_data_timestamps(
     data IS from right now.  For daily reports, bar data comes from DB close
     prices and we show the DB date so stale data is visible.
 
-    Valuation date always comes from the DB (MAX date in valuation table) so
-    a cache hit from yesterday shows yesterday's date, not today's fetch time.
+    Both bar_date and valuation_date use the most recent date with SUBSTANTIAL
+    coverage (>= MIN_REPRESENTATIVE_ROWS), not raw MAX(date).  This avoids the
+    failure mode where a stray partial-bar row for "today" (e.g. an ETF intraday
+    quote accidentally upserted into daily_bars) makes the report claim 行情:
+    today when 99% of stocks only have data through yesterday.
     """
     from mp.data.store import DataStore
     from sqlalchemy import text as _text
+
+    # Threshold: a date must have at least this many rows to be reported as
+    # "the data date".  Calibrated for ZZ500 (~500 stocks); set well below 500
+    # so that minor data outages don't trigger fallbacks.
+    MIN_REPRESENTATIVE_ROWS = 100
 
     fmt_dt = "%Y-%m-%d %H:%M"
     result = {
@@ -813,22 +837,35 @@ def _make_data_timestamps(
         "generated_at": datetime.now().strftime(fmt_dt),
     }
 
+    def _representative_date(conn, table: str) -> str:
+        """Return the most recent date with >= MIN_REPRESENTATIVE_ROWS in *table*."""
+        row = conn.execute(_text(
+            f"SELECT date FROM {table} GROUP BY date "
+            f"HAVING COUNT(*) >= :min_rows ORDER BY date DESC LIMIT 1"
+        ), {"min_rows": MIN_REPRESENTATIVE_ROWS}).scalar()
+        return str(row)[:10] if row else "N/A"
+
     try:
         store = DataStore()
         with store.engine.connect() as conn:
-            # Valuation: always show the actual date of the cached data
-            val_row = conn.execute(_text("SELECT MAX(date) FROM valuation")).scalar()
-            if val_row:
-                result["valuation_date"] = str(val_row)[:10]
+            bar_date = _representative_date(conn, "daily_bars")
+            val_date = _representative_date(conn, "valuation")
+
+            # If valuation snapshot is fresher than the latest EOD bars, it
+            # means a real-time intraday snapshot was just refreshed.  Mark it
+            # explicitly so the report doesn't misleadingly claim "估值: today"
+            # when the underlying PE/PB are derived from morning prices, not EOD.
+            if val_date != "N/A" and bar_date != "N/A" and val_date > bar_date:
+                val_date = f"{val_date}(盘中)"
+
+            result["valuation_date"] = val_date
 
             if intraday and bar_fetched_at is not None:
                 # Midday: bars are live intraday quotes fetched right now
                 result["bar_date"] = bar_fetched_at.strftime(fmt_dt)
             else:
-                # Daily: bars come from DB — show actual data date, not fetch time
-                bar_row = conn.execute(_text("SELECT MAX(date) FROM daily_bars")).scalar()
-                if bar_row:
-                    result["bar_date"] = str(bar_row)[:10]
+                # Daily: latest DB date with substantial coverage
+                result["bar_date"] = bar_date
     except Exception as e:
         logger.debug("Failed to collect data timestamps: {}", e)
 
@@ -911,6 +948,9 @@ def _format_markdown(
         lines.append("")
 
     lines.append("## 持仓评估")
+    lines.append("> 口径说明：决策看**模型超额预测 + 综合排名**；"
+                 "**绝对参考 = 模型超额 + 长期均值 +0.5%**（中证500 长期年化 6%/12 个月），"
+                 "不再使用 trailing 20d 涨跌做加项。")
     is_rank = "rank_pct" in holdings_eval.columns if not holdings_eval.empty else False
     if holdings_eval.empty:
         lines.append("*无 A 股持仓*")
@@ -919,7 +959,13 @@ def _format_markdown(
         for _, row in holdings_eval.iterrows():
             icon = {"加仓": "🟢", "持有": "🟡", "减仓": "🟠", "清仓": "🔴"}.get(row["suggestion"], "⚪")
             if is_rank and pd.notna(row.get("rank_pct")):
-                score_text = f"综合排名: **前{(1-row['rank_pct'])*100:.1f}%**  预测收益: **{row['predicted_return']:+.2f}%**"
+                excess = row.get("predicted_excess", float("nan"))
+                if pd.notna(excess):
+                    score_text = (f"排名: **前{(1-row['rank_pct'])*100:.1f}%**  "
+                                  f"模型超额: **{excess:+.2f}%**  "
+                                  f"绝对参考: {row['predicted_return']:+.2f}%")
+                else:
+                    score_text = f"排名: **前{(1-row['rank_pct'])*100:.1f}%**  绝对参考: {row['predicted_return']:+.2f}%"
             else:
                 score_text = f"预测20日收益: **{row['predicted_return']:+.2f}%**"
             # Realtime price info (midday report)
@@ -992,7 +1038,13 @@ def _format_markdown(
         lines.append("")
         for i, row in recommendations.iterrows():
             if rec_is_rank and pd.notna(row.get("rank_pct")):
-                score_text = f"综合排名: **前{(1-row['rank_pct'])*100:.1f}%**  预测收益: **{row['predicted_return']:+.2f}%**"
+                excess = row.get("predicted_excess", float("nan"))
+                if pd.notna(excess):
+                    score_text = (f"排名: **前{(1-row['rank_pct'])*100:.1f}%**  "
+                                  f"模型超额: **{excess:+.2f}%**  "
+                                  f"绝对参考: {row['predicted_return']:+.2f}%")
+                else:
+                    score_text = f"排名: **前{(1-row['rank_pct'])*100:.1f}%**  绝对参考: {row['predicted_return']:+.2f}%"
             else:
                 score_text = f"预测20日收益: **{row['predicted_return']:+.2f}%**"
             lines.append(
@@ -1077,7 +1129,11 @@ def format_feishu_card(
         for _, row in holdings_eval.iterrows():
             icon = {"加仓": "🟢", "持有": "🟡", "减仓": "🟠", "清仓": "🔴"}.get(row["suggestion"], "⚪")
             if is_rank and pd.notna(row.get("rank_pct")):
-                ret_str = f"前{(1-row['rank_pct'])*100:.1f}% ({row['predicted_return']:+.2f}%)"
+                excess = row.get("predicted_excess", float("nan"))
+                if pd.notna(excess):
+                    ret_str = f"前{(1-row['rank_pct'])*100:.1f}% (超额{excess:+.2f}%)"
+                else:
+                    ret_str = f"前{(1-row['rank_pct'])*100:.1f}% ({row['predicted_return']:+.2f}%)"
             else:
                 ret_str = f"{row['predicted_return']:+.2f}%"
 
@@ -1109,7 +1165,7 @@ def format_feishu_card(
             else:
                 rows.append(f"| {row['name']} | {ret_str}{warn_mark} | {pred_60d} | {sig_str}{rating_str} | {icon}{row['suggestion']} |")
 
-        header_score = "排名(预测)" if is_rank else "预测20d"
+        header_score = "排名(模型超额)" if is_rank else "预测20d"
         if any(pd.notna(r.get("realtime_price")) for _, r in holdings_eval.iterrows()):
             table_md = (
                 f"| 股票 | 涨跌 | {header_score} | 预测60d | 信号评分 | 建议 |\n"
@@ -1197,7 +1253,13 @@ def format_feishu_card(
         rec_rows = []
         for i, row in recommendations.iterrows():
             if rec_is_rank and pd.notna(row.get("rank_pct")):
-                ret_str = f"前{(1-row['rank_pct'])*100:.1f}% ({row['predicted_return']:+.2f}%)"
+                # Show pure model excess (consistent with holdings table at line 1134),
+                # not predicted_return (which is excess + 0.5% baseline = '绝对参考').
+                excess = row.get("predicted_excess", float("nan"))
+                if pd.notna(excess):
+                    ret_str = f"前{(1-row['rank_pct'])*100:.1f}% (超额{excess:+.2f}%)"
+                else:
+                    ret_str = f"前{(1-row['rank_pct'])*100:.1f}% ({row['predicted_return']:+.2f}%)"
             else:
                 ret_str = f"{row['predicted_return']:+.2f}%"
 

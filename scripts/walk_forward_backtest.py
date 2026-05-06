@@ -51,6 +51,7 @@ from mp.ml.dataset import (
     _add_industry_relative_features,
 )
 from mp.ml.model import FEATURE_COLS, StockRanker
+from mp.ml.regime_features import REGIME_COLUMNS, add_regime_features
 
 # ──────────────────────────────────────────────────────────────────────
 # Parameters
@@ -58,17 +59,71 @@ from mp.ml.model import FEATURE_COLS, StockRanker
 
 INITIAL_CAPITAL = 100_000       # 10万元
 UNIVERSE = "zz500"
-TRAIN_START = "20150101"        # expanding window start
+TRAIN_START = "20160501"        # expanding window start (Baidu 近十年 covers from 2016-04)
 BT_START = "20200101"           # first trading month
 BT_END = "20260401"             # last month (exclusive)
-TOP_K = 10
+TOP_K = int(os.environ.get("TOP_K", "10"))
 HORIZON = 20                    # forward return horizon in trading days
-SLIPPAGE_BPS = 5
-COMMISSION_BPS = 3
+SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", "5"))
+COMMISSION_BPS = int(os.environ.get("COMMISSION_BPS", "3"))
 COST_AWARE_REBALANCE = True      # skip swaps where score gap < round-trip cost
 
+# Rebalance policy — controls when to rebalance positions that are still
+# selected (same Top-K names as yesterday).  Positions that drop out of the
+# selection are always sold regardless of policy.
+#
+#   "on_change"        : only rebalance when selection changes (low turnover).
+#                        Weights drift with price movement — default, preserves
+#                        historical behavior.
+#   "drift_threshold"  : additionally rebalance on days where any held position's
+#                        weight deviates from equal-weight target by more than
+#                        ``MAX_WEIGHT_DRIFT`` (e.g. 0.10 = 10 percentage points).
+#                        Enforces stricter equal-weight at the cost of turnover.
+#
+# Override with env var REBALANCE_POLICY for A/B runs.
+REBALANCE_POLICY = os.environ.get("REBALANCE_POLICY", "on_change")
+MAX_WEIGHT_DRIFT = float(os.environ.get("MAX_WEIGHT_DRIFT", "0.10"))
+assert REBALANCE_POLICY in ("on_change", "drift_threshold"), \
+    f"Unknown REBALANCE_POLICY={REBALANCE_POLICY}"
+
+# Which ranker to use for monthly retrain.  "stock" = StockRanker on fwd_ret
+# (the historical default, validated at 1.81 Sharpe / 57% annual after the
+# 2026-04-28 data fix).  "blend" = BlendRanker (0.8 primary on excess_ret +
+# 0.2 extreme), which is what daily_report.py and paper_trade.py actually use.
+# Validating "blend" here is the missing piece — until this completes we
+# don't know if BlendRanker matches/beats StockRanker on the same backtest.
+RANKER_KIND = os.environ.get("RANKER_KIND", "stock")
+assert RANKER_KIND in ("stock", "blend"), f"Unknown RANKER_KIND={RANKER_KIND}"
+
+# Position-sizing scheme for the Top-K selection.
+#   "equal"      : 1/N each (BASELINE-validated, default).
+#   "inverse_vol": weight ∝ 1 / volatility_20d, normalized.  Lower-vol stocks
+#                  get bigger positions, with the goal of reducing portfolio
+#                  vol & DD.  Falls back to equal-weight if any vol is missing.
+# Position-sizing default switched 2026-04-29 from "equal" to "conviction":
+# conviction (weight ∝ model's predicted excess) outperforms equal-weight on
+# Sharpe 2.01 vs 1.88, annual 69.84% vs 54.25%, Calmar 3.07 vs 2.21.
+# Leak audit (POSITION_SIZING=conviction_oracle, using realized fwd_ret as
+# weights) gave 366% annual / Sharpe 6.77 — 5x higher than real conviction —
+# proving the model's edge is real, not future-leaked.
+POSITION_SIZING = os.environ.get("POSITION_SIZING", "conviction")
+assert POSITION_SIZING in ("equal", "inverse_vol", "conviction", "vol_target",
+                           "conviction_oracle"), f"Unknown POSITION_SIZING={POSITION_SIZING}"
+# "conviction_oracle" = LEAK-CHECK ONLY.  Uses REALIZED fwd_ret as conviction,
+# which is information the model could not have at decision time.  Result is
+# the upper bound of "perfect-conviction" performance.  If real conviction is
+# anywhere close to oracle, real conviction is leaking.  If oracle is much
+# higher, real conviction is just exploiting genuine model edge.
+
+# Regime-proxy features: zz500 momentum/volatility/drawdown + cross-sectional
+# breadth, added as per-date features (same value for all stocks on a date).
+# LGBM can learn regime↔factor interactions via tree splits.  Toggle via env
+# var USE_REGIME_FEATURES=1 for A/B testing.
+USE_REGIME_FEATURES = os.environ.get("USE_REGIME_FEATURES", "0") == "1"
+
 CACHE_DIR = Path("data/wf_cache")
-REPORT_PATH = Path("data/reports/walk_forward_result.md")
+REPORT_PATH = Path(os.environ.get(
+    "WF_REPORT_PATH", "data/reports/walk_forward_result.md"))
 
 # ──────────────────────────────────────────────────────────────────────
 # Data Preparation
@@ -119,9 +174,11 @@ def _load_or_build_factors(
         logger.info("Loaded factor panel: {} rows", len(panel))
         return panel
 
-    # Build technical factors
+    # Build technical factors only; fundamentals are aligned below in this
+    # script (WF owns its own richer merge path — keep _build_factor_panel
+    # from doing the same work twice).
     logger.info("Building factor panel for {} stocks...", len(bars_map))
-    factor_map = _build_factor_panel(bars_map)
+    factor_map = _build_factor_panel(bars_map, include_fundamentals=False)
 
     # Merge into one big DataFrame
     frames = []
@@ -135,15 +192,47 @@ def _load_or_build_factors(
 
     # Add fundamental factors (time-aligned)
     logger.info("Fetching and aligning fundamental data...")
+
+    # Pre-load all historical PE/PB/total_mv once; split per-code below.
+    val_hist_map: Dict[str, pd.DataFrame] = {}
+    try:
+        from mp.data.store import DataStore as _DS
+        _date_min = panel["date"].min().strftime("%Y-%m-%d")
+        _date_max = panel["date"].max().strftime("%Y-%m-%d")
+        vh_all = _DS().load_valuation_history(codes=codes, start=_date_min, end=_date_max)
+        if not vh_all.empty:
+            for c, grp in vh_all.groupby("code"):
+                val_hist_map[c] = grp[["date", "pe_ttm", "pb", "total_mv"]].copy()
+            logger.info("Loaded historical valuation for {}/{} stocks",
+                        len(val_hist_map), len(codes))
+        else:
+            logger.warning("Valuation table empty — PE/PB/total_mv will be NaN")
+    except Exception as e:
+        logger.warning("Failed to load historical valuation: {}", e)
+
     for code in codes:
         mask = panel["code"] == code
         if mask.sum() == 0:
             continue
         fin_hist = _fetch_financial_history(code)
         code_dates = panel.loc[mask, "date"]
-        fund = _align_fundamentals_to_dates(code_dates, fin_hist, None)
+        val_hist = val_hist_map.get(code)
+        fund = _align_fundamentals_to_dates(
+            code_dates, fin_hist, valuation_row=None, valuation_hist=val_hist,
+        )
         for col in FUNDAMENTAL_COLUMNS + FUNDAMENTAL_TREND_COLUMNS:
-            panel.loc[mask, col] = fund[col]
+            new_vals = fund[col]
+            # For total_mv_log, fall back to the derived float-mv proxy
+            # (computed in _build_factor_panel) when historical valuation is
+            # missing (e.g. pre-2016 dates beyond Baidu's 近十年 lookback).
+            if col == "total_mv_log":
+                existing = panel.loc[mask, col].to_numpy()
+                merged_vals = np.where(
+                    np.isnan(new_vals), existing, new_vals,
+                )
+                panel.loc[mask, col] = merged_vals
+            else:
+                panel.loc[mask, col] = new_vals
 
     # Compute forward returns for each stock
     logger.info("Computing {}-day forward returns...", HORIZON)
@@ -174,11 +263,15 @@ def _load_or_build_factors(
     # Industry-relative ranking features
     logger.info("Computing industry-relative ranking features...")
     try:
-        from mp.data.fetcher import get_industry_mapping
-        code_to_industry = get_industry_mapping(universe=codes)
-        panel = _add_industry_relative_features(panel, code_to_industry)
+        # Point-in-time industry assignment: for each (code, date) use the
+        # SW classification in effect on that date (merge_asof backward).
+        # Avoids look-ahead from stocks that switched industries mid-panel
+        # (~67% of A-share stocks have >=1 historical reclassification).
+        from mp.data.fetcher import get_industry_history
+        ind_hist = get_industry_history(universe=codes)
+        panel = _add_industry_relative_features(panel, ind_hist)
         n_ranked = panel["pe_ind_rank"].notna().sum()
-        logger.info("Industry rank features: {}/{} rows", n_ranked, len(panel))
+        logger.info("Industry rank features (PIT): {}/{} rows", n_ranked, len(panel))
     except Exception as e:
         logger.warning("Industry rank features failed, skipping: {}", e)
         for col in INDUSTRY_RANK_COLUMNS:
@@ -208,6 +301,104 @@ def _get_monthly_retrain_dates(panel: pd.DataFrame) -> List[pd.Timestamp]:
 
 
 _ADV_PERIOD = 20   # days for rolling average daily value
+
+
+_VOL_TARGET_ANNUAL = 0.25   # target annualized portfolio vol for "vol_target"
+
+
+def _compute_position_weights(
+    codes: list,
+    dt: pd.Timestamp,
+    panel_by_date: Dict[pd.Timestamp, pd.DataFrame],
+    sizing: str,
+    raw_scores: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
+    """Return {code: weight}.
+
+    For "equal" / "inverse_vol" / "conviction": weights sum to 1 (fully invested).
+    For "vol_target": weights may sum to <1 (rest stays in cash) — this is the
+    only scheme that scales total leverage.
+
+    Schemes:
+      - "equal":       1/N each.
+      - "inverse_vol": weight_i ∝ 1 / vol_i, normalized.  Lower-vol stocks bigger.
+      - "conviction":  weight_i ∝ max(raw_excess_i - floor, 0) + epsilon, normalized.
+                       Higher predicted excess = bigger position.  Stocks below
+                       a small floor get a token (epsilon) weight to maintain
+                       diversification.  Falls back to equal if all raws are
+                       missing or non-positive.
+      - "vol_target":  scale total exposure so estimated portfolio vol ≈
+                       _VOL_TARGET_ANNUAL (currently 25%).  Within the
+                       portfolio still equal-weight.  Excess cash stays at 0%.
+    """
+    n = len(codes)
+    if n == 0:
+        return {}
+
+    if sizing == "equal":
+        w = 1.0 / n
+        return {c: w for c in codes}
+
+    if sizing == "inverse_vol":
+        today_df = panel_by_date.get(dt)
+        if today_df is None:
+            return {c: 1.0 / n for c in codes}
+        vol_map = {}
+        sub = today_df[today_df["code"].isin(codes)]
+        for _, row in sub.iterrows():
+            v = row.get("volatility_20d")
+            if pd.notna(v) and v > 0:
+                vol_map[row["code"]] = float(v)
+        if len(vol_map) < n:
+            return {c: 1.0 / n for c in codes}
+        inv = {c: 1.0 / vol_map[c] for c in codes}
+        s = sum(inv.values())
+        if s <= 0:
+            return {c: 1.0 / n for c in codes}
+        return {c: inv[c] / s for c in codes}
+
+    if sizing in ("conviction", "conviction_oracle"):
+        # Use raw excess predictions; floor at 0, add small epsilon for tail
+        # diversification (so even the weakest Top-K name gets a token weight).
+        # conviction_oracle uses realized fwd_ret instead of model prediction
+        # (intentional leak, for upper-bound diagnostics only).
+        if not raw_scores:
+            return {c: 1.0 / n for c in codes}
+        epsilon = 0.005   # 0.5pp floor as min "conviction"
+        floor = 0.0
+        adj = {c: max(raw_scores.get(c, 0.0) - floor, 0.0) + epsilon for c in codes}
+        s = sum(adj.values())
+        if s <= 0:
+            return {c: 1.0 / n for c in codes}
+        return {c: adj[c] / s for c in codes}
+
+    if sizing == "vol_target":
+        # Estimate portfolio vol assuming average pairwise correlation ρ.
+        # var_p = avg(var) / N + (N-1)/N * avg(cov) ≈ avg(var)/N + (N-1)/N * ρ * avg(var)
+        # For a long-only equity portfolio in same universe, ρ ≈ 0.4-0.6.
+        # We use ρ = 0.5 as a reasonable mid-point, no need to estimate.
+        today_df = panel_by_date.get(dt)
+        if today_df is None:
+            return {c: 1.0 / n for c in codes}
+        sub = today_df[today_df["code"].isin(codes)]
+        vols = []
+        for _, row in sub.iterrows():
+            v = row.get("volatility_20d")
+            if pd.notna(v) and v > 0:
+                vols.append(float(v))
+        if len(vols) < n:
+            return {c: 1.0 / n for c in codes}
+        avg_var = sum(v ** 2 for v in vols) / len(vols)
+        rho = 0.5
+        port_var = avg_var / n + (n - 1) / n * rho * avg_var
+        port_vol = port_var ** 0.5
+        if port_vol <= 0:
+            return {c: 1.0 / n for c in codes}
+        leverage = min(1.0, _VOL_TARGET_ANNUAL / port_vol)   # never >1 (no margin)
+        w = leverage / n
+        return {c: w for c in codes}
+
+    raise ValueError(f"Unknown sizing scheme: {sizing}")
 
 
 def _build_price_adv_lookup(
@@ -247,12 +438,59 @@ def run_walk_forward():
     logger.info("Capital: {:,.0f} | Universe: {} | Top-K: {}", INITIAL_CAPITAL, UNIVERSE, TOP_K)
     logger.info("=" * 60)
 
-    codes = get_index_constituents(UNIVERSE)
-    logger.info("Universe: {} stocks", len(codes))
+    # Universe: union of all point-in-time constituents across every stored
+    # snapshot (so bars / factors are fetched for stocks that were ever in
+    # the index, not just today's members).  Fixes the half-baked
+    # survivorship mitigation that fetched only current members.
+    try:
+        from mp.data.store import DataStore as _DS
+        _store = _DS()
+        _snap_dates = _store.list_constituent_snapshot_dates(UNIVERSE)
+        _union: set[str] = set()
+        for _d in _snap_dates:
+            _c = _store.load_constituent_snapshot_at(UNIVERSE, _d)
+            if _c:
+                _union.update(_c)
+        if len(_snap_dates) >= 2 and _union:
+            codes = sorted(_union)
+            logger.info("Universe: {} unique stocks across {} historical {} snapshots "
+                        "({} → {})", len(codes), len(_snap_dates), UNIVERSE,
+                        _snap_dates[0], _snap_dates[-1])
+        else:
+            codes = get_index_constituents(UNIVERSE)
+            logger.warning("Only {} snapshot(s) for {}; falling back to current "
+                           "constituents ({} stocks) — SURVIVORSHIP BIAS PRESENT.  "
+                           "Run scripts/backfill_constituents.py to fix.",
+                           len(_snap_dates), UNIVERSE, len(codes))
+    except Exception as _e:
+        codes = get_index_constituents(UNIVERSE)
+        logger.warning("Historical snapshot lookup failed ({}); using current "
+                       "{} constituents", _e, UNIVERSE)
 
     # 2. Data
     bars_map = _load_or_fetch_bars(codes)
     panel = _load_or_build_factors(bars_map, codes)
+
+    # BlendRanker primary trains on excess_ret; if the cached panel lacks it,
+    # add it now (one akshare fetch + simple subtraction).  StockRanker uses
+    # fwd_ret directly and doesn't need this, but adding the column is cheap
+    # and keeps the panel ready for either ranker.
+    if "excess_ret" not in panel.columns and "fwd_ret" in panel.columns:
+        from mp.ml.dataset import add_excess_ret
+        logger.info("Computing excess_ret column for BlendRanker compatibility...")
+        panel = add_excess_ret(panel, horizon=HORIZON)
+
+    # Optional: augment panel with per-date regime features (PIT-safe,
+    # computed from ZZ500 + cross-sectional breadth).  LGBM can learn
+    # regime↔factor interactions via tree splits.
+    feature_cols = list(FACTOR_COLUMNS)
+    if USE_REGIME_FEATURES:
+        logger.info("Regime features: ENABLED ({} cols added)", len(REGIME_COLUMNS))
+        panel = add_regime_features(panel)
+        feature_cols = feature_cols + [c for c in REGIME_COLUMNS if c in panel.columns]
+    else:
+        logger.info("Regime features: disabled (set USE_REGIME_FEATURES=1 to enable)")
+
     close_lk, open_lk, adv_lk = _build_price_adv_lookup(bars_map)
 
     # All trading dates in the BT window
@@ -308,6 +546,30 @@ def run_walk_forward():
         rd_str = rd.strftime("%Y-%m-%d")
         snap = get_index_constituents_at(UNIVERSE, rd_str)
         _month_universe[rd.to_period("M")] = frozenset(snap) if snap else _current_codes_set
+
+    # ── PIT training membership lookup ────────────────────────────────────
+    # We also need the PIT universe at every *training* row, not just at
+    # scoring/retrain dates.  Pre-compute a {(code, month_period): True}
+    # membership set so filtering the training panel is O(1) per row.
+    _membership: dict[tuple[str, pd.Period], bool] = {}
+    if n_snapshots >= 2:
+        # Build month-indexed snapshots across the full training span
+        _panel_months = pd.period_range(
+            start=pd.Timestamp(TRAIN_START).to_period("M"),
+            end=pd.Timestamp.today().to_period("M"),
+            freq="M",
+        )
+        for _pm in _panel_months:
+            _asof = (_pm.to_timestamp(how="end")).strftime("%Y-%m-%d")
+            _snap = get_index_constituents_at(UNIVERSE, _asof)
+            if _snap:
+                for _c in _snap:
+                    _membership[(_c, _pm)] = True
+        logger.info("PIT training membership: {} (code, month) pairs across {} months",
+                    len(_membership), len(_panel_months))
+    else:
+        logger.warning("Fewer than 2 snapshots — cannot filter training rows PIT; "
+                       "training will use all ever-members (selection bias).")
     # ────────────────────────────────────────────────────────────────────────
 
     # 3. Simulation state
@@ -323,6 +585,7 @@ def run_walk_forward():
     current_month = None
     current_ranker: Optional[StockRanker] = None
     pending_selection: Optional[List[tuple]] = None  # signal from previous close
+    pending_raw_scores: Dict[str, float] = {}        # raw excess pred by code, populated in Step B
     current_universe: frozenset = _current_codes_set  # updated at each retrain
 
     # 4. Main loop — retrain monthly, score & rebalance daily
@@ -359,17 +622,46 @@ def run_walk_forward():
             train_mask = (panel["date"] < label_cutoff) & panel["fwd_ret"].notna()
             train_df = panel.loc[train_mask].copy()
 
+            # PIT training universe: for each training row, require that the
+            # stock was actually in the index at that row's month.  Removes the
+            # "ever-in-ZZ500" selection bias (training on stocks that future
+            # rebalances would promote into the index = mild look-ahead).
+            if _membership:
+                _periods = train_df["date"].dt.to_period("M")
+                _keep = [
+                    (c, p) in _membership
+                    for c, p in zip(train_df["code"].to_numpy(), _periods.to_numpy())
+                ]
+                n_before = len(train_df)
+                train_df = train_df.loc[_keep].copy()
+                logger.debug("PIT training filter: {} → {} rows ({:.0f}% kept)",
+                             n_before, len(train_df),
+                             100.0 * len(train_df) / max(n_before, 1))
+
             if len(train_df) < 500:
                 logger.warning("Too few training rows ({}), skipping retrain", len(train_df))
             else:
-                ranker = StockRanker(feature_cols=FACTOR_COLUMNS)
                 try:
-                    metrics = ranker.train_fast(train_df)
-                    logger.info("  Train: {} rows, MAE={:.4f}, IC={:.3f}, HitRate@10={:.2f}, Precision@10={:.2f}, rounds={}",
-                                len(train_df), metrics["mae"], metrics["ic"],
-                                metrics.get("hit_rate_at_k", float("nan")),
-                                metrics.get("precision_at_k", float("nan")),
-                                metrics["best_rounds"])
+                    if RANKER_KIND == "blend":
+                        from mp.ml.model import BlendRanker
+                        ranker = BlendRanker(feature_cols=feature_cols)
+                        metrics = ranker.train_fast(train_df)
+                        # BlendRanker returns nested {"primary": {...}, "extreme": {...}}
+                        m_p = metrics.get("primary", {})
+                        m_e = metrics.get("extreme", {})
+                        logger.info("  Train: {} rows | primary: MAE={:.4f} IC={:.3f} rounds={} | extreme: IC={:.3f} rounds={}",
+                                    len(train_df),
+                                    m_p.get("mae", float("nan")), m_p.get("ic", float("nan")),
+                                    m_p.get("best_rounds", -1),
+                                    m_e.get("ic", float("nan")), m_e.get("best_rounds", -1))
+                    else:
+                        ranker = StockRanker(feature_cols=feature_cols)
+                        metrics = ranker.train_fast(train_df)
+                        logger.info("  Train: {} rows, MAE={:.4f}, IC={:.3f}, HitRate@10={:.2f}, Precision@10={:.2f}, rounds={}",
+                                    len(train_df), metrics["mae"], metrics["ic"],
+                                    metrics.get("hit_rate_at_k", float("nan")),
+                                    metrics.get("precision_at_k", float("nan")),
+                                    metrics["best_rounds"])
                     current_ranker = ranker
                 except Exception as e:
                     logger.error("  Training failed: {}", e)
@@ -378,38 +670,93 @@ def run_walk_forward():
         if pending_selection is not None:
             sel_codes = {c for c, _ in pending_selection}
             held_codes = set(broker.positions.keys())
-            if sel_codes != held_codes:
+            selection_changed = sel_codes != held_codes
+
+            # Drift-triggered rebalance: even when names are unchanged, if any
+            # held position's weight has drifted beyond threshold, re-equalize.
+            drift_triggered = False
+            if (not selection_changed and REBALANCE_POLICY == "drift_threshold"
+                    and held_codes):
+                # Compute current weights using today's open (execution price).
+                pos_values = {}
+                for c in held_codes:
+                    p = open_lk.get((c, dt), broker.positions[c].current_price)
+                    pos_values[c] = broker.positions[c].shares * p
+                total_equity = broker.cash + sum(pos_values.values())
+                target_w = 1.0 / TOP_K
+                max_drift = max(
+                    abs(v / total_equity - target_w) for v in pos_values.values()
+                ) if total_equity > 0 else 0
+                drift_triggered = max_drift > MAX_WEIGHT_DRIFT
+
+            if selection_changed or drift_triggered:
                 # Sizing uses previous close (already in broker from yesterday's NAV step).
                 # Using today's close here would be look-ahead bias.
 
-                # (b) Sell positions not in new selection at today's open
                 dt_str = dt.strftime("%Y-%m-%d")
+
+                # (a) For drift rebalance (names unchanged): trim overweights
+                # first so broker.buy() has cash to top up underweights.
+                if drift_triggered and not selection_changed:
+                    total_value_now = broker.total_value
+                    target_per_stock = total_value_now / TOP_K
+                    for code in list(broker.positions.keys()):
+                        price_raw = open_lk.get((code, dt))
+                        if price_raw is None or price_raw <= 0:
+                            continue
+                        current_value = broker.positions[code].shares * price_raw
+                        excess = current_value - target_per_stock
+                        if excess > target_per_stock * 0.01:  # >1pp over target
+                            sell_shares = int(excess / price_raw)
+                            if sell_shares > 0:
+                                broker.sell(code, price_raw, shares=sell_shares,
+                                            date=dt_str, action="SELL (drift)",
+                                            adv=adv_lk.get((code, dt)))
+
+                # (b) Sell positions not in new selection at today's open
                 for code in list(broker.positions.keys()):
                     if code not in sel_codes:
                         sell_price = open_lk.get((code, dt), broker.positions[code].current_price)
                         broker.sell(code, sell_price, date=dt_str,
                                     adv=adv_lk.get((code, dt)))
 
-                # (c) Buy new / adjust positions (equal weight) at today's open
-                target_per_stock = broker.total_value / TOP_K
+                # (c) Buy new / adjust positions at today's open.
+                #     Position weights per POSITION_SIZING setting.
+                total_value_now = broker.total_value
+                weights = _compute_position_weights(
+                    [c for c, _ in pending_selection], dt, panel_by_date,
+                    POSITION_SIZING,
+                    raw_scores=pending_raw_scores,
+                )
                 for code, score in pending_selection:
                     price_raw = open_lk.get((code, dt))
                     if price_raw is None or price_raw <= 0:
                         continue
-                    broker.buy(code, price_raw, target_value=target_per_stock,
+                    target_value = total_value_now * weights.get(code, 1.0 / TOP_K)
+                    broker.buy(code, price_raw, target_value=target_value,
                                date=dt_str,
                                action="BUY (add)" if code in broker.positions else "BUY",
                                adv=adv_lk.get((code, dt)))
 
-                logger.info("  Day {}: rebalanced → {} stocks, cash: {:,.0f}",
-                            dt.strftime("%Y-%m-%d"), len(broker.positions), broker.cash)
+                reason = "drift" if drift_triggered and not selection_changed else "sel"
+                logger.info("  Day {}: rebalanced ({}) → {} stocks, cash: {:,.0f}",
+                            dt.strftime("%Y-%m-%d"), reason, len(broker.positions), broker.cash)
             pending_selection = None  # consumed
 
         # --- Step B: Score stocks at today's close, store as pending for tomorrow ---
         # Filter to the universe that was known on this date to avoid look-ahead
         # from index membership.  When only today's snapshot is available,
         # current_universe == all current codes (no filtering effect).
-        if current_ranker is not None and current_ranker.model is not None:
+        # StockRanker stores its booster as `.model`; BlendRanker has no `.model`
+        # attribute but is ready as long as its sub-rankers are trained.
+        ranker_ready = current_ranker is not None and (
+            getattr(current_ranker, "model", None) is not None
+            or (
+                hasattr(current_ranker, "primary")
+                and getattr(current_ranker.primary, "model", None) is not None
+            )
+        )
+        if ranker_ready:
             today_df = panel_by_date.get(dt)
             if today_df is not None:
                 today_df = today_df[today_df["code"].isin(current_universe)]
@@ -417,6 +764,14 @@ def run_walk_forward():
                 if not today_valid.empty:
                     codes_in = today_valid["code"].tolist()
                     scores = current_ranker.predict(today_valid)
+                    # Also capture raw excess predictions for conviction sizing
+                    # (BlendRanker.predict_raw returns primary's excess prediction
+                    # in decimal; StockRanker.predict_raw == predict).
+                    if hasattr(current_ranker, "predict_raw"):
+                        raws = current_ranker.predict_raw(today_valid)
+                    else:
+                        raws = scores
+                    raw_score_map = dict(zip(codes_in, raws))
                     scored = sorted(zip(codes_in, scores), key=lambda x: -x[1])
 
                     if COST_AWARE_REBALANCE:
@@ -426,6 +781,21 @@ def run_walk_forward():
                         )
                     else:
                         pending_selection = scored[:TOP_K]
+                    # Snapshot the raw scores keyed by date for the buy step.
+                    # In conviction_oracle mode (leak check ONLY), replace with
+                    # the realized forward 20d return — this is the perfect
+                    # conviction upper bound.
+                    if POSITION_SIZING == "conviction_oracle":
+                        oracle_map = {}
+                        for _, row in today_valid.iterrows():
+                            fr = row.get("fwd_ret")
+                            if pd.notna(fr):
+                                oracle_map[row["code"]] = float(fr)
+                            else:
+                                oracle_map[row["code"]] = 0.0
+                        pending_raw_scores = oracle_map
+                    else:
+                        pending_raw_scores = raw_score_map
 
         # --- Daily NAV ---
         close_snap = {}
@@ -597,51 +967,100 @@ def _save_report(metrics, monthly_returns, benchmark_ret, trade_log, elapsed):
 
 def update_production_models(
     codes: List[str],
-    ranker_20d: Optional[StockRanker] = None,
+    ranker_20d=None,  # StockRanker or BlendRanker from walk-forward
 ) -> dict:
     """Save/retrain production models.
 
-    - 20d model: if ranker_20d is provided (from walk-forward), just save it;
-      otherwise retrain from scratch with full CV.
-    - 60d model: always retrain (walk-forward doesn't train 60d).
+    - ranker_20d (BlendRanker or StockRanker, from walk-forward): if provided
+      AND already trained, save it directly.  BlendRanker is the production
+      default (saved to data/blend_*.lgb).  StockRanker is saved to data/model.lgb
+      as a fallback.
+    - 60d StockRanker: always retrain (walk-forward doesn't train 60d).
 
-    Returns a dict with training metrics for both models.
+    Returns a dict with training metrics for all models.
     """
     from mp.ml.dataset import build_dataset
+    from mp.ml.model import BlendRanker
 
     logger.info("=" * 60)
     logger.info("Updating production models...")
     logger.info("=" * 60)
 
     results: dict = {}
+    ds_20 = None  # built lazily if needed
 
-    # 20-day horizon model — reuse walk-forward's last model if available
-    if ranker_20d is not None and ranker_20d.model is not None:
+    # Detect what kind of ranker_20d we got
+    ranker_is_blend = (
+        ranker_20d is not None
+        and hasattr(ranker_20d, "primary")
+        and hasattr(ranker_20d, "extreme")
+    )
+    ranker_is_stock = (
+        ranker_20d is not None
+        and hasattr(ranker_20d, "model")
+        and getattr(ranker_20d, "model", None) is not None
+        and not ranker_is_blend
+    )
+
+    # ── Production BlendRanker (data/blend_*.lgb) — what daily_report/paper_trade use ──
+    if ranker_is_blend and getattr(ranker_20d.primary, "model", None) is not None:
+        ranker_20d.save("data/blend")
+        logger.info("Production BlendRanker: saved from walk-forward (no retrain)")
+        results["blend"] = {"source": "walk-forward", "saved": True}
+    else:
+        # Need to retrain BlendRanker from scratch
+        logger.info("Training production BlendRanker (0.8 primary + 0.2 extreme)...")
+        if ds_20 is None:
+            ds_20 = build_dataset(codes, TRAIN_START, horizon=20)
+        if ds_20 is not None and not ds_20.empty:
+            blend = BlendRanker()
+            try:
+                blend_metrics = blend.train_fast(ds_20)
+                blend.save("data/blend")
+                results["blend"] = {
+                    "saved": True,
+                    "source": "retrained",
+                    "n_train_rows": len(ds_20),
+                    "primary_ic": blend_metrics.get("primary", {}).get("ic"),
+                    "extreme_ic": blend_metrics.get("extreme", {}).get("ic"),
+                }
+                logger.info("BlendRanker: saved (rows={}, primary IC={:.3f}, extreme IC={:.3f})",
+                            len(ds_20),
+                            results["blend"].get("primary_ic") or float("nan"),
+                            results["blend"].get("extreme_ic") or float("nan"))
+            except Exception as e:
+                logger.error("BlendRanker training failed: {}", e)
+                results["blend"] = {"error": str(e)}
+        else:
+            results["blend"] = {"error": "no dataset"}
+
+    # ── StockRanker fallback (data/model.lgb) ──
+    if ranker_is_stock:
         ranker_20d.model_path = Path("data/model.lgb")
         ranker_20d.save()
-        logger.info("20d model: saved from walk-forward (no retrain needed)")
+        logger.info("20d StockRanker fallback: saved from walk-forward")
         results["20d"] = {"source": "walk-forward", "saved": True}
     else:
-        logger.info("Building 20d dataset from scratch...")
-        ds_20 = build_dataset(codes, TRAIN_START, horizon=20)
-        if not ds_20.empty:
+        logger.info("Building 20d dataset for StockRanker fallback (if not already)...")
+        if ds_20 is None:
+            ds_20 = build_dataset(codes, TRAIN_START, horizon=20)
+        if ds_20 is not None and not ds_20.empty:
             ranker = StockRanker(model_path="data/model.lgb")
             m = ranker.train(ds_20)
-            logger.info("20d model: MAE={:.4f}±{:.4f}, IC={:.3f}±{:.3f}, rounds={}",
+            logger.info("20d StockRanker fallback: MAE={:.4f}±{:.4f}, IC={:.3f}±{:.3f}, rounds={}",
                          m["cv_mae_mean"], m["cv_mae_std"],
                          m["cv_ic_mean"], m["cv_ic_std"], m["best_rounds"])
             results["20d"] = m
         else:
-            logger.error("Failed to build 20d dataset")
             results["20d"] = {"error": "dataset build failed"}
 
-    # 60-day horizon model — always retrain
+    # 60-day StockRanker — always retrain
     logger.info("Building 60d dataset...")
     ds_60 = build_dataset(codes, TRAIN_START, horizon=60)
     if not ds_60.empty:
         ranker_60 = StockRanker(model_path="data/model_60d.lgb")
         m = ranker_60.train(ds_60)
-        logger.info("60d model: MAE={:.4f}±{:.4f}, IC={:.3f}±{:.3f}, rounds={}",
+        logger.info("60d StockRanker: MAE={:.4f}±{:.4f}, IC={:.3f}±{:.3f}, rounds={}",
                      m["cv_mae_mean"], m["cv_mae_std"],
                      m["cv_ic_mean"], m["cv_ic_std"], m["best_rounds"])
         results["60d"] = m
