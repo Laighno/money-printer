@@ -58,8 +58,46 @@ from mp.ml.regime_features import REGIME_COLUMNS, add_regime_features
 # ──────────────────────────────────────────────────────────────────────
 
 INITIAL_CAPITAL = 100_000       # 10万元
-UNIVERSE = "zz500"
+# Universe widened 2026-05-14 from ZZ500-only to HS300+ZZ500 (~800 unique).
+# Both indices have ≥120 PIT snapshots in DB so training preserves
+# point-in-time integrity (no survivorship bias from today's HS300 list).
+UNIVERSES: tuple[str, ...] = ("hs300", "zz500")
+UNIVERSE = "+".join(UNIVERSES)  # for logging / model_path conventions
 TRAIN_START = "20160501"        # expanding window start (Baidu 近十年 covers from 2016-04)
+
+
+def _merged_pit_at(date_str: str) -> list[str] | None:
+    """PIT constituent union across UNIVERSES at a given date.  Returns
+    None only if no member index has a snapshot for that date."""
+    from mp.data.fetcher import get_index_constituents_at as _at
+    merged: set[str] = set()
+    any_found = False
+    for idx in UNIVERSES:
+        snap = _at(idx, date_str)
+        if snap:
+            merged.update(snap)
+            any_found = True
+    return sorted(merged) if any_found else None
+
+
+def _merged_all_snapshots(store) -> tuple[list[str], list[str]]:
+    """Return (sorted_union_codes, all_snapshot_dates) across UNIVERSES."""
+    union: set[str] = set()
+    dates: set[str] = set()
+    for idx in UNIVERSES:
+        ds = store.list_constituent_snapshot_dates(idx)
+        dates.update(ds)
+        for d in ds:
+            c = store.load_constituent_snapshot_at(idx, d)
+            if c:
+                union.update(c)
+    return sorted(union), sorted(dates)
+
+
+def _merged_current() -> list[str]:
+    """Merged current constituents across UNIVERSES (today's list)."""
+    from mp.data.fetcher import get_recommendation_universe
+    return get_recommendation_universe(UNIVERSES)
 BT_START = "20200101"           # first trading month
 BT_END = "20260401"             # last month (exclusive)
 TOP_K = int(os.environ.get("TOP_K", "10"))
@@ -445,25 +483,20 @@ def run_walk_forward():
     try:
         from mp.data.store import DataStore as _DS
         _store = _DS()
-        _snap_dates = _store.list_constituent_snapshot_dates(UNIVERSE)
-        _union: set[str] = set()
-        for _d in _snap_dates:
-            _c = _store.load_constituent_snapshot_at(UNIVERSE, _d)
-            if _c:
-                _union.update(_c)
+        _union, _snap_dates = _merged_all_snapshots(_store)
         if len(_snap_dates) >= 2 and _union:
-            codes = sorted(_union)
+            codes = _union
             logger.info("Universe: {} unique stocks across {} historical {} snapshots "
                         "({} → {})", len(codes), len(_snap_dates), UNIVERSE,
                         _snap_dates[0], _snap_dates[-1])
         else:
-            codes = get_index_constituents(UNIVERSE)
+            codes = _merged_current()
             logger.warning("Only {} snapshot(s) for {}; falling back to current "
                            "constituents ({} stocks) — SURVIVORSHIP BIAS PRESENT.  "
                            "Run scripts/backfill_constituents.py to fix.",
                            len(_snap_dates), UNIVERSE, len(codes))
     except Exception as _e:
-        codes = get_index_constituents(UNIVERSE)
+        codes = _merged_current()
         logger.warning("Historical snapshot lookup failed ({}); using current "
                        "{} constituents", _e, UNIVERSE)
 
@@ -526,7 +559,7 @@ def run_walk_forward():
     _snapshot_dates = []
     try:
         from mp.data.store import DataStore as _DS
-        _snapshot_dates = _DS().list_constituent_snapshot_dates(UNIVERSE)
+        _, _snapshot_dates = _merged_all_snapshots(_DS())
     except Exception:
         pass
     n_snapshots = len(_snapshot_dates)
@@ -544,7 +577,7 @@ def run_walk_forward():
         )
     for rd in retrain_dates:
         rd_str = rd.strftime("%Y-%m-%d")
-        snap = get_index_constituents_at(UNIVERSE, rd_str)
+        snap = _merged_pit_at(rd_str)
         _month_universe[rd.to_period("M")] = frozenset(snap) if snap else _current_codes_set
 
     # ── PIT training membership lookup ────────────────────────────────────
@@ -561,7 +594,7 @@ def run_walk_forward():
         )
         for _pm in _panel_months:
             _asof = (_pm.to_timestamp(how="end")).strftime("%Y-%m-%d")
-            _snap = get_index_constituents_at(UNIVERSE, _asof)
+            _snap = _merged_pit_at(_asof)
             if _snap:
                 for _c in _snap:
                     _membership[(_c, _pm)] = True
@@ -1314,7 +1347,7 @@ if __name__ == "__main__":
 
     if args.update_only:
         t0 = time.time()
-        codes = get_index_constituents(UNIVERSE)
+        codes = _merged_current()
         model_results = update_production_models(codes)
         elapsed_min = (time.time() - t0) / 60
         logger.info("Production models updated! ({:.1f} min)", elapsed_min)
@@ -1324,7 +1357,7 @@ if __name__ == "__main__":
             update_only=True,
         )
     elif args.cache_only:
-        codes = get_index_constituents(UNIVERSE)
+        codes = _merged_current()
         bars_map = _load_or_fetch_bars(codes)
         _load_or_build_factors(bars_map, codes)
         logger.info("Cache built successfully. Run again without --cache-only to start backtest.")
@@ -1333,7 +1366,7 @@ if __name__ == "__main__":
 
         if not args.skip_update:
             t1 = time.time()
-            codes = get_index_constituents(UNIVERSE)
+            codes = _merged_current()
             model_results = update_production_models(codes, ranker_20d=last_ranker)
             elapsed_min = (time.time() - t1) / 60
             logger.info("Production models updated! ({:.1f} min)", elapsed_min)

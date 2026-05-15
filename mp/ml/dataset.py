@@ -727,14 +727,41 @@ def _process_single_stock(
         result[col] = fund_aligned[col]
 
     # Derive total_mv_log from daily bars (close * volume / turnover).
-    # Only overwrite the valuation-cache value when the bar-derived estimate is valid;
-    # Sina daily bars lack turnover, so we fall back to the cached total_mv_log
-    # rather than replacing it with NaN.
+    #
+    # Two value SPACES used to collide here:
+    #   (A) bars-derived  = close × volume / turnover_rate = 流通市值 float-cap
+    #   (B) cached value  = EM/Sina valuation snapshot total_mv = 总市值 total-cap
+    # For most stocks A ≠ B by a factor of 1.5-3× (e.g. 粤电力A: 流通 ~196亿 vs
+    # 总 ~374亿 → log diff 0.64).  When the intraday_bar injection path has
+    # no turnover, bars_mv_log goes NaN and we used to fall back to the cached
+    # value — silently switching the feature's value space mid-pipeline.
+    # Since training data uses one space per stock-day, the model sees the
+    # midday cross-space jump as "a different-sized company" and predictions
+    # break (verified 2026-05-13: 粤电力A 14:00 −0.71% vs EOD +3.02%, the
+    # entire +3.73pp swing came from this one feature).
+    #
+    # Fix: forward-fill bars_mv_log to today using yesterday's bars-derived
+    # value × (today_close / prev_close).  Shares outstanding barely moves
+    # intra-day; market-cap change ≈ close change.  This keeps the
+    # intraday row in the SAME value space as the rest of the history.
+    # Only when no prior bars-derived value exists at all do we fall back
+    # to the cached snapshot value (training-time Sina-only path).
     valid_t = turnover > 0
     float_mv = np.where(valid_t, close * volume / turnover, np.nan)
     bars_mv_log = np.where(float_mv > 0, np.log(float_mv), np.nan)
     cached_mv_log = result["total_mv_log"].values.copy()
-    result["total_mv_log"] = np.where(~np.isnan(bars_mv_log), bars_mv_log, cached_mv_log)
+
+    # Forward-fill bars_mv_log, adjusting for close changes (keeps value space)
+    filled = bars_mv_log.copy()
+    last_valid = -1
+    for i in range(len(filled)):
+        if not np.isnan(filled[i]):
+            last_valid = i
+        elif last_valid >= 0 and close[i] > 0 and close[last_valid] > 0:
+            # log(today_mv) ≈ log(prev_mv) + log(today_close / prev_close)
+            filled[i] = bars_mv_log[last_valid] + np.log(close[i] / close[last_valid])
+
+    result["total_mv_log"] = np.where(~np.isnan(filled), filled, cached_mv_log)
 
     # --- forward return (optional) ---
     if horizon is not None:

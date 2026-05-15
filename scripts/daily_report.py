@@ -12,6 +12,7 @@ Run daily via launchd or manually::
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -54,6 +55,36 @@ def load_holdings() -> List[dict]:
     return [h for h in cfg.get("holdings", []) if h.get("type") == "stock" and h.get("code")]
 
 
+def load_account() -> dict | None:
+    """Load structured account snapshot (total_assets / cash_available / target_position_pct).
+
+    Returns None if portfolio.yaml has no `account:` block — orderlist generation
+    will then be skipped gracefully.
+    """
+    if not PORTFOLIO_PATH.exists():
+        return None
+    try:
+        with open(PORTFOLIO_PATH) as f:
+            cfg = yaml.safe_load(f) or {}
+        acct = cfg.get("account")
+        if not acct:
+            return None
+        # Sanity: require total_assets & cash_available
+        if "total_assets" not in acct or "cash_available" not in acct:
+            return None
+        return acct
+    except Exception as e:
+        logger.warning("load_account failed: {}", e)
+        return None
+
+
+def load_holdings_full() -> List[dict]:
+    """Like load_holdings but includes shares/avg_cost/entry_date."""
+    with open(PORTFOLIO_PATH) as f:
+        cfg = yaml.safe_load(f)
+    return [h for h in cfg.get("holdings", []) if h.get("type") == "stock" and h.get("code")]
+
+
 def get_stock_names(codes: List[str]) -> Dict[str, str]:
     """Fetch stock names via Sina quote API (single HTTP call, proxy-safe)."""
     import httpx
@@ -91,21 +122,34 @@ def get_stock_names(codes: List[str]) -> Dict[str, str]:
 # Universe scoring (for meaningful BlendRanker percentiles)
 # =====================================================================
 
-def score_universe(ranker, holding_codes: list[str], intraday_bars: dict | None = None) -> pd.DataFrame:
+def score_universe(ranker, holding_codes: list[str], intraday_bars: dict | None = None,
+                   precomputed_features: pd.DataFrame | None = None) -> pd.DataFrame:
     """Score holdings within ZZ500 universe for meaningful percentiles.
 
     BlendRanker's .rank(pct=True) only makes sense with a large pool.
     This scores holdings + ZZ500 together, then returns holdings rows.
 
     Returns DataFrame with columns: code, ml_score, rank_pct, raw_return.
+
+    ``precomputed_features`` lets the caller (run() / run_midday()) build
+    the panel ONCE for universe ∪ holdings and share it between
+    score_universe and recommend_stocks.  Without this shared panel,
+    a flaky API mid-run can have evaluate_holdings see one DB snapshot
+    (no today close) and recommend_stocks see another (today close
+    arrived between the two calls), producing inconsistent predictions
+    for the same stock in the same report (2026-05-15 粤电力A bug:
+    持仓 +1.98% vs 推荐 +4.75%).
     """
     from mp.data.fetcher import get_index_constituents
 
     is_rank = getattr(ranker, "score_type", "predicted_return") == "rank_percentile"
 
     if not is_rank:
-        features = build_latest_features(holding_codes, include_fundamentals=True,
-                                         intraday_bars=intraday_bars)
+        if precomputed_features is not None:
+            features = precomputed_features[precomputed_features["code"].isin(holding_codes)].copy()
+        else:
+            features = build_latest_features(holding_codes, include_fundamentals=True,
+                                             intraday_bars=intraday_bars)
         if features.empty:
             return pd.DataFrame()
         scores = ranker.predict(features)
@@ -119,16 +163,20 @@ def score_universe(ranker, holding_codes: list[str], intraday_bars: dict | None 
             df["_data_warnings"] = features["_data_warnings"].values
         return df
 
-    # BlendRanker: score holdings + ZZ500 together
-    try:
-        zz500_codes = get_index_constituents("zz500")
-    except Exception as e:
-        logger.warning("ZZ500 fetch failed in score_universe, scoring holdings only: {}", e)
-        zz500_codes = []
+    # BlendRanker: score holdings + recommendation universe together
+    if precomputed_features is not None:
+        features = precomputed_features
+    else:
+        try:
+            from mp.data.fetcher import get_recommendation_universe
+            zz500_codes = get_recommendation_universe()   # HS300 + ZZ500 ≈ 800
+        except Exception as e:
+            logger.warning("Universe fetch failed in score_universe, scoring holdings only: {}", e)
+            zz500_codes = []
 
-    all_codes = list(set(holding_codes + zz500_codes))
-    features = build_latest_features(all_codes, include_fundamentals=True,
-                                     intraday_bars=intraday_bars)
+        all_codes = list(set(holding_codes + zz500_codes))
+        features = build_latest_features(all_codes, include_fundamentals=True,
+                                         intraday_bars=intraday_bars)
     if features.empty:
         return pd.DataFrame()
 
@@ -137,8 +185,11 @@ def score_universe(ranker, holding_codes: list[str], intraday_bars: dict | None 
     if dq < 0.5:
         logger.warning("⚠ ZZ500数据质量差({:.0f}%完整)，排名不可信，仅返回持仓原始预测", dq * 100)
         # Fall back: only score holdings with their own features (baidu-backed)
-        h_features = build_latest_features(holding_codes, include_fundamentals=True,
-                                           intraday_bars=intraday_bars)
+        if precomputed_features is not None:
+            h_features = precomputed_features[precomputed_features["code"].isin(holding_codes)].copy()
+        else:
+            h_features = build_latest_features(holding_codes, include_fundamentals=True,
+                                               intraday_bars=intraday_bars)
         if h_features.empty:
             return pd.DataFrame()
         raw = ranker.predict_raw(h_features)
@@ -171,13 +222,16 @@ def score_universe(ranker, holding_codes: list[str], intraday_bars: dict | None 
 # Holdings Evaluation
 # =====================================================================
 
-def evaluate_holdings(ranker, regime: MarketRegime | None = None, intraday_bars: dict | None = None) -> pd.DataFrame:
+def evaluate_holdings(ranker, regime: MarketRegime | None = None, intraday_bars: dict | None = None,
+                      precomputed_features: pd.DataFrame | None = None) -> pd.DataFrame:
     """Evaluate current holdings with ML model.
 
     Returns DataFrame with: code, name, ml_score, predicted_return, suggestion,
     rank_pct.  Thresholds and display adapt to ranker.score_type:
       - "rank_percentile" (BlendRanker): percentile thresholds, rank in ZZ500 pool
       - "predicted_return" (StockRanker): absolute return thresholds
+
+    ``precomputed_features`` — see :func:`score_universe`.
     """
     holdings = load_holdings()
     if not holdings:
@@ -191,17 +245,24 @@ def evaluate_holdings(ranker, regime: MarketRegime | None = None, intraday_bars:
 
     if is_rank:
         logger.info("Scoring {} holdings within ZZ500 universe...", len(codes))
-        result = score_universe(ranker, codes, intraday_bars=intraday_bars)
+        result = score_universe(ranker, codes, intraday_bars=intraday_bars,
+                                precomputed_features=precomputed_features)
         if result.empty:
             logger.error("Failed to score holdings in universe")
             return pd.DataFrame()
-        # score_universe builds features internally
-        features = build_latest_features(codes, include_fundamentals=True,
-                                         intraday_bars=intraday_bars)
+        # score_universe builds features internally (unless precomputed provided)
+        if precomputed_features is not None:
+            features = precomputed_features[precomputed_features["code"].isin(codes)].copy()
+        else:
+            features = build_latest_features(codes, include_fundamentals=True,
+                                             intraday_bars=intraday_bars)
     else:
         logger.info("Building features for {} holdings...", len(codes))
-        features = build_latest_features(codes, include_fundamentals=True,
-                                         intraday_bars=intraday_bars)
+        if precomputed_features is not None:
+            features = precomputed_features[precomputed_features["code"].isin(codes)].copy()
+        else:
+            features = build_latest_features(codes, include_fundamentals=True,
+                                             intraday_bars=intraday_bars)
         if features.empty:
             logger.error("Failed to build features for holdings")
             return pd.DataFrame()
@@ -716,36 +777,140 @@ def generate_rebalance_advice(
 # Stock Recommendations
 # =====================================================================
 
-def recommend_stocks(ranker, n_recommend: int = 5, intraday_bars: dict | None = None) -> Tuple[pd.DataFrame, list[dict], dict]:
+# =====================================================================
+# Midday → Afternoon Watchlist Tracking
+# =====================================================================
+# Midday report saves its top-N recommendations as a "watchlist" so the
+# afternoon report can show how those picks performed once the full day's
+# information is in.  Mismatch between midday and afternoon is structural
+# (midday only sees morning session), so this gives the user transparency
+# into which midday picks held up vs faded.
+
+WATCHLIST_DIR = Path("data/reports/watchlist")
+
+
+def _save_midday_watchlist(recs: pd.DataFrame, today: date) -> None:
+    """Persist midday recommendations so afternoon report can track them."""
+    if recs is None or recs.empty:
+        return
+    if "_degraded_reason" in recs.columns:
+        return  # don't save degraded mode placeholder
+    rows = []
+    for _, r in recs.iterrows():
+        def _f(v):
+            try:
+                return float(v) if pd.notna(v) else None
+            except (TypeError, ValueError):
+                return None
+        rows.append({
+            "code": str(r["code"]),
+            "name": r.get("name", "") or "",
+            "midday_excess": _f(r.get("predicted_excess")),
+            "midday_return": _f(r.get("predicted_return")),
+            "midday_rank_pct": _f(r.get("rank_pct")),
+        })
+    p = WATCHLIST_DIR / f"{today.strftime('%Y%m%d')}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Midday watchlist saved: {} stocks → {}", len(rows), p)
+
+
+def _load_midday_watchlist(today: date) -> list[dict]:
+    """Load today's midday watchlist (empty list if midday didn't run)."""
+    p = WATCHLIST_DIR / f"{today.strftime('%Y%m%d')}.json"
+    if not p.exists():
+        return []
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to load midday watchlist: {}", e)
+        return []
+
+
+def _evaluate_watchlist_afternoon(
+    full_scored: pd.DataFrame | None,
+    watchlist: list[dict],
+) -> list[dict]:
+    """Look up each watchlist code's afternoon rank/score from the full ZZ500 ranking.
+
+    `full_scored` should be the full sorted DataFrame from recommend_stocks
+    (one row per ZZ500 stock), with columns: code, predicted_excess,
+    predicted_return, rank_pct, _rank.
+    """
+    if not watchlist:
+        return []
+    if full_scored is None or full_scored.empty:
+        # Afternoon ranking unavailable — surface watchlist with no delta.
+        return [{**w, "afternoon_rank": None, "afternoon_excess": None,
+                 "excess_delta": None, "universe_size": None}
+                for w in watchlist]
+    n_universe = len(full_scored)
+    out = []
+    for w in watchlist:
+        code = w["code"]
+        match = full_scored[full_scored["code"] == code]
+        if match.empty:
+            out.append({**w, "afternoon_rank": None, "afternoon_excess": None,
+                        "excess_delta": None, "universe_size": n_universe})
+            continue
+        row = match.iloc[0]
+        a_excess = float(row["predicted_excess"]) if pd.notna(row.get("predicted_excess")) else None
+        a_rank = int(row["_rank"]) if pd.notna(row.get("_rank")) else None
+        a_rank_pct = float(row["rank_pct"]) if pd.notna(row.get("rank_pct")) else None
+        m_excess = w.get("midday_excess")
+        delta = (a_excess - m_excess) if (a_excess is not None and m_excess is not None) else None
+        out.append({
+            **w,
+            "afternoon_rank": a_rank,
+            "afternoon_rank_pct": a_rank_pct,
+            "afternoon_excess": a_excess,
+            "excess_delta": delta,
+            "universe_size": n_universe,
+        })
+    return out
+
+
+def recommend_stocks(ranker, n_recommend: int = 5, intraday_bars: dict | None = None,
+                     precomputed_features: pd.DataFrame | None = None) -> Tuple[pd.DataFrame, list[dict], dict, pd.DataFrame]:
     """Scan ZZ500 for top ML-scored stocks.
 
-    Returns (top_df, rec_60d, rec_name_map):
+    Returns (top_df, rec_60d, rec_name_map, full_scored):
       - top_df: top N stocks by ML predicted return
       - rec_60d: 60-day analysis for each recommended stock
       - rec_name_map: code -> name mapping for recommended stocks
+      - full_scored: ALL ZZ500 stocks sorted by ml_score, with _rank column;
+        used by afternoon report to evaluate the midday watchlist without
+        re-running build_latest_features.  Empty DataFrame if scoring failed.
+
+    ``precomputed_features`` — see :func:`score_universe`.
     """
-    from mp.data.fetcher import get_index_constituents
+    from mp.data.fetcher import get_recommendation_universe
 
-    logger.info("Fetching ZZ500 constituents...")
-    try:
-        codes = get_index_constituents("zz500")
-    except Exception as e:
-        logger.error("Failed to get ZZ500 constituents: {}", e)
-        return pd.DataFrame(), [], {}
+    if precomputed_features is not None:
+        features = precomputed_features
+        codes = features["code"].tolist()
+        logger.info("Using precomputed features panel: {} stocks", len(codes))
+    else:
+        logger.info("Fetching recommendation universe (HS300 + ZZ500)...")
+        try:
+            codes = get_recommendation_universe()
+        except Exception as e:
+            logger.error("Failed to get recommendation universe: {}", e)
+            return pd.DataFrame(), [], {}, pd.DataFrame()
 
-    logger.info("Building features for {} ZZ500 stocks...", len(codes))
-    features = build_latest_features(codes, include_fundamentals=True,
-                                     intraday_bars=intraday_bars)
+        logger.info("Building features for {} universe stocks...", len(codes))
+        features = build_latest_features(codes, include_fundamentals=True,
+                                         intraday_bars=intraday_bars)
     if features.empty:
         logger.error("Failed to build features for ZZ500")
-        return pd.DataFrame(), [], {}
+        return pd.DataFrame(), [], {}, pd.DataFrame()
 
     # --- Data quality gate: degrade if fundamentals largely missing ---
     dq = features.attrs.get("_data_quality", 1.0)
     if dq < 0.5:
         logger.error("⚠ 数据源异常: 仅{:.0f}%股票有完整基本面数据，荐股模块降级", dq * 100)
         degraded = pd.DataFrame({"_degraded_reason": ["数据源异常：PE/PB等基本面数据大面积缺失，荐股结果不可信"]})
-        return degraded, [], {}
+        return degraded, [], {}, pd.DataFrame()
 
     scores = ranker.predict(features)
     result = pd.DataFrame({
@@ -772,8 +937,10 @@ def recommend_stocks(ranker, n_recommend: int = 5, intraday_bars: dict | None = 
         result["predicted_return"] = (result["ml_score"] * 100).round(2)
         result["rank_pct"] = pd.Series(scores).rank(pct=True).round(4)
 
-    # Sort and take top N, then fetch names only for those
-    result = result.sort_values("ml_score", ascending=False).head(n_recommend).reset_index(drop=True)
+    # Sort full ranking, attach rank index, then take top N for display
+    full_scored = result.sort_values("ml_score", ascending=False).reset_index(drop=True)
+    full_scored["_rank"] = full_scored.index + 1
+    result = full_scored.head(n_recommend).reset_index(drop=True)
     rec_name_map = get_stock_names(result["code"].tolist())
     result["name"] = result["code"].map(rec_name_map)
 
@@ -798,12 +965,245 @@ def recommend_stocks(ranker, n_recommend: int = 5, intraday_bars: dict | None = 
     logger.info("--- 60-day analysis for {} recommendations ---", len(rec_codes))
     rec_60d = evaluate_holdings_60d(rec_codes) if rec_codes else []
 
-    return result, rec_60d, rec_name_map
+    return result, rec_60d, rec_name_map, full_scored
 
 
 # =====================================================================
 # Report Formatting
 # =====================================================================
+
+# =====================================================================
+# Next-day open order list (afternoon report only)
+# =====================================================================
+# Convert model recommendations + current portfolio into actionable orders
+# you can fill straight into your broker at next open.
+#
+# Sizing: top-N conviction-weighted (weight ∝ max(predicted_excess, 0) +
+# 0.5pp epsilon).  Target_value_per_stock = total_assets × target_pos_pct
+# × weight.  Existing holdings in top-N are adjusted by delta; holdings
+# outside top-30 trigger reduce/clear suggestions.
+#
+# Limit pricing: buy = close × 1.01, sell = close × 0.99.  Open auction
+# noise typically < 1%; this gets you filled without paying market.
+
+def _latest_closes(codes: List[str]) -> Dict[str, float]:
+    """Latest close per code from DB (no API call)."""
+    out: Dict[str, float] = {}
+    if not codes:
+        return out
+    try:
+        from mp.data.store import DataStore, DEFAULT_DB_URL
+        from sqlalchemy import text
+        store = DataStore(db_url=DEFAULT_DB_URL)
+        with store.engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT code, close FROM daily_bars "
+                "WHERE code IN :codes AND date = ("
+                "  SELECT MAX(date) FROM daily_bars WHERE code = daily_bars.code"
+                ")"
+            ).bindparams(__import__("sqlalchemy").bindparam("codes", expanding=True)),
+            {"codes": list(codes)}).fetchall()
+            for code, close in rows:
+                if close is not None:
+                    out[str(code).zfill(6)] = float(close)
+    except Exception as e:
+        logger.warning("_latest_closes failed: {}", e)
+    # Per-code fallback for any missing
+    missing = [c for c in codes if c not in out]
+    if missing:
+        try:
+            from mp.data.store import DataStore, DEFAULT_DB_URL
+            from sqlalchemy import text
+            store = DataStore(db_url=DEFAULT_DB_URL)
+            with store.engine.connect() as conn:
+                for code in missing:
+                    row = conn.execute(text(
+                        "SELECT close FROM daily_bars WHERE code = :c "
+                        "ORDER BY date DESC LIMIT 1"
+                    ), {"c": code}).fetchone()
+                    if row and row[0] is not None:
+                        out[code] = float(row[0])
+        except Exception as e:
+            logger.warning("_latest_closes per-code fallback failed: {}", e)
+    return out
+
+
+def generate_order_list(
+    holdings_full: list[dict],
+    account: dict | None,
+    recommendations: pd.DataFrame,
+    full_scored: pd.DataFrame | None,
+) -> list[dict]:
+    """Generate next-day open order list.
+
+    Returns list of dicts: {code, name, action, shares, limit_price, cost, reason}.
+    Empty list if account snapshot or recommendations missing.
+
+    Logic:
+      Top-N (default 5) → conviction-weighted target value, delta vs current
+      In-portfolio + rank > 100 → 清仓
+      In-portfolio + 30 < rank ≤ 100 → 减仓 50%
+      In-portfolio + rank ≤ 30 (but not top N) → silent hold
+    """
+    if account is None or recommendations is None or recommendations.empty:
+        return []
+    if "_degraded_reason" in recommendations.columns:
+        return []
+
+    cash_available = float(account.get("cash_available", 0))
+    # Buy budget: 95% of cash, leaving 5% for fees/slippage
+    buy_budget = cash_available * 0.95
+
+    # Filter out HS300 stocks: model is trained on ZZ500 only, predictions
+    # on HS300 names are out-of-distribution extrapolations.  Surface them
+    # in the report (with ⚠️ marker) but do NOT auto-include in orders.
+    hs300 = _hs300_set()
+    all_rec_codes = [str(c).zfill(6) for c in recommendations["code"].tolist()]
+    rec_codes = [c for c in all_rec_codes if c not in hs300]
+    if len(rec_codes) < len(all_rec_codes):
+        skipped = [c for c in all_rec_codes if c in hs300]
+        logger.info("Order list: skipped {} HS300 recs (extrapolation): {}",
+                    len(skipped), skipped)
+    held_shares = {str(h["code"]).zfill(6): int(h.get("shares", 0) or 0) for h in holdings_full}
+    held_names = {str(h["code"]).zfill(6): h.get("name", h["code"]) for h in holdings_full}
+
+    closes = _latest_closes(list(set(rec_codes) | set(held_shares.keys())))
+
+    # Conviction weights — predicted_excess is in pp (already × 100)
+    excess_map = {}
+    rec_name_map = {}
+    for _, r in recommendations.iterrows():
+        c = str(r["code"]).zfill(6)
+        ex = r.get("predicted_excess")
+        excess_map[c] = float(ex) if pd.notna(ex) else 0.0
+        rec_name_map[c] = r.get("name", c)
+
+    # Rank lookup (full ZZ500 ranking)
+    rank_map: Dict[str, int] = {}
+    universe_size = 500
+    if full_scored is not None and not full_scored.empty and "_rank" in full_scored.columns:
+        for _, r in full_scored.iterrows():
+            rank_map[str(r["code"]).zfill(6)] = int(r["_rank"])
+        universe_size = len(full_scored)
+
+    orders: list[dict] = []
+    rec_set = set(rec_codes)
+
+    # Pass 1: NEW BUYS only — top-N codes not currently held, conviction-weighted
+    # over buy_budget (= cash × 95%).  Already-held top-N codes are signal
+    # confirmation: model still likes them, no fresh action needed.
+    new_buy_codes = [c for c in rec_codes if held_shares.get(c, 0) == 0]
+    if new_buy_codes:
+        epsilon = 0.5  # pp floor — weakest still gets a slice
+        adj = {c: max(excess_map.get(c, 0.0), 0.0) + epsilon for c in new_buy_codes}
+        s = sum(adj.values())
+        weights = ({c: adj[c] / s for c in new_buy_codes}
+                   if s > 0 else {c: 1.0 / len(new_buy_codes) for c in new_buy_codes})
+
+        for c in new_buy_codes:
+            close = closes.get(c)
+            if not close or close <= 0:
+                continue
+            limit = round(close * 1.01, 2)
+            slot_value = buy_budget * weights[c]
+            shares = int(slot_value / limit / 100) * 100
+            if shares < 100:
+                continue
+            money = shares * limit
+            rank = rank_map.get(c)
+            ex_pp = excess_map.get(c, 0.0)
+            rank_str = f"#{rank}/{universe_size}" if rank else "—"
+            orders.append({
+                "code": c,
+                "name": rec_name_map.get(c, c),
+                "action": "买入",
+                "shares": shares,
+                "limit_price": limit,
+                "cost": money,
+                "reason": f"模型 {rank_str}, 超额 {ex_pp:+.2f}%",
+            })
+
+    # Pass 1b: held codes that ARE in top-N → silent confirmation, no order
+    # (No rebalance toward "ideal weights" — avoids churn on noisy signals.)
+
+    # Pass 2: holdings NOT in top-N — possible reduce/clear
+    for code, current in held_shares.items():
+        if code in rec_set or current <= 0:
+            continue
+        close = closes.get(code)
+        if not close or close <= 0:
+            continue
+        rank = rank_map.get(code)
+        if rank is None:
+            continue  # not in ZZ500 — silent
+        if rank > 100:
+            shares = current
+            action = "清仓"
+            reason = f"模型排名 #{rank}/{universe_size}（已不在 Top 100）"
+        elif rank > 30:
+            shares = (current // 2 // 100) * 100
+            if shares < 100:
+                continue
+            action = "减仓"
+            reason = f"模型排名 #{rank}/{universe_size}（跌出 Top 30，减半仓）"
+        else:
+            continue  # in top 30 — silent hold
+
+        limit = round(close * 0.99, 2)
+        proceeds = shares * limit
+        orders.append({
+            "code": code,
+            "name": held_names.get(code, code),
+            "action": action,
+            "shares": shares,
+            "limit_price": limit,
+            "cost": -proceeds,
+            "reason": reason,
+        })
+
+    return orders
+
+
+def format_order_list_section(orders: list[dict], account: dict | None) -> str:
+    """Render the order list section as markdown.  Empty string if no orders."""
+    if not orders:
+        return ""
+    lines = ["", "## 📋 明日开盘订单清单", ""]
+    if account and account.get("cash_available") is not None:
+        cash = float(account['cash_available'])
+        lines.append(
+            f"> 可用资金 ¥{cash:,.0f}（买单预算 = 可用 × 95% = ¥{cash * 0.95:,.0f}）"
+        )
+        lines.append("")
+
+    lines.append("| 股票 | 方向 | 股数 | 限价 | 资金 | 原因 |")
+    lines.append("|---|---|---:|---:|---:|---|")
+    for o in orders:
+        cost = o["cost"]
+        cost_str = (f"-¥{abs(cost):,.0f}" if cost < 0 else f"+¥{cost:,.0f}")
+        lines.append(
+            f"| {o['name']} ({o['code']}) | {o['action']} | "
+            f"{o['shares']:,} | ¥{o['limit_price']:.2f} | {cost_str} | {o['reason']} |"
+        )
+
+    net = sum(o["cost"] for o in orders)
+    if account and account.get("cash_available") is not None:
+        cash_after = float(account["cash_available"]) - net
+        sign = "占用" if net > 0 else "释放"
+        lines.append("")
+        lines.append(
+            f"> 净资金{sign}：¥{abs(net):,.0f}"
+            f" | 执行后可用：¥{cash_after:,.0f}"
+        )
+
+    lines.append("")
+    lines.append(
+        "**报价规则**：买单 = 收盘 × 1.01，卖单 = 收盘 × 0.99。"
+        "买不到/卖不掉就放弃，等次日。仓位按 conviction 加权（top-N 权重 ∝ 模型超额预测）。"
+    )
+    lines.append("")
+    return "\n".join(lines)
+
 
 def _make_data_timestamps(
     bar_fetched_at: "datetime | None" = None,
@@ -887,6 +1287,10 @@ def format_report(
     regime: MarketRegime | None = None,
     midday: bool = False,
     data_timestamps: dict | None = None,
+    midday_watchlist_eval: list[dict] | None = None,
+    order_list: list[dict] | None = None,
+    account: dict | None = None,
+    session_label: str = "midday",
 ) -> str:
     """Format evaluation results as markdown string (saved to file)."""
     return _format_markdown(
@@ -895,6 +1299,10 @@ def format_report(
         holdings_screen, rec_screen, rebalance_advice, regime,
         midday=midday,
         data_timestamps=data_timestamps,
+        midday_watchlist_eval=midday_watchlist_eval,
+        order_list=order_list,
+        account=account,
+        session_label=session_label,
     )
 
 
@@ -904,13 +1312,21 @@ def _format_markdown(
     holdings_screen, rec_screen, rebalance_advice=None, regime=None,
     midday: bool = False,
     data_timestamps: dict | None = None,
+    midday_watchlist_eval: list[dict] | None = None,
+    order_list: list[dict] | None = None,
+    account: dict | None = None,
+    session_label: str = "midday",
 ) -> str:
     """Plain markdown format (for file saving)."""
     today = date.today().strftime("%Y-%m-%d")
     weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     wd = weekday_cn[date.today().weekday()]
 
-    title = "午间快报" if midday else "每日持仓评估报告"
+    if midday:
+        title = {"midday": "午间快报", "2pm": "盘中快报 14:00"}.get(session_label, "盘中快报")
+    else:
+        title = "每日持仓评估报告"
+    _hs300 = _hs300_set()   # for ⚠️ extrapolation marking
     lines = [f"# {title}", f"**{today} {wd}**", ""]
 
     # --- Market regime ---
@@ -973,8 +1389,9 @@ def _format_markdown(
             if pd.notna(row.get("realtime_price")):
                 sign = "+" if row["realtime_change_pct"] >= 0 else ""
                 rt_text = f"  现价: ¥{row['realtime_price']:.2f} ({sign}{row['realtime_change_pct']:.2f}%)"
+            extra_mark = _EXTRAPOLATION_MARK if row["code"] in _hs300 else ""
             lines.append(
-                f"**{row['name']}** ({row['code']}){rt_text}  "
+                f"**{row['name']}**{extra_mark} ({row['code']}){rt_text}  "
                 f"{score_text}  "
                 f"建议: {icon} **{row['suggestion']}**"
             )
@@ -1026,7 +1443,13 @@ def _format_markdown(
         lines.append(format_60d_section(holdings_60d, name_map, scores_60d=holdings_60d_scores))
         lines.append("")
 
-    lines.append("## 推荐关注 (ZZ500)")
+    lines.append("## 推荐关注 (HS300 + ZZ500)")
+    _has_hs300_in_recs = (
+        not recommendations.empty
+        and any(c in _hs300 for c in recommendations["code"].tolist())
+    )
+    if _has_hs300_in_recs:
+        lines.append(_EXTRAPOLATION_FOOTNOTE)
     _rec_degraded = "_degraded_reason" in recommendations.columns if not recommendations.empty else False
     rec_is_rank = "rank_pct" in recommendations.columns if not recommendations.empty and not _rec_degraded else False
     if _rec_degraded:
@@ -1047,8 +1470,9 @@ def _format_markdown(
                     score_text = f"排名: **前{(1-row['rank_pct'])*100:.1f}%**  绝对参考: {row['predicted_return']:+.2f}%"
             else:
                 score_text = f"预测20日收益: **{row['predicted_return']:+.2f}%**"
+            extra_mark = _EXTRAPOLATION_MARK if row["code"] in _hs300 else ""
             lines.append(
-                f"{i+1}. **{row['name']}** ({row['code']})  "
+                f"{i+1}. **{row['name']}**{extra_mark} ({row['code']})  "
                 f"{score_text}"
             )
             if row.get("top_factors"):
@@ -1069,6 +1493,47 @@ def _format_markdown(
         lines.append(format_60d_section(rec_60d, rec_name_map, scores_60d=rec_60d_scores))
         lines.append("")
 
+    # --- Midday watchlist tracking ---
+    # Shown in 14:00 intraday and 16:00 EOD reports.  Compares the model's
+    # noon picks against the latest ranking to surface signal drift through
+    # the trading day.  Skipped in the noon report itself (it's the SAVER).
+    _show_wl = (midday and session_label != "midday") or (not midday)
+    if _show_wl and midday_watchlist_eval:
+        _later_label = {"2pm": "14:00", "midday": "现时"}.get(session_label, "下午")
+        lines.append("## 午间观察列表跟踪")
+        lines.append(f"> 中午推荐的股票，对比 {_later_label} 数据后的最新排名/超额预测变动。")
+        lines.append("")
+        lines.append(f"| 股票 | 中午超额 | {_later_label} 超额 | 变动 | {_later_label} 排名 |")
+        lines.append("|---|---:|---:|---:|---|")
+        for w in midday_watchlist_eval:
+            name = w.get("name") or w["code"]
+            code = w["code"]
+            m_ex = w.get("midday_excess")
+            a_ex = w.get("afternoon_excess")
+            delta = w.get("excess_delta")
+            a_rank = w.get("afternoon_rank")
+            n_uni = w.get("universe_size")
+
+            m_str = f"{m_ex:+.2f}%" if m_ex is not None else "—"
+            a_str = f"{a_ex:+.2f}%" if a_ex is not None else "—"
+            if delta is None:
+                d_str = "—"
+            else:
+                arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "→")
+                d_str = f"{arrow}{delta:+.2f}pp"
+            if a_rank is None:
+                r_str = "未在 ZZ500"
+            elif n_uni:
+                r_str = f"#{a_rank} / {n_uni}"
+            else:
+                r_str = f"#{a_rank}"
+            lines.append(f"| {name} ({code}) | {m_str} | {a_str} | {d_str} | {r_str} |")
+        lines.append("")
+
+    # --- Next-day open order list (afternoon report only) ---
+    if not midday and order_list:
+        lines.append(format_order_list_section(order_list, account))
+
     lines.append("---")
     ts = data_timestamps or {}
     bar_d = ts.get("bar_date", "N/A")
@@ -1076,6 +1541,39 @@ def _format_markdown(
     gen_t = ts.get("generated_at", datetime.now().strftime("%Y-%m-%d %H:%M"))
     lines.append(f"*行情数据: {bar_d} | 估值数据: {val_d} | 生成于: {gen_t}*")
     return "\n".join(lines)
+
+
+_INTRADAY_TITLE = {"midday": "📊 午间快报", "2pm": "⏰ 盘中快报 14:00"}
+
+
+# Extrapolation marker: HS300 stocks are in the inference universe (since
+# 2026-05-14 widening) but the production BlendRanker was trained on ZZ500
+# only.  Predictions on HS300 names are out-of-distribution extrapolations
+# until Layer 2 (HS300 historical constituent backfill) + Layer 3 (retrain)
+# complete.  Mark them in reports and exclude from automated order lists.
+_EXTRAPOLATION_MARK = " ⚠️*"
+_EXTRAPOLATION_FOOTNOTE = (
+    "> ⚠️* 标记：该股属于 HS300 大盘股，模型当前训练池只覆盖 ZZ500，"
+    "对它的预测是**外推**——仅供参考，不进入换仓建议/订单清单。"
+    "HS300 历史成分股 backfill + 模型重训完成后会移除此标记。"
+)
+
+
+def _hs300_set() -> set[str]:
+    """Cached set of current HS300 codes (used to flag out-of-training-pool stocks)."""
+    try:
+        from mp.data.fetcher import get_index_constituents
+        return set(get_index_constituents("hs300"))
+    except Exception as e:
+        logger.debug("HS300 fetch failed (extrapolation marker off): {}", e)
+        return set()
+
+
+def _card_title(midday: bool, session_label: str, today: str, wd: str) -> str:
+    if not midday:
+        return f"💰 每日持仓报告 {today} {wd}"
+    prefix = _INTRADAY_TITLE.get(session_label, "📊 盘中快报")
+    return f"{prefix} {today} {wd}"
 
 
 def format_feishu_card(
@@ -1093,6 +1591,10 @@ def format_feishu_card(
     regime: MarketRegime | None = None,
     midday: bool = False,
     data_timestamps: dict | None = None,
+    midday_watchlist_eval: list[dict] | None = None,
+    order_list: list[dict] | None = None,
+    account: dict | None = None,
+    session_label: str = "midday",
 ) -> dict:
     """Format evaluation results as a Feishu interactive card JSON."""
     import json
@@ -1100,6 +1602,7 @@ def format_feishu_card(
     today = date.today().strftime("%Y-%m-%d")
     weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     wd = weekday_cn[date.today().weekday()]
+    _hs300 = _hs300_set()   # for ⚠️ extrapolation marking
 
     elements: list[dict] = []
 
@@ -1160,10 +1663,11 @@ def format_feishu_card(
                 rt_str = f" | <font color='{color}'>{sign}{row['realtime_change_pct']:.2f}%</font>"
 
             warn_mark = " [缺]" if row.get("_data_warnings", "") else ""
+            extrap = _EXTRAPOLATION_MARK if row["code"] in _hs300 else ""
             if rt_str:
-                rows.append(f"| {row['name']}{rt_str} | {ret_str}{warn_mark} | {pred_60d} | {sig_str}{rating_str} | {icon}{row['suggestion']} |")
+                rows.append(f"| {row['name']}{extrap}{rt_str} | {ret_str}{warn_mark} | {pred_60d} | {sig_str}{rating_str} | {icon}{row['suggestion']} |")
             else:
-                rows.append(f"| {row['name']} | {ret_str}{warn_mark} | {pred_60d} | {sig_str}{rating_str} | {icon}{row['suggestion']} |")
+                rows.append(f"| {row['name']}{extrap} | {ret_str}{warn_mark} | {pred_60d} | {sig_str}{rating_str} | {icon}{row['suggestion']} |")
 
         header_score = "排名(模型超额)" if is_rank else "预测20d"
         if any(pd.notna(r.get("realtime_price")) for _, r in holdings_eval.iterrows()):
@@ -1277,7 +1781,8 @@ def format_feishu_card(
                 pred_60d = f"{rec_60d_scores[row['code']] * 100:+.2f}%"
 
             warn_mark = " [缺]" if row.get("_data_warnings", "") else ""
-            rec_rows.append(f"| {row['name']} | {ret_str}{warn_mark} | {pred_60d} | {sig_str}{rating_str} |")
+            extrap = _EXTRAPOLATION_MARK if row["code"] in _hs300 else ""
+            rec_rows.append(f"| {row['name']}{extrap} | {ret_str}{warn_mark} | {pred_60d} | {sig_str}{rating_str} |")
 
         rec_header_score = "排名(预测)" if rec_is_rank else "预测20d"
         rec_table_md = (
@@ -1324,6 +1829,73 @@ def format_feishu_card(
             )
             elements.append({"tag": "markdown", "content": detail})
 
+    # --- Midday watchlist tracking ---
+    _show_wl_card = (midday and session_label != "midday") or (not midday)
+    if _show_wl_card and midday_watchlist_eval:
+        _later_label_c = {"2pm": "14:00", "midday": "现时"}.get(session_label, "下午")
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": f"**🕛 午间观察列表跟踪 → {_later_label_c}**"})
+        wl_rows = []
+        for w in midday_watchlist_eval:
+            nm = w.get("name") or w["code"]
+            m_ex = w.get("midday_excess")
+            a_ex = w.get("afternoon_excess")
+            delta = w.get("excess_delta")
+            a_rank = w.get("afternoon_rank")
+            n_uni = w.get("universe_size")
+
+            m_str = f"{m_ex:+.2f}%" if m_ex is not None else "—"
+            a_str = f"{a_ex:+.2f}%" if a_ex is not None else "—"
+            if delta is None:
+                d_str = "—"
+            else:
+                arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "→")
+                d_str = f"{arrow}{delta:+.2f}pp"
+            if a_rank is None:
+                r_str = "—"
+            elif n_uni:
+                r_str = f"#{a_rank}/{n_uni}"
+            else:
+                r_str = f"#{a_rank}"
+            wl_rows.append(f"| {nm} | {m_str} | {a_str} | {d_str} | {r_str} |")
+        wl_table = (
+            f"| 股票 | 中午超额 | {_later_label_c} 超额 | 变动 | {_later_label_c} 排名 |\n"
+            "|---|---|---|---|---|\n"
+            + "\n".join(wl_rows)
+        )
+        elements.append({"tag": "markdown", "content": wl_table})
+
+    # --- Next-day open order list (afternoon report only) ---
+    if not midday and order_list:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": "**📋 明日开盘订单清单**"})
+        if account and account.get("cash_available") is not None:
+            cash = float(account['cash_available'])
+            elements.append({"tag": "markdown", "content":
+                f"可用 ¥{cash:,.0f} · 买单预算 ¥{cash * 0.95:,.0f}"})
+        ol_rows = []
+        for o in order_list:
+            cost = o["cost"]
+            cost_str = (f"-¥{abs(cost):,.0f}" if cost < 0 else f"+¥{cost:,.0f}")
+            ol_rows.append(
+                f"| {o['name']} | {o['action']} | {o['shares']:,} | "
+                f"¥{o['limit_price']:.2f} | {cost_str} | {o['reason']} |"
+            )
+        ol_table = (
+            "| 股票 | 方向 | 股数 | 限价 | 资金 | 原因 |\n"
+            "|---|---|---|---|---|---|\n"
+            + "\n".join(ol_rows)
+        )
+        elements.append({"tag": "markdown", "content": ol_table})
+        net = sum(o["cost"] for o in order_list)
+        if account and account.get("cash_available") is not None:
+            cash_after = float(account["cash_available"]) - net
+            sign = "占用" if net > 0 else "释放"
+            elements.append({"tag": "markdown", "content":
+                f"净资金{sign} ¥{abs(net):,.0f} · 执行后 ¥{cash_after:,.0f}"})
+        elements.append({"tag": "markdown", "content":
+            "*买单 = 收盘×1.01，卖单 = 收盘×0.99；按 conviction 加权*"})
+
     # --- Footer ---
     elements.append({"tag": "hr"})
     ts = data_timestamps or {}
@@ -1338,7 +1910,7 @@ def format_feishu_card(
 
     card = {
         "header": {
-            "title": {"tag": "plain_text", "content": f"{'📊 午间快报' if midday else '💰 每日持仓报告'} {today} {wd}"},
+            "title": {"tag": "plain_text", "content": _card_title(midday, session_label, today, wd)},
             "template": "wathet" if midday else "blue",
         },
         "elements": elements,
@@ -1391,9 +1963,58 @@ def send_to_feishu(
 # Midday Report (午间快报)
 # =====================================================================
 
+def _trading_minutes_elapsed(now: datetime | None = None) -> int:
+    """A-share trading minutes elapsed by `now` (0–240).
+
+    Sessions: 9:30–11:30 (120m) + 13:00–15:00 (120m) = 240m.
+    Lunch break (11:30–13:00) returns 120 (morning complete).
+    Pre-open returns 0; post-close returns 240.
+    """
+    if now is None:
+        now = datetime.now()
+    t = now.hour * 60 + now.minute
+    morning = max(0, min(t - (9 * 60 + 30), 120))
+    afternoon = max(0, min(t - 13 * 60, 120))
+    return morning + afternoon
+
+
+def _full_day_session_scale(now: datetime | None = None) -> float:
+    """Multiplier to convert intraday partial volume/amount to *estimated full-day*.
+
+    Why: model technical features (amount_ratio, volume_trend, amihud_illiq,
+    mfi_14, vwap_dev, …) compare today's volume/amount against a 5/20/60-day
+    rolling mean of *full-day* values.  Injecting a half-day value at midday
+    systematically biases these features low for low-turnover stocks (utilities,
+    banks, defensives), causing midday rank to be artificially depressed.
+    Scaling by ``1/session_fraction`` extrapolates the partial bar to a
+    full-day estimate, restoring distributional consistency with training data.
+
+    Returns 1.0 outside trading hours (post-close = no scaling needed).
+    """
+    elapsed = _trading_minutes_elapsed(now)
+    if elapsed <= 0:
+        return 1.0  # before market open: volume is 0 anyway, no scaling
+    fraction = elapsed / 240.0
+    # Clamp lower bound so a 9:35 fetch (only 5 minutes elapsed) doesn't
+    # produce a 48× extrapolation that's noisier than just using the raw value.
+    fraction = max(fraction, 0.20)
+    return 1.0 / fraction
+
+
 def _fetch_realtime_prices(codes: List[str]) -> Dict[str, dict]:
-    """Fetch realtime prices via Sina quote API. Returns {code: {price, prev_close, change_pct, name}}."""
+    """Fetch realtime prices via Sina quote API. Returns {code: {price, prev_close, change_pct, name}}.
+
+    Volume/amount are scaled to *estimated full-day* via :func:`_full_day_session_scale`
+    so model features that compare today's flow against historical full-day
+    averages (amount_ratio, volume_trend, amihud_illiq, mfi_14, …) operate on
+    the same distribution they were trained on.  Midday: ×2.0; 14:00: ×1.33;
+    post-close: ×1.0.
+    """
     import httpx
+
+    scale = _full_day_session_scale()
+    logger.info("Realtime volume/amount scale = {:.3f} (session fraction {:.0%})",
+                scale, 1.0 / scale)
 
     result = {}
     symbols = []
@@ -1414,7 +2035,15 @@ def _fetch_realtime_prices(codes: List[str]) -> Dict[str, dict]:
             if len(fields) >= 10 and fields[0]:
                 name = fields[0]
                 # Sina fields: 0=name, 1=open, 2=prev_close, 3=current,
-                #   4=high, 5=low, 6=bid, 7=ask, 8=volume(手), 9=amount(元)
+                #   4=high, 5=low, 6=bid, 7=ask, 8=volume(股), 9=amount(元)
+                #
+                # ⚠️ Unit verified 2026-05-11: hq.sinajs.cn returns volume
+                # in SHARES, not 手 — checked 002385 EOD where DB volume =
+                # 70,455,338 (shares) exactly matches sina fields[8].
+                # Previous *100 conversion inflated volume by 100x, crushing
+                # amihud_illiq to ~0 and making model wildly overweight
+                # small-caps midday.  Source convention matches schema.py's
+                # SOURCE_CONVENTIONS["sina"] = {"volume": "shares"}.
                 try:
                     prev_close = float(fields[2])
                     current = float(fields[3])
@@ -1428,8 +2057,11 @@ def _fetch_realtime_prices(codes: List[str]) -> Dict[str, dict]:
                             "open": float(fields[1]),
                             "high": float(fields[4]),
                             "low": float(fields[5]),
-                            "volume": float(fields[8]) * 100,  # 手→股
-                            "amount": float(fields[9]),
+                            # Scale to estimated full-day so model features
+                            # operate on the same distribution as training.
+                            # No 手→股 conversion — sina already returns shares.
+                            "volume": float(fields[8]) * scale,
+                            "amount": float(fields[9]) * scale,
                         }
                 except (ValueError, IndexError):
                     pass
@@ -1547,6 +2179,7 @@ def format_midday_feishu_card(
     today = date.today().strftime("%Y-%m-%d")
     weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     wd = weekday_cn[date.today().weekday()]
+    _hs300 = _hs300_set()   # for ⚠️ extrapolation marking
 
     elements: list[dict] = []
 
@@ -1620,15 +2253,30 @@ def format_midday_feishu_card(
     }
 
 
-def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[str] = None):
-    """Run midday report — same pipeline as daily, with intraday bars injected."""
+def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[str] = None,
+               session_label: str = "midday"):
+    """Run intraday report — same pipeline as daily, with intraday bars injected.
+
+    session_label drives the title, file name, and watchlist behaviour:
+      - "midday"  (~12:00, scale ≈ 2.0): saves recommendations as watchlist,
+        no disk persistence (feishu only).
+      - "2pm"     (~14:00, scale ≈ 1.33): saves report as
+        ``daily_YYYYMMDD_14h.md``, does NOT overwrite the noon watchlist
+        (the afternoon EOD report tracks the noon picks specifically).
+
+    Volume scaling is handled automatically by :func:`_full_day_session_scale`
+    based on wall-clock time — at 14:00 it returns ~1.333 (since session
+    fraction = 180/240 = 75%).  No code change needed for that.
+    """
     from mp.data.fetcher import get_index_constituents
 
     if date.today().weekday() >= 5:
-        logger.info("Weekend — skipping midday report")
+        logger.info("Weekend — skipping {} report", session_label)
         return
 
-    logger.info("=== Midday Report: {} ===", date.today())
+    is_midday_proper = session_label == "midday"
+    label_zh = {"midday": "午间快报", "2pm": "盘中快报 14:00"}.get(session_label, session_label)
+    logger.info("=== {} Report: {} ===", label_zh, date.today())
 
     # 1. Load models (same as daily)
     ranker = BlendRanker()
@@ -1663,9 +2311,10 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     name_map = {h["code"]: h["name"] for h in holdings}
 
     try:
-        zz500_codes = get_index_constituents("zz500")
+        from mp.data.fetcher import get_recommendation_universe
+        zz500_codes = get_recommendation_universe()   # HS300 + ZZ500
     except Exception as e:
-        logger.warning("ZZ500 constituents fetch failed: {}", e)
+        logger.warning("Universe fetch failed: {}", e)
         zz500_codes = []
 
     all_codes = list(set(h_codes + zz500_codes))
@@ -1691,9 +2340,23 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
                 "amount": p["amount"],
             }
 
-    # 5. Evaluate holdings (with intraday bars → fresh ML)
+    # 5a. Build shared feature panel ONCE for universe ∪ holdings.
+    # Same fix as run() — see comment there.  Without this, holdings_eval
+    # and recommend_stocks can see two different DB snapshots when the
+    # API recovers mid-run and DB advances between calls.
+    panel_codes = sorted(set(zz500_codes) | set(h_codes))
+    logger.info("--- Building shared feature panel ({} stocks) ---", len(panel_codes))
+    shared_features = build_latest_features(
+        panel_codes, include_fundamentals=True, intraday_bars=intraday_bars)
+    if shared_features.empty:
+        logger.error("Shared feature panel is empty — aborting midday")
+        return
+
+    # 5. Evaluate holdings using the shared panel (with intraday bars baked in)
     logger.info("--- Evaluating holdings (with intraday data) ---")
-    holdings_eval = evaluate_holdings(ranker, regime=regime, intraday_bars=intraday_bars)
+    holdings_eval = evaluate_holdings(ranker, regime=regime,
+                                       intraday_bars=intraday_bars,
+                                       precomputed_features=shared_features)
     valuation_fetched_at = datetime.now()   # ← 估值数据（PE/PB）拉取完成时刻
 
     # 5b. Append realtime price/change to holdings_eval for display
@@ -1708,11 +2371,10 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     logger.info("--- 60-day technical analysis ---")
     holdings_60d = evaluate_holdings_60d(h_codes) if h_codes else []
 
-    # 6b. 60d ML predictions
+    # 6b. 60d ML predictions (reuse shared panel)
     holdings_60d_scores = {}
     if has_60d_model and h_codes:
-        h_features = build_latest_features(h_codes, include_fundamentals=True,
-                                           intraday_bars=intraday_bars)
+        h_features = shared_features[shared_features["code"].isin(h_codes)].copy()
         if not h_features.empty:
             s60 = ranker_60d.predict(h_features)
             for c, s in zip(h_features["code"].values, s60):
@@ -1726,18 +2388,35 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
         holdings_screen = screen_stocks(h_codes, names=name_map)
         logger.info("Holdings screened: {} stocks", len(holdings_screen))
 
-    # 8. Recommend stocks from ZZ500 (with intraday bars)
-    logger.info("--- Scanning ZZ500 for recommendations ---")
-    recommendations, rec_60d, rec_name_map = recommend_stocks(
-        ranker, n_recommend=5, intraday_bars=intraday_bars)
+    # 8. Recommend stocks using the same shared panel
+    logger.info("--- Scanning universe for recommendations ---")
+    recommendations, rec_60d, rec_name_map, full_scored = recommend_stocks(
+        ranker, n_recommend=5, intraday_bars=intraday_bars,
+        precomputed_features=shared_features)
 
-    # 8b. 60d ML predictions for recommendations
+    # 8a. Save midday picks as watchlist for afternoon report to track.
+    # Only the 12:00 run owns the watchlist — the 14:00 intraday should
+    # NOT overwrite it (the 16:00 EOD report specifically tracks how the
+    # noon picks held up vs faded as full-day data came in).
+    midday_watchlist_eval: list[dict] | None = None
+    if is_midday_proper:
+        _save_midday_watchlist(recommendations, date.today())
+    else:
+        # 2pm (or later intraday) — read midday watchlist and evaluate it
+        # against the just-computed full_scored ranking so users see how
+        # noon's picks have evolved through the early afternoon.
+        midday_watchlist = _load_midday_watchlist(date.today())
+        midday_watchlist_eval = _evaluate_watchlist_afternoon(full_scored, midday_watchlist)
+        if midday_watchlist_eval:
+            logger.info("Midday watchlist tracked at {}: {} stocks",
+                        session_label, len(midday_watchlist_eval))
+
+    # 8b. 60d ML predictions for recommendations (reuse shared panel)
     rec_degraded = "_degraded_reason" in recommendations.columns
     rec_60d_scores = {}
     if has_60d_model and not recommendations.empty and not rec_degraded:
-        rec_features = build_latest_features(recommendations["code"].tolist(),
-                                             include_fundamentals=True,
-                                             intraday_bars=intraday_bars)
+        rec_codes_list = recommendations["code"].tolist()
+        rec_features = shared_features[shared_features["code"].isin(rec_codes_list)].copy()
         if not rec_features.empty:
             s60 = ranker_60d.predict(rec_features)
             for c, s in zip(rec_features["code"].values, s60):
@@ -1758,7 +2437,7 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     n_swaps = sum(1 for a in rebalance_advice if a["action"] in ("换仓", "清仓"))
     logger.info("Rebalance advice: {} actions ({} swaps/sells)", len(rebalance_advice), n_swaps)
 
-    # 10. Format report (same as daily, with midday=True)
+    # 10. Format report (intraday — midday=True flag, custom title via session_label)
     data_timestamps = _make_data_timestamps(bar_fetched_at=bar_fetched_at, intraday=True)
     report = format_report(
         holdings_eval, recommendations,
@@ -1772,8 +2451,19 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
         regime=regime,
         midday=True,
         data_timestamps=data_timestamps,
+        session_label=session_label,
+        midday_watchlist_eval=midday_watchlist_eval,
     )
-    logger.info("Midday report generated ({} chars)", len(report))
+    logger.info("{} report generated ({} chars)", label_zh, len(report))
+
+    # Save 2pm reports to disk so they don't get lost (midday is feishu-only).
+    if not is_midday_proper:
+        report_dir = PROJECT_ROOT / "data" / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        suffix = {"2pm": "_14h"}.get(session_label, f"_{session_label}")
+        report_path = report_dir / f"daily_{date.today().strftime('%Y%m%d')}{suffix}.md"
+        report_path.write_text(report, encoding="utf-8")
+        logger.info("Report saved to {}", report_path)
 
     card = format_feishu_card(
         holdings_eval, recommendations,
@@ -1785,8 +2475,10 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
         rec_screen=rec_screen if not rec_screen.empty else None,
         rebalance_advice=rebalance_advice,
         regime=regime,
+        session_label=session_label,
         midday=True,
         data_timestamps=data_timestamps,
+        midday_watchlist_eval=midday_watchlist_eval,
     )
 
     # 11. Save & send
@@ -1834,21 +2526,42 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         logger.warning("Regime detection failed (non-critical): {}", e)
         regime = None
 
-    # 1. Evaluate holdings
+    # 0a. Build feature panel ONCE for universe ∪ holdings.
+    # ALL downstream scoring (evaluate_holdings, recommend_stocks) shares
+    # this single snapshot.  Without this, a flaky API mid-run can have
+    # evaluate_holdings see DB-as-of-X while recommend_stocks sees
+    # DB-as-of-X+1 → same stock gets two different predictions in the
+    # same report (粤电力A 2026-05-15: 持仓 +1.98% vs 推荐 +4.75%).
+    from mp.data.fetcher import get_recommendation_universe
+    holdings = load_holdings()
+    holding_codes = [h["code"] for h in holdings]
+    try:
+        universe = get_recommendation_universe()
+    except Exception as e:
+        logger.warning("Universe fetch failed, using holdings only: {}", e)
+        universe = []
+    panel_codes = sorted(set(universe) | set(holding_codes))
+    logger.info("--- Building shared feature panel ({} stocks) ---", len(panel_codes))
+    shared_features = build_latest_features(panel_codes, include_fundamentals=True)
+    if shared_features.empty:
+        logger.error("Shared feature panel is empty — aborting")
+        return
+
+    # 1. Evaluate holdings using the shared panel
     logger.info("--- Evaluating holdings ---")
-    holdings_eval = evaluate_holdings(ranker, regime=regime)
+    holdings_eval = evaluate_holdings(ranker, regime=regime,
+                                       precomputed_features=shared_features)
 
     # 1b. 60-day technical analysis for holdings
-    holdings = load_holdings()
-    codes = [h["code"] for h in holdings]
+    codes = holding_codes
     name_map = {h["code"]: h["name"] for h in holdings}
     logger.info("--- 60-day technical analysis ---")
     holdings_60d = evaluate_holdings_60d(codes) if codes else []
 
-    # 1c. 60d ML predictions for holdings
+    # 1c. 60d ML predictions for holdings (reuse shared panel)
     holdings_60d_scores = {}
     if has_60d_model and codes:
-        h_features = build_latest_features(codes, include_fundamentals=True)
+        h_features = shared_features[shared_features["code"].isin(codes)].copy()
         if not h_features.empty:
             s60 = ranker_60d.predict(h_features)
             for c, s in zip(h_features["code"].values, s60):
@@ -1863,15 +2576,23 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         holdings_screen = screen_stocks(codes, names=name_map_screen)
         logger.info(f"Holdings screened: {len(holdings_screen)} stocks")
 
-    # 2. Recommend stocks from ZZ500
-    logger.info("--- Scanning ZZ500 for recommendations ---")
-    recommendations, rec_60d, rec_name_map = recommend_stocks(ranker, n_recommend=5)
+    # 2. Recommend stocks using the same shared panel
+    logger.info("--- Scanning universe for recommendations ---")
+    recommendations, rec_60d, rec_name_map, full_scored = recommend_stocks(
+        ranker, n_recommend=5, precomputed_features=shared_features)
 
-    # 2b. 60d ML predictions for recommendations
+    # 2a. Evaluate today's midday watchlist (if midday ran) — show how those picks held up
+    midday_watchlist = _load_midday_watchlist(date.today())
+    midday_watchlist_eval = _evaluate_watchlist_afternoon(full_scored, midday_watchlist)
+    if midday_watchlist_eval:
+        logger.info("Midday watchlist tracked: {} stocks", len(midday_watchlist_eval))
+
+    # 2b. 60d ML predictions for recommendations (reuse shared panel)
     rec_degraded = "_degraded_reason" in recommendations.columns
     rec_60d_scores = {}
     if has_60d_model and not recommendations.empty and not rec_degraded:
-        rec_features = build_latest_features(recommendations["code"].tolist(), include_fundamentals=True)
+        rec_codes_list = recommendations["code"].tolist()
+        rec_features = shared_features[shared_features["code"].isin(rec_codes_list)].copy()
         if not rec_features.empty:
             s60 = ranker_60d.predict(rec_features)
             for c, s in zip(rec_features["code"].values, s60):
@@ -1892,6 +2613,26 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
     n_swaps = sum(1 for a in rebalance_advice if a["action"] in ("换仓", "清仓"))
     logger.info("Rebalance advice: {} actions ({} swaps/sells)", len(rebalance_advice), n_swaps)
 
+    # 2d. Generate next-day open order list (conviction-weighted, top-5)
+    account = load_account()
+    order_list: list[dict] = []
+    if account is None:
+        logger.info("portfolio.yaml has no `account:` block — order list skipped")
+    elif rec_degraded:
+        logger.info("recommendations degraded — order list skipped")
+    else:
+        try:
+            order_list = generate_order_list(
+                holdings_full=holdings,
+                account=account,
+                recommendations=recommendations,
+                full_scored=full_scored,
+            )
+            logger.info("Order list: {} orders", len(order_list))
+        except Exception as e:
+            logger.warning("Order list generation failed (non-fatal): {}", e)
+            order_list = []
+
     # 3. Format report
     data_timestamps = _make_data_timestamps()  # daily: both dates from DB
     report = format_report(
@@ -1905,6 +2646,9 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         rebalance_advice=rebalance_advice,
         regime=regime,
         data_timestamps=data_timestamps,
+        midday_watchlist_eval=midday_watchlist_eval or None,
+        order_list=order_list or None,
+        account=account,
     )
     logger.info("Report generated ({} chars)", len(report))
 
@@ -1927,6 +2671,9 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         rebalance_advice=rebalance_advice,
         regime=regime,
         data_timestamps=data_timestamps,
+        midday_watchlist_eval=midday_watchlist_eval or None,
+        order_list=order_list or None,
+        account=account,
     )
 
     # 4. Send to Feishu
@@ -1942,11 +2689,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Daily portfolio report")
     parser.add_argument("--dry-run", action="store_true", help="Generate report without sending")
     parser.add_argument("--midday", action="store_true", help="Run midday report (noon)")
+    parser.add_argument("--intraday-2pm", action="store_true",
+                        help="Run 14:00 intraday report (same flow as midday, scale ≈ 1.33×)")
     parser.add_argument("--chat-id", type=str, help="Feishu group chat ID (oc_xxx)")
     parser.add_argument("--user-id", type=str, help="Feishu user ID for DM (ou_xxx)")
     args = parser.parse_args()
 
-    if args.midday:
-        run_midday(dry_run=args.dry_run, chat_id=args.chat_id, user_id=args.user_id)
+    if args.intraday_2pm:
+        run_midday(dry_run=args.dry_run, chat_id=args.chat_id, user_id=args.user_id,
+                   session_label="2pm")
+    elif args.midday:
+        run_midday(dry_run=args.dry_run, chat_id=args.chat_id, user_id=args.user_id,
+                   session_label="midday")
     else:
         run(dry_run=args.dry_run, chat_id=args.chat_id, user_id=args.user_id)

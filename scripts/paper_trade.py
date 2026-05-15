@@ -232,15 +232,61 @@ def execute_pending(state: dict, broker: SimulatedBroker, today: pd.Timestamp,
 
 def mark_to_market(broker: SimulatedBroker, today: pd.Timestamp,
                    bar_cache: dict) -> None:
-    """Update each position's current_price to today's close."""
+    """Update each position's current_price to today's close.
+
+    DB-only path: assumes build_latest_features (in score_universe) has
+    already populated today's bars for all held codes.  Falls back to the
+    most recent prior close if today's row is missing (warns loudly).
+
+    Why no API call: when paper_trade runs at 16:30, the realtime
+    endpoints sometimes haven't refreshed EOD yet (or are transiently
+    down).  An API failure here used to silently keep stale prices, so
+    NAV-today equalled NAV-yesterday and "今日盈亏" showed +0.00
+    despite real intraday moves.  Reading from DB after feature build
+    guarantees consistency with the same data the model just scored on.
+    """
+    import sqlite3
+    from mp.data.store import DEFAULT_DB_URL
+    db_path = DEFAULT_DB_URL.replace("sqlite:///", "")
+    today_str = today.strftime("%Y-%m-%d")
+
     prices: dict[str, float] = {}
-    for code in list(broker.positions.keys()):
-        bar = bar_cache.get(code) or get_today_bar(code, today)
-        if bar is None:
-            logger.warning("No close price for {}", code)
-            continue
-        bar_cache[code] = bar
-        prices[code] = bar["close"]
+    stale: list[tuple[str, str]] = []   # (code, fallback_date)
+    missing: list[str] = []
+
+    with sqlite3.connect(db_path) as conn:
+        cur = conn.cursor()
+        for code in list(broker.positions.keys()):
+            # First try cache (from execute_pending earlier in run)
+            bar = bar_cache.get(code)
+            if bar is not None:
+                prices[code] = bar["close"]
+                continue
+            # DB lookup: today's close
+            row = cur.execute(
+                "SELECT date, close FROM daily_bars WHERE code = ? "
+                "AND date = ? LIMIT 1", (code, today_str)).fetchone()
+            if row and row[1] is not None:
+                prices[code] = float(row[1])
+                continue
+            # Fall back to latest available close (still better than stale)
+            row = cur.execute(
+                "SELECT date, close FROM daily_bars WHERE code = ? "
+                "ORDER BY date DESC LIMIT 1", (code,)).fetchone()
+            if row and row[1] is not None:
+                prices[code] = float(row[1])
+                stale.append((code, str(row[0])[:10]))
+            else:
+                missing.append(code)
+
+    if stale:
+        logger.warning(
+            "mark_to_market: no {} close for {} positions, using latest DB ({})",
+            today_str, len(stale),
+            ", ".join(f"{c}@{d}" for c, d in stale[:5]),
+        )
+    if missing:
+        logger.warning("mark_to_market: no DB row at all for {}", missing)
     if prices:
         broker.update_prices(prices)
 
@@ -251,8 +297,15 @@ def mark_to_market(broker: SimulatedBroker, today: pd.Timestamp,
 
 def score_universe_with_blend(ranker: BlendRanker, today: pd.Timestamp,
                               held_codes: set[str]) -> tuple[pd.DataFrame, float]:
-    """Return (scored_df, data_quality) for the ZZ500 universe + held codes."""
-    universe = set(get_index_constituents(UNIVERSE_NAME))
+    """Return (scored_df, data_quality) for the recommendation universe + held codes.
+
+    Uses HS300 + ZZ500 (≈800 stocks) since 2026-05-14 to cover both large
+    and mid caps.  Prior to that the universe was ZZ500 only — paper trade
+    history under that narrower universe remains in nav_history but new
+    decisions will draw from the broader pool.
+    """
+    from mp.data.fetcher import get_recommendation_universe
+    universe = set(get_recommendation_universe())
     universe.update(held_codes)   # always score current holdings even if dropped from index
     codes = sorted(universe)
     logger.info("Building features for {} stocks...", len(codes))
@@ -637,16 +690,20 @@ def run() -> None:
     executed = execute_pending(state, broker, today, bar_cache)
     logger.info("Executed {} trades from yesterday's plan", len(executed))
 
-    # Step 2: Mark to market at today's close
-    mark_to_market(broker, today, bar_cache)
-
-    # Step 3: Score universe (load model)
+    # Step 2: Score universe (load model).  This is moved BEFORE mark_to_market
+    # so build_latest_features can populate DB with today's bars for held
+    # codes.  Previously mark_to_market ran first and silently kept stale
+    # prices whenever the realtime API was slow/down at 16:30 — making NAV
+    # equal yesterday's and "今日盈亏" show 0.
     ranker = BlendRanker()
     if not ranker.load(MODEL_PATH_PREFIX):
         logger.error("Failed to load BlendRanker from {}_*.lgb — aborting",
                      MODEL_PATH_PREFIX)
         sys.exit(1)
     scored, dq = score_universe_with_blend(ranker, today, set(broker.positions.keys()))
+
+    # Step 3: Mark to market at today's close (DB-only, after step 2 cached it)
+    mark_to_market(broker, today, bar_cache)
     if scored.empty:
         logger.error("Universe scoring returned empty — aborting (no state changes)")
         sys.exit(1)

@@ -129,6 +129,30 @@ def get_index_constituents(index: str = "hs300") -> list[str]:
     raise RuntimeError(f"All sources failed for index constituents: {index}")
 
 
+def get_recommendation_universe(indices: tuple[str, ...] = ("hs300", "zz500")) -> list[str]:
+    """Return the deduplicated union of multiple index constituent lists.
+
+    This is the universe used by recommendation / midday / EOD reports.
+    Default: HS300 (top 300 by market cap) + ZZ500 (rank 301-800) ≈ 800 unique
+    A-share stocks covering both large and mid caps.
+
+    Why both: ZZ500 alone misses large caps like 卓胜微 / 比亚迪 / 招行 etc.
+    Users wanting model signals on those need the larger pool.  Adding HS300
+    is cheap (cached fetch) and produces no overlap (the two indices are
+    disjoint by design).
+
+    Caller can pass other tuples like ``("hs300",)`` or
+    ``("hs300", "zz500", "zz1000")`` to widen/narrow.
+    """
+    codes: set[str] = set()
+    for idx in indices:
+        try:
+            codes.update(get_index_constituents(idx))
+        except Exception as e:
+            logger.warning("Universe fetch failed for {}: {}", idx, e)
+    return sorted(codes)
+
+
 def _save_constituent_snapshot(index: str, codes: list[str]) -> None:
     """Persist today's constituent list to the DB (best-effort, silent on failure)."""
     try:
@@ -604,9 +628,11 @@ def _is_etf_code(code: str) -> bool:
 def _get_daily_bars_etf(code: str, start: str, end: str) -> pd.DataFrame:
     """Eastmoney ETF/fund daily bars via fund_etf_hist_em.
 
-    Like _get_daily_bars_em, EM returns volume in 手 (100 shares) — normalize
-    to 股 (shares) at fetch time to match Sina convention storage-wide.
+    Unit conversion is delegated to :func:`mp.data.schema.normalize_bars`
+    (source="eastmoney_etf").  Do NOT add ad-hoc conversions here.
     """
+    from mp.data.schema import normalize_bars
+
     df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
     df = df.rename(columns={
         "日期": "date", "开盘": "open", "最高": "high", "最低": "low",
@@ -615,15 +641,22 @@ def _get_daily_bars_etf(code: str, start: str, end: str) -> pd.DataFrame:
     })
     df["code"] = code
     df["date"] = pd.to_datetime(df["date"])
-    # Convert volume from 手 (100 shares) → 股 to match Sina convention
-    df["volume"] = df["volume"].astype(float) * 100
     if "turnover" not in df.columns:
         df["turnover"] = float("nan")
+    df = normalize_bars(df, source="eastmoney_etf")
     return df[["code", "date", "open", "high", "low", "close", "volume", "amount", "turnover"]]
 
 
 def _get_daily_bars_sina(code: str, start: str, end: str) -> pd.DataFrame:
-    """Sina daily bars."""
+    """Sina daily bars.
+
+    Unit conversion is delegated to :func:`mp.data.schema.normalize_bars`
+    (source="sina"). Sina returns volume in 股 and turnover in 小数 already,
+    so this is currently a no-op — but routing through normalize_bars
+    documents the contract and catches future Sina changes.
+    """
+    from mp.data.schema import normalize_bars
+
     sina_code = _code_to_sina(code)
     df = ak.stock_zh_a_daily(symbol=sina_code, start_date=start, end_date=end, adjust="qfq")
     df = df.rename(columns={
@@ -634,19 +667,24 @@ def _get_daily_bars_sina(code: str, start: str, end: str) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"])
     if "turnover" not in df.columns:
         df["turnover"] = float("nan")
+    df = normalize_bars(df, source="sina")
     return df[["code", "date", "open", "high", "low", "close", "volume", "amount", "turnover"]]
 
 
 def _get_daily_bars_em(code: str, start: str, end: str) -> pd.DataFrame:
     """Eastmoney daily bars.
 
-    UNIT NORMALIZATION (2026-04-28): Eastmoney returns 成交量 in 手 (lots,
-    1 手 = 100 shares), while Sina returns it in 股 (shares).  We normalize
-    EM to Sina convention (shares) at fetch time so all rows in daily_bars
-    share the same unit.  Otherwise volume-based factors (vwap_dev,
-    obv_slope, vol_price_corr, intraday_intensity, …) get contaminated when
-    a stock's row happens to come from EM fallback.
+    Unit conversion is delegated to :func:`mp.data.schema.normalize_bars`
+    (source="eastmoney").  Do NOT add ad-hoc conversions here.
+
+    History of bugs this routing prevents:
+    - 2026-04-28: 成交量 was 手 not 股 → ×100 missing → silent feature
+      contamination on EM-fallback days
+    - 2026-05-07: 换手率 was 百分数 not 小数 → /100 missing → 100× spike
+      in turnover features → 粤电力A predicted +11.85% vs correct +2.94%
     """
+    from mp.data.schema import normalize_bars
+
     df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
     df = df.rename(columns={
         "日期": "date", "开盘": "open", "最高": "high", "最低": "low",
@@ -655,10 +693,9 @@ def _get_daily_bars_em(code: str, start: str, end: str) -> pd.DataFrame:
     })
     df["code"] = code
     df["date"] = pd.to_datetime(df["date"])
-    # Convert volume from 手 (100 shares) → 股 (shares) to match Sina convention
-    df["volume"] = df["volume"].astype(float) * 100
     if "turnover" not in df.columns:
         df["turnover"] = float("nan")
+    df = normalize_bars(df, source="eastmoney")
     return df[["code", "date", "open", "high", "low", "close", "volume", "amount", "turnover"]]
 
 

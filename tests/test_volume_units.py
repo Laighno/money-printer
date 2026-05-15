@@ -21,24 +21,43 @@ import pandas as pd
 import pytest
 
 
-def test_em_endpoint_normalizes_volume_to_shares():
-    """_get_daily_bars_em must multiply volume by 100 to convert from 手 → 股."""
+def test_em_endpoint_routes_through_normalize_bars():
+    """_get_daily_bars_em must delegate unit conversion to schema.normalize_bars
+    rather than do ad-hoc ×100 inline.
+
+    Updated 2026-05-07: After moats refactor, all unit conversions live in
+    mp.data.schema.normalize_bars to make adding a new source impossible
+    without registering its conventions.
+    """
     from mp.data import fetcher
     src = inspect.getsource(fetcher._get_daily_bars_em)
-    # Must contain explicit normalization
-    assert re.search(r'df\["volume"\]\s*=\s*df\["volume"\]\.astype\(float\)\s*\*\s*100', src), (
-        "_get_daily_bars_em must multiply volume by 100 to convert 手 → 股 "
-        "(matches Sina convention).  See BASELINE for the 2026-04-28 fix."
+    assert 'normalize_bars(df, source="eastmoney")' in src, (
+        "_get_daily_bars_em must call normalize_bars(df, source='eastmoney') "
+        "— do NOT inline ad-hoc unit conversions."
     )
 
 
-def test_etf_endpoint_normalizes_volume_to_shares():
-    """_get_daily_bars_etf must also multiply volume by 100."""
+def test_etf_endpoint_routes_through_normalize_bars():
+    """_get_daily_bars_etf must delegate to schema.normalize_bars."""
     from mp.data import fetcher
     src = inspect.getsource(fetcher._get_daily_bars_etf)
-    assert re.search(r'df\["volume"\]\s*=\s*df\["volume"\]\.astype\(float\)\s*\*\s*100', src), (
-        "_get_daily_bars_etf must also normalize volume × 100 (EM convention)."
+    assert 'normalize_bars(df, source="eastmoney_etf")' in src, (
+        "_get_daily_bars_etf must call normalize_bars(df, source='eastmoney_etf')."
     )
+
+
+def test_em_endpoint_actually_normalizes_volume(monkeypatch):
+    """End-to-end: when ak returns 手, fetcher must produce 股."""
+    from mp.data import fetcher
+    fake_em = pd.DataFrame({
+        "日期": ["2026-05-07"], "开盘": [10.0], "最高": [10.0], "最低": [10.0],
+        "收盘": [10.0], "成交量": [1000.0],   # 手
+        "成交额": [1_000_000.0], "换手率": [3.0],
+    })
+    monkeypatch.setattr(fetcher.ak, "stock_zh_a_hist", lambda **kw: fake_em)
+    df = fetcher._get_daily_bars_em("000001", "20260507", "20260507")
+    assert df["volume"].iloc[0] == pytest.approx(100_000.0)   # 手 ×100 → 股
+    assert df["turnover"].iloc[0] == pytest.approx(0.03)      # 百分数 /100 → 小数
 
 
 def test_save_bars_upsert_rejects_unit_mismatch(tmp_path, monkeypatch):

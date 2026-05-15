@@ -2,67 +2,52 @@
 # type: stock (A股个股) / board (行业板块) / us_stock (美股) / etf (场内ETF)
 # shares / avg_cost / entry_date: 可选，填写后 Tab4 显示浮动盈亏
 # 更新方式: 发券商截图给 Claude，自动识别并更新
-# 最后更新: 2026-04-20 (OCR截图识别)
-# 账户快照: 总资产 83,052.60 / 总市值 82,686.00 / 可用 366.60 / 仓位 99.6%
-# 浮动盈亏 +3,179.92 / 当日盈亏 -86.70 (-0.10%)
+# 规则: 清仓股票直接从列表移除（不再保留 shares=0 占位）
+# 最后更新: 2026-05-15 10:00 (OCR截图识别)
+# 浮动盈亏 -14,622.64 / 当日盈亏 -7,496.00 (-2.69%)
+# 今日动作 (5-15):
+#   - 卖出 健友股份 9500股 (实现 -3,528.98 / -3.62%, 平均卖价 ~8.81) 止损
+#   - 加仓 粤电力A 12100股 (T+1 锁仓, 摊低成本)
+# 昨日动作 (5-14, 未在 portfolio.yaml 记录):
+#   - 新建仓 粤电力A 14200股 (已 T+1 解锁)
+# 备注: 仓位拉到 99.8%，可用资金仅 502.80 元。粤电力A 早盘 -8.19% 砸盘，
+#       昨天那笔在高位接的（≈7.5-7.7），今天 6.82 浮亏 -¥10,149.53。
+#       新模型 (HS300+ZZ500, walk-forward) 5-15 早盘报告仍把粤电力A 列推荐 #1
+#       (excess +5.08%)，逻辑上"持有 + 摊低成本"是顺着模型；但 99.8% 仓位
+#       完全没有止损余量，下行风险敞口大。
+
+# 账户快照（结构化，供 4 点日报订单清单生成用）
+account:
+  total_assets: 271428.80      # 总资产
+  market_value: 270926.00      # 持仓市值
+  cash_available: 502.80       # ⚠️ 可用资金接近 0
+  position_pct: 0.998          # ⚠️ 仓位 99.8%（无止损空间）
+  target_position_pct: 0.70    # 订单生成目标仓位（可调）
+  updated_at: '2026-05-15'
 
 holdings:
-- name: 山东出版
-  code: '601019'
-  type: stock
-  board: ''
-  shares: 6200
-  avg_cost: 7.68   # 当日新建仓，成本临时按现价；券商系统尚未显示实际均价
-  entry_date: '2026-04-20'
-- name: 豫园股份
-  code: '600655'
-  type: stock
-  board: ''
-  shares: 7000
-  avg_cost: 4.861
-  entry_date: ''
 - name: 粤电力A
-  code: 000539
+  code: '000539'
   type: stock
   board: ''
-  shares: 0    # 已清仓（实现盈利 +2,157.32 / +5.04%）
-  avg_cost: 5.531
-  entry_date: ''
-- name: 军工ETF
-  code: '512660'
-  type: stock
-  board: 军工装备
-  shares: 0    # 已清仓
-  avg_cost: 1.455
-  entry_date: ''
-- name: 航天电器
-  code: '002025'
+  shares: 26300              # 14200 (5-14 建仓) + 12100 (5-15 加仓，T+1 锁仓)
+  avg_cost: 7.429            # 显示均价；总成本 195,383
+  entry_date: '2026-05-14'   # 首次建仓日；最近加仓 5-15 T+1 锁仓至 5-18
+- name: 启明星辰
+  code: '002439'
   type: stock
   board: ''
-  shares: 0
-  avg_cost: 78.62
-  entry_date: ''
-- name: 襄阳轴承
-  code: 000678
+  shares: 4000
+  avg_cost: 16.156           # 反推自浮亏 -126.01 @ 现价 16.140（broker 微调）
+  entry_date: '2026-05-08'
+- name: 大北农
+  code: '002385'
   type: stock
-  board: 汽车零部件
-  shares: 0
-  avg_cost: 15.401
-  entry_date: ''
-- name: 海格通信
-  code: '002465'
-  type: stock
-  board: 通信设备
-  shares: 0
-  avg_cost: 14.96
-  entry_date: '2026-04-09'
+  board: ''
+  shares: 7200
+  avg_cost: 3.860            # 反推自浮亏 -818.12 @ 现价 3.750
+  entry_date: '2026-05-11'
 - name: 国防军工
   code: null
   type: board
   board: 军工装备
-- name: 理想汽车
-  code: LI
-  type: us_stock
-  shares: 0
-  avg_cost: 0.0
-  entry_date: ''

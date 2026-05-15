@@ -114,10 +114,14 @@ class DataStore:
 
         Returns the number of rows written.
 
-        Sanity check (2026-04-28): rows where amount/(volume*close) is far
-        from 1.0 indicate a unit mismatch (e.g. EM lots-vs-shares).  Such
-        rows are dropped with a warning rather than written, to prevent
-        feature contamination downstream.
+        All schema enforcement is delegated to :func:`mp.data.schema.validate_bars`,
+        which auto-normalizes obvious unit drift (e.g. turnover > 1 → /100),
+        drops rows violating hard physical bounds, and rejects rows where
+        amount/(volume*close) shows a unit mismatch.
+
+        Per-stock drift detection (>50× the trailing 30-day median) is also
+        applied as the final defense against single-row unit errors that
+        slip through the batch-level checks.
         """
         if df.empty:
             return 0
@@ -129,29 +133,24 @@ class DataStore:
                 df[c] = None
         df = df[cols]
 
-        # Drop rows with obvious volume-unit mismatch.  Allow some slack
-        # (0.3 ~ 3.0) for legitimate floating-point + price-vs-VWAP variance.
-        try:
-            v = df["volume"].astype(float)
-            a = df["amount"].astype(float)
-            c = df["close"].astype(float)
-            ratio = a / (v * c)
-            valid = (ratio > 0.3) & (ratio < 3.0)
-            # Allow rows where any of v/a/c is missing (NaN) — sanity check is best-effort
-            valid = valid | v.isna() | a.isna() | c.isna() | (v == 0) | (c == 0)
-            n_bad = (~valid).sum()
-            if n_bad > 0:
-                logger.warning(
-                    "save_bars_upsert: dropping {} rows with amount/(volume*close) "
-                    "out of [0.3, 3.0] (likely volume unit mismatch). Sample: {}",
-                    n_bad,
-                    df.loc[~valid, ["code", "date", "volume", "amount", "close"]].head(3).to_dict("records"),
-                )
-                df = df[valid].reset_index(drop=True)
-                if df.empty:
-                    return 0
-        except Exception as e:
-            logger.debug(f"Sanity check skipped: {e}")
+        # Schema-enforced validation (Layer 3 of the unit moat).
+        # Auto-normalizes turnover > 1 (back-stop for un-registered sources),
+        # drops rows violating hard physical bounds, and drops rows with
+        # amount/(volume*close) inconsistency.
+        from mp.data.schema import detect_per_stock_drift, validate_bars
+
+        df = validate_bars(df)
+        if df.empty:
+            return 0
+
+        # Per-stock drift detection (Layer 4): catches single-row unit errors
+        # that slip past batch checks — e.g. one stock from a flaky source
+        # whose value is normal-magnitude but 100× its own historical norm.
+        df = detect_per_stock_drift(
+            df,
+            historical_median_lookup=self._trailing_median,
+            threshold=50.0,
+        )
 
         written = 0
         with self.engine.connect() as conn:
@@ -185,6 +184,35 @@ class DataStore:
                 {"code": code},
             ).scalar()
         return result  # e.g. "2025-04-10" or None
+
+    def _trailing_median(self, code: str, col: str, days: int = 30) -> float | None:
+        """Return the median of *col* over the last *days* rows for *code*.
+
+        Used by :func:`mp.data.schema.detect_per_stock_drift` to catch single
+        rows whose value is >50× the stock's own historical median —
+        characteristic of unit drift in a single source/day.
+        Returns None if the column doesn't exist or no history is available.
+        """
+        if col not in {"volume", "amount", "turnover"}:
+            return None
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        f"SELECT {col} FROM daily_bars "
+                        f"WHERE code = :code AND {col} IS NOT NULL AND {col} > 0 "
+                        f"ORDER BY date DESC LIMIT :n"
+                    ),
+                    {"code": code, "n": days},
+                ).fetchall()
+            vals = [r[0] for r in rows if r[0] is not None]
+            if not vals:
+                return None
+            import statistics
+            return float(statistics.median(vals))
+        except Exception as e:
+            logger.debug(f"_trailing_median({code}, {col}) failed: {e}")
+            return None
 
     @staticmethod
     def _normalize_date(d: str) -> str:
