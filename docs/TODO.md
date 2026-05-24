@@ -117,30 +117,23 @@ Y1 revert 决策）
 
 ---
 
-## P3 — seed 44 BlendRanker outlier 归因
+## P3 — seed 切换前的 2023-03 catalyst attribution（updated 2026-05-24 P4-1A）
 
-**问题**：2026-05-24 β0 3-seed spike（docs/dialog/ round 36）显示 seed 44
-BlendRanker walk-forward Sharpe 1.67 vs seed 42/43 的 1.89-1.90，spread 0.23 / -1.5σ。
+**已完成（P4-1A round 39）**：β0 3-seed monthly gap breakdown 定位完成。
+seed 44 落后 seed 42 = `[2020-2022 累积 structural variance ~0.05-0.08 Sharpe]`
++ `[2023-03 single-month +17 pp catalyst gap]` + `[compounding 在 2024-2025 进一步放大到 ~1.50×]`。
+mixed 诊断 (top 3 月只占 19%, top 10 月占 37.7%)。
 
-**关键观察**：win_rate 几乎不变（51.36% vs 52.28%，spread 0.92pp），但 NAV
-compounding 量级差距大（1106% vs 1601%）—— 不是"选股能力不一致"，是"compounding 关键日 hit 与否"
-的 lottery-ticket 性质差异。
+**剩余 prerequisite**：如未来要换 `LGBM_SEED` 或上 multi-seed averaging，
+**必须先做 2023-03 catalyst stock-level attribution**——per-day portfolio
+dump 比对 seed 42 vs 44 在那一月的 stock picks，弄清是 specific stock pick
+fluke 还是 systematic market regime call。否则可能丢 ~0.10 Sharpe 来源不明的优势。
 
-**production 影响**：production 锁 `LGBM_SEED=42` deterministic，**当前 1.90 Sharpe
-是稳定数字**。但如果未来需要换 seed（例如 seed 42 模型 drift），不知道 seed 44
-那种 outlier 会不会重现。
+**预算**：~80 min（脚本 dump + 跑 + 分析）。
+**优先级 P3**：production 锁 seed=42 不阻塞 daily ops；要切 seed 才解禁。
 
-**待办**：
-- 跑 seed 44 + dump per-month NAV breakdown，看哪几个月（or 哪些 trade）
-  拉跨 cumulative NAV
-- 比对 seed 42 同月 selection diff
-- 如果是 1-2 个 large-loss event → 评估是否风控漏洞
-- 如果是 cumulative drift → BlendRanker stability 问题（model architecture issue）
-
-**不阻塞 production**（production 锁 seed=42）。要换 seed / 加 multi-seed 平均
-前必须解。
-
-**参考**：docs/dialog/ rounds 35-36（β0 spike 设计 + 数据）
+**参考**：docs/dialog/ rounds 35-36 (β0 spike) + 38-39 (1A monthly attribution +
+BASELINE.md "Single-month catalyst attribution" 段)
 
 ---
 

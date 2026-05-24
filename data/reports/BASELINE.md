@@ -97,6 +97,27 @@ realized**，不是 distribution mean。3-seed spike 数据：
 数据源：`data/reports/wf_experiments_20260524/wf_b0_seed{42,43,44}_*.log`
 （P3-1d β0 spike）。
 
+#### Single-month catalyst attribution (P4-1A, round 39)
+
+按 P3-1d β0 spike 的 1A 跟进归因（per-month NAV breakdown，docs/dialog/ rounds 38-39）：
+
+- **2020-2022 三年累积 structural variance**: ~0.05-0.08 Sharpe 跨-seed
+  (irreducible)，NAV ratio seed42/seed44 稳定 ~1.22
+- **2023-03 single-month catalyst**: +17 pp single-month gap (seed=42 抓
+  +27.85% 大涨, seed=44 仅抓 +10.45%) 把 NAV ratio 一次性推高到 1.40+，贡献
+  额外 ~+0.10 Sharpe，后由 compounding 在 2024-2025 进一步放大到 ~1.50×
+- **production seed=42 = 1.90 包含此 catalyst gain**；如换 seed，期望落
+  ~1.75-1.85 量级（structural baseline ≈ 1.82）
+
+**Implication**：如未来切换 `LGBM_SEED` 或上 multi-seed averaging，**必须先做
+2023-03 catalyst stock-level attribution**（per-day portfolio dump 比对
+seed 42 vs 44 在那一月的 picks），弄清是 specific stock pick fluke 还是
+systematic market regime call。否则可能丢 ~0.10 Sharpe 的来源不明优势。
+
+数据源：`data/reports/wf_experiments_20260524/wf_b0_seed{42,44}_*.log`
+对照 monthly returns。Top-1 月 (2023-03) 占总 |monthly gap| 8.5%；
+top-10 月占 37.7%（不是 fluke，也不是均匀 structural，是 mixed）。
+
 > **历史快照（zz500 era, pre-2026-05-14）** —— 保留作为对比参考，不再是当前 production 数字
 >
 > | Metric | Value (zz500 era) |
@@ -215,6 +236,13 @@ realized**，不是 distribution mean。3-seed spike 数据：
 ### 4.1 性能退化告警
 
 阈值基于 ★ 当前 BASELINE（年化 60.42% / Sharpe 1.90 / DD -36.30%，post-P2 2026-05-24）的 ~50% / 50% / 1.1× 安全裕度（DD 阈值放宽因为 hs300+zz500 固有 Max DD 已经偏深）。
+
+> **阈值代码 source of truth**: [`mp/monitor/threshold_alert.py`](../../mp/monitor/threshold_alert.py)
+> （P4-1C, docs/dialog/ round 39）。下方表里 Sharpe / 年化 / Max DD 三行**会
+> 自动告警**——weekly `walk_forward_backtest.py` cron 跑完之后，
+> `send_model_update_report` 调用 `check_thresholds(bt_metrics)`，breach 时在
+> 飞书消息里加 "🚨 RED" / "⚠ YELLOW" 段。其余指标（月度胜率 / paper_trade /
+> §4.2-4.4 全部）**仍是人工 review**。
 
 | 指标 | BASELINE ★ | 黄色告警 | 红色告警（即停模拟交易）| 为什么 |
 |---|---:|---:|---:|---|
