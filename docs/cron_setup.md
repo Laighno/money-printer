@@ -7,7 +7,7 @@ Reason for not auto-applying: macOS requires Full Disk Access for
 
 ---
 
-## Current crontab (post P6-X1, 2026-05-24)
+## Current crontab (post P6-X3, 2026-05-24)
 
 ```cron
 # Friday 18:00 — full walk-forward + retrain production models
@@ -38,6 +38,15 @@ Reason for not auto-applying: macOS requires Full Disk Access for
 # update.  Runs 60 min after the heartbeat slot — independent failure
 # domain. Reads crontab; never modifies it.
 0 7 * * * /Users/laighno/laighno/money-printer/.venv/bin/python scripts/monitor/cron_drift_detect.py >> data/logs/cron_drift.log 2>&1
+
+# Saturday 06:30 — paper_trade vs walk_forward Sharpe drift (P6-X3 round 47)
+# Computes rolling 20-day Sharpe from data/paper_trade/state.json::nav_history
+# and compares to the latest data/reports/backtest_history.json bt_metrics
+# Sharpe.  |Δ|>0.5 → YELLOW; |Δ|>1.0 AND paper Sharpe negative → RED.
+# Min N=15 NAV entries before any alert (cold-start guard). Skips if
+# walk_forward data >21 days old (heartbeat would already RED).  Same
+# batch as heartbeat 06:00 but independent failure domain (30 min offset).
+30 6 * * 6 /Users/laighno/laighno/money-printer/.venv/bin/python scripts/monitor/paper_trade_drift_detect.py >> data/logs/paper_trade_drift.log 2>&1
 ```
 
 ## How to apply
@@ -82,7 +91,8 @@ If any of these change, add to the table above + commit.
 ## References
 
 - docs/dialog/ round 41-43 — P5 chain background + design + crontab bug discovery
-- docs/dialog/ round 47 — P6-X1/X2 cron drift detect + trading-day-aware heartbeat
+- docs/dialog/ round 47 — P6-X1/X2/X3 cron drift + trading-day-aware heartbeat + paper_trade Sharpe drift
 - mp/monitor/threshold_alert.py — P4-1C breach alerts (now actually triggers because we removed --update-only)
 - scripts/monitor/weekly_heartbeat.py — P5-B dead-man-switch implementation (trading-day-aware as of P6-X2)
 - scripts/monitor/cron_drift_detect.py — P6-X1 drift detector
+- scripts/monitor/paper_trade_drift_detect.py — P6-X3 paper/walk-forward Sharpe drift monitor
