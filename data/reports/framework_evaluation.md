@@ -207,12 +207,40 @@ EM(估值)       因子表达式引擎    20日收益预测     换仓建议    
 | 短期动量 | 2 | 5日/10日动量 | 短线趋势 |
 | **基本面** | **6** | **PE, PB, 市值对数, ROE, 营收增速, 利润增速** | **价值/成长** |
 
+### 关于本节数字的 counterfactual 说明
+
+本节及下文 §3.3 / §5 列出的因子 "贡献" 数字测的是 **不同 counterfactual**，
+**不能跨表横向比较**。一个 feature 在不同 baseline 上的 Δ 方向可能完全相反
+（见下方 max_drawdown_20d 实证）：
+
+| 数字来源 | counterfactual 含义 | 文件 / 路径 |
+|---|---|---|
+| §3.2 ICIR 表 | univariate 截面 IC mean/std，**单变量** 信号强度 | `mp/ml/ic_utils.py` / `data/ic_curated.json` |
+| W0 / W1 / W2 walk-forward 对比 | **28-feature** baseline 上"加 / 减一个因子" | `data/reports/wf_experiments_20260524/wf_w*.log` |
+| `mp/ml/wf_gate.py` LOO 输出 | **64-feature** baseline 上"砍一个因子" vs 63-feature LOO | `data/reports/wf_gate_calibration.json` |
+
+实证已发现同一 feature 在不同 counterfactual 下方向**可能完全相反**：
+
+- **W2 vs W1**（28 上加 `max_drawdown_20d`）：Sharpe **−0.18**（hurt）
+- **wf_gate LOO**（64 上砍 `max_drawdown_20d`）：Sharpe **+0.11**（即 64 上有它更差，move 后变好）
+
+这不是 bug，是因子贡献 **conditional on baseline 容量**。round 21 的 winsorize
+conditional 反转（28 上 hurt / 64 上 help）是同款现象。
+
+→ 任何 feature 选择决策必须**先声明 vs which baseline**。没有 universal
+"feature X 是否应该用" 的答案。详见 [`docs/dialog/`](../../docs/dialog/) rounds 21
+（winsorize 反转）+ 25-30（wf_gate calibration 失败）+ [`docs/TODO.md`](../../docs/TODO.md)
+"P2 — feature 评估的多 counterfactual 问题"。
+
+---
+
 ### 3.2 因子筛选: IC分析
 
 > ⚠ **2026-05-24 re-baseline**：本节数字基于修复后的 ICIR 公式（commit `b023ba4` 修了 Bug 1：
 > 旧公式 `mean/std * sqrt(N)` 实际是 t-stat，被 √N ≈ 28 倍放大）+ 新 universe (hs300+zz500, 800 只)
 > + 新 panel（653,191 行，2022-01 至 2026-05，979 个交易日）。
 > 旧表（zz500 era）已废，下方保留作对比。
+> 数字 counterfactual = univariate 截面 IC（不可跨表比较，见本节开头说明）。
 
 **新口径 (★ 当前)**：通过截面 IC (Spearman) 和 标准 ICIR = mean(IC) / std(IC) 筛选：
 

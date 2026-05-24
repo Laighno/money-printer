@@ -1,50 +1,33 @@
 # Project TODO
 
-Active follow-ups from the 2026-05-24 P0/P1 research chain on branch
-`collab/advisor-dialog` (commits b023ba4 → 05be047). See
-`docs/dialog/to_advisor.md` and `docs/dialog/to_engineer.md` for the
-17-round narrative behind each item.
+Active follow-ups from the 2026-05-23 → 2026-05-24 P0/P1/P2/P3 research chain
+on branch `collab/advisor-dialog` (commits b023ba4 → 7079b5f). See
+[docs/dialog/](dialog/) for the 32-round narrative and [decision_log.md](decision_log.md)
+for the single-page decision summary.
 
 ---
 
-## P2 — audit 方法学评估
+## ✅ ~~P2 — audit 方法学评估~~ — PARTIALLY RESOLVED 2026-05-24
 
-**问题**：`scripts/feature_importance_audit.py` 基于 80/20 时间分割 val IC drop
-判定"REAL CONTRIBUTOR"，与 walk-forward out-of-sample Sharpe Δ 实证不一致
-（2026-05-24 W2 实验：audit 推荐保留的 max_drawdown_20d / roe_qoq 实际加回
-使 Sharpe -0.18 / Max DD 恶化 3.36 pp）。
+P2-#1 chain (rounds 25-30) implemented and then reverted `--wf-gate`
+integration into audit (commit `26010bf`). Audit verdicts no longer claim
+"REAL CONTRIBUTOR" without WF validation — the in-sample-only header warning
+now points readers at the multi-counterfactual P2 below. `mp/ml/wf_gate.py`
+kept as standalone ad-hoc tool only.
 
-**待办**：
-- 改造 audit gold standard：用 walk-forward Δ Sharpe 替代 val IC drop，或
-  叠加 walk-forward 作为二级 gate
-- 重新审视所有 audit 推荐的"REAL CONTRIBUTOR"是否经过 walk-forward 验证
-- 在 audit 输出里显式标注"in-sample only"vs"walk-forward verified"
-
-**参考**：docs/dialog/ rounds 12-14（W1/W2 实验和 audit 反向证据）
+Remaining if anyone wants to revive a binding gate: a true full-LOO
+walk-forward (~8.5 hr on 64 features) would give a same-baseline ground
+truth, but P2 multi-counterfactual finding suggests the answer would still
+be conditional on the baseline. See `docs/dialog/` rounds 25-30.
 
 ---
 
-## P2 — BASELINE.md + framework_evaluation.md re-baseline
+## ✅ ~~P2 — BASELINE.md + framework_evaluation.md re-baseline~~ — RESOLVED 2026-05-24
 
-**问题**：两文件当前数字基于 zz500 universe（2026-05-14 之前），production
-已切到 hs300+zz500 但文档未更新。具体过时项：
-- BASELINE.md Sharpe 2.01 / 年化 69.84% / Max DD -22.74% → 新 production
-  实测 ~1.53 / ~52% / ~-38%（见 `data/reports/wf_experiments_20260524/`
-  特别是 `wf_production_retrain_20260524_1305.log`）
-- framework_evaluation.md 因子表 ICIR 排序基于错公式（Bug 1，已修
-  commit b023ba4）和 zz500 universe，应在 hs300+zz500 + 修复后 ICIR
-  公式下重做
-- L221 "57 个因子中 24 个" 等所有数字都基于旧 universe / 旧公式
-
-**待办**：
-- BASELINE.md L25-65 表格重算（用 `data/reports/wf_experiments_20260524/`
-  里的实际数字）
-- framework_evaluation.md §3.2 §3.3 因子表重做（用 `mp/ml/ic_utils.py`
-  + 新 universe + `data/ic_curated.json` 的修复后 IC 表）
-- 加 "zz500 era (pre-2026-05-14)" tag 保留历史数字，不删
-
-**参考**：docs/dialog/ rounds 9-11（universe widening 分析）+
-commit b023ba4 (Bug 1 ICIR 修复)
+Commits `a947303` (initial re-baseline) + `P3-1b` (counterfactual specification
+section added to framework_evaluation.md §3) close this item. Both docs now
+carry hs300+zz500 + 64-feature + winsorize numbers in their ★ tables and
+preserve zz500-era snapshots as quoted history with `<sub>` tags.
 
 ---
 
@@ -58,31 +41,48 @@ P2-verify-1 跑 Sharpe **1.90 bit-perfect 复现** round-11。0.37 Sharpe 完全
 
 ---
 
-## P3 — StockRanker fallback `.lgb` 一致性
+## ✅ ~~P3 — StockRanker fallback `.lgb` 一致性~~ — RESOLVED 2026-05-24
 
-**问题**：2026-05-24 P2-fix-1 + P2-verify-1（commit `1674e69`+`5be2856`）
-重训了 BlendRanker (`data/blend_*.lgb`) 用新 winsorize 配置，但
-`data/model.lgb` (20d StockRanker fallback) 和 `data/model_60d.lgb`
-(60d StockRanker) 仍是 P1 close-out commit `89515cb` 时的 winsorize-less 版本。
-原因：`walk_forward_backtest.py::update_production_models()` 在
-`RANKER_KIND=blend` 路径下只重训 BlendRanker，不重训 StockRanker。
+P3-1a (commit `7079b5f`) ran `RANKER_KIND=stock WF_FEATURE_PRESET=W_BASELINE
+LGBM_SEED=42 python scripts/walk_forward_backtest.py` and:
 
-**后果**：
-- production 主路径走 BlendRanker，**不受影响**
-- 但 daily_report 的 fallback 链路（`scripts/daily_report.py:2519`）触发时
-  会用 winsorize-less 的 StockRanker → 行为不一致
+- `data/model.lgb` (20d StockRanker fallback) → retrained walk-forward,
+  64-feature + winsorize. Sharpe 1.15 (expected — StockRanker < Blend conviction).
+- `data/model_60d.lgb` (60d StockRanker) → already 64-feature + winsorize
+  in 89515cb; same seed produced byte-identical output, no commit needed.
 
-**待办**：
-- 跑一次 `RANKER_KIND=stock WF_FEATURE_PRESET=W_BASELINE LGBM_SEED=42 \
-   python scripts/walk_forward_backtest.py`（不带 --skip-update）重训
-  StockRanker `data/model.lgb`。预计 5 min
-- 60d StockRanker 当前 walk-forward 无对应 HORIZON 切换，可能需要 ad-hoc
-  retrain or 修 `update_production_models()` 让它在任何 RANKER_KIND 下
-  都跑一遍 60d 重训
+Production fallback chain (`scripts/daily_report.py:2519`) now uses
+consistent 64-feature + winsorize models.
 
-**优先级 P3**：fallback 路径触发概率低，不阻塞日常 production。
+---
 
-**参考**：docs/dialog/ round 22
+## P3 — update_production_models() clobbers blend_*.lgb when RANKER_KIND=stock
+
+**问题**（2026-05-24 P3-1a 发现）：`scripts/walk_forward_backtest.py::update_production_models()`
+line 1167-1191 在 `ranker_is_blend == False` 路径下 unconditionally retrains
+BlendRanker via `train_fast(ds_20)` on full panel — produces a much worse
+model (val IC ≈ -0.005) than walk-forward expanding-window training, and
+silently overwrites `data/blend_*.lgb`.
+
+**实测**：P3-1a 跑 `RANKER_KIND=stock ...` 期间，blend_primary.lgb 被
+覆盖为 285KB / IC=-0.005 模型（vs P2-verify-1 walk-forward 训出的 81KB /
+Sharpe 1.90 模型）。手动 rollback：`git show 5be2856:data/blend_*.lgb >`。
+
+**后果**：任何人跑 `RANKER_KIND=stock` 不带 `--skip-update`（包括
+cron / ad-hoc training）都会 silently nuke production blend model。
+
+**待办**：修 `update_production_models()` 在 `ranker_is_blend == False`
+路径下：
+- 要么 skip blend retrain 完全（保持现有 blend_*.lgb 不变）
+- 要么 fail-loudly：`raise RuntimeError("Cannot retrain BlendRanker via
+  RANKER_KIND=stock walk-forward path. Pass --skip-update if running stock
+  for the StockRanker fallback only.")`
+
+我倾向第一个（skip + warning），与 README / BASELINE.md 当前"blend is the
+primary production model"语义一致。**P3 但建议优先做**——production 一行
+误操作就 nuke 1.90 Sharpe 模型。
+
+**参考**：docs/dialog/ round 32-33 + commit `7079b5f` 末段披露
 
 ---
 
@@ -117,8 +117,41 @@ Y1 revert 决策）
 
 ---
 
+## P4 — 6 个月后 review CURATED_COLUMNS 是否可物理删除
+
+时间：2026-11-24（6 个月后）。
+
+**问题**：`mp/ml/dataset.py::CURATED_COLUMNS` 当前保留 HEAD 23-item 版本作为
+deprecation marker（commit `05be047`）。
+
+**待办**：grep 整个仓库（含 production cron / 备份脚本）确认无 new
+caller 显式引用 `CURATED_COLUMNS`，如确认 6 个月内无新调用，物理删
+list 本体 + 同时清掉所有 `from mp.ml.dataset import CURATED_COLUMNS`
+import 语句。
+
+如有新引用，**评估是否合理**：6 个月内任何 commit 引入 CURATED 都应被
+当作"未读 docs/dialog/ 14-15 决策档案"flag 出来质询。
+
+**参考**：decision_log.md #9（CURATED 弃用决策）
+
+---
+
 ## 教训（永久规则）
 
-任何 `git checkout HEAD -- <file>` / `git reset --hard` / `git stash drop`
-等 "销毁工作树未提交内容" 的决策**必须先做 `git diff HEAD -- <file>` 看
-当前 diff 是多少行 + 是什么**，确认无价值再执行。Q16 教训。
+以下规则按发现顺序累积，每条**对应一次具体 incident**，违反成本明确：
+
+1. **任何 "销毁工作树未提交内容" 的决策必须先做 `git diff HEAD -- <file>`**
+   看当前 diff 是多少行 + 是什么，确认无价值再执行。Q16 教训
+   （成本：0.37 Sharpe 归因丢失，靠 Claude Code transcript 取证才捞回）
+2. **任何 "production +X Sharpe" 声明前必须 grep production entry points
+   end-to-end**，穷举所有 ranker 类型（StockRanker / BlendRanker /
+   EnsembleBlendRanker / TwoStageRanker / 任何 future 类型）。
+   P2-7 教训（advisor 漏 grep EnsembleBlendRanker, P0/P1/P2 所有 lift
+   差点白做）
+3. **任何需要 calibration 的工具，先做 1-2 hr spike 验证 calibration 可行性
+   再投入完整实现**。P2-#1 教训
+   （成本：~3 hr 工程时间最终 revert，wf_gate.py 留作 standalone tool）
+4. **任何重训 / 覆盖 `data/*.lgb` 的脚本必须先 `cp` 备份**，即使是已
+   ACK 的"安全"动作。Q16 + P3-1a 教训
+   （P3-1a 漏备份 blend_*.lgb，update_production_models bug 直接覆盖了
+   1.90 Sharpe 模型，靠 git show recover）

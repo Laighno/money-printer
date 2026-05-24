@@ -30,6 +30,9 @@ For active follow-ups not yet decided, see [docs/TODO.md](TODO.md).
 | 16 | Re-baseline `BASELINE.md` + `framework_evaluation.md` to hs300+zz500 + 64+winsorize numbers (1.90 era), keep zz500-era snapshots tagged | 23 | `a947303` | active | β admonition + α `<sub>` tags + explicit per-event attribution table |
 | 17 | P2-#1 audit methodology rewrite: add `mp/ml/wf_gate.py` mini walk-forward Δ Sharpe gate | 25-28 | `c9c3415` | active (standalone module only) | Module kept; wiring into audit reverted (see #18) |
 | 18 | P2-#1 wf_gate integration into audit: REVERTED after calibration failed | 30 | `26010bf` (reverts `e71b722`) | superseded | wf_gate LOO from 64-feature ≠ W1/W2 28-feature counterfactual; no shared ground truth |
+| 19 | P3-1a: StockRanker fallback (`model.lgb`) retrained to 64-feature + winsorize | 32 | `7079b5f` | active | 60d StockRanker (`model_60d.lgb`) was deterministically byte-identical to 89515cb so no commit needed |
+| 20 | P3-1b: framework_evaluation.md §3 counterfactual specification section + docs/TODO.md cleanup (close 2 P2s + add 2 P3s + add P4) + decision_log update (this row) | 32 | `34a270a` (eaa4cc9 amended) | active | TODO.md now reflects current state with status tags |
+| 21 | Bug discovered in P3-1a: `update_production_models()` clobbers blend_*.lgb when `RANKER_KIND=stock`; manually rolled back via `git show 5be2856:...`; new P3 TODO opened | 32 | (rollback only, not committed) | rule | Permanent rule #4 added: "any script that retrains data/*.lgb must `cp` backup first" |
 
 ## Status meanings
 
