@@ -71,6 +71,32 @@
 数据源：`data/reports/wf_experiments_20260524/wf_p2fix_20260524_1510.log`
 （commit `5be2856`：P2-verify-1）。
 
+#### Seed-stability caveat（β0 spike 2026-05-24, commit `_P3-1d_`）
+
+Production 锁 `LGBM_SEED=42` deterministic 运行；上方 1.90 Sharpe **是 single-seed
+realized**，不是 distribution mean。3-seed spike 数据：
+
+| seed | Sharpe | 年化 | Max DD | NAV |
+|---|---:|---:|---:|---:|
+| **42** (production) | **1.90** | 60.42% | -36.30% | 1601% |
+| 43 | 1.89 | 60.37% | -33.13% | 1598% |
+| 44 | 1.67 | 51.48% | -38.72% | 1106% |
+
+- mean ± σ (n=3): **1.82 ± 0.13** Sharpe
+- **seed 42/43 cluster 紧密**（差 0.01）→ production 数字稳定可复现
+- **seed 44 是 outlier**（-1.5σ from cluster），归因待研究（见 docs/TODO.md
+  "P3 — seed 44 BlendRanker outlier"）
+- win_rate spread 仅 0.92 pp（51.36-52.28%）→ 选股能力跨 seed 稳定，差异在
+  NAV compounding（lottery-ticket / 关键日 hit 与否）
+
+**Implications**：
+- production deployment confidence: **1.90 deterministic, reproducible**（cron 永远跑 seed 42）
+- generalization confidence (cross-seed): **1.82 ± 0.13**（n=3 估算）
+- §4.1 alert thresholds 仍 anchor 在 1.90（production 实测真值），不改
+
+数据源：`data/reports/wf_experiments_20260524/wf_b0_seed{42,43,44}_*.log`
+（P3-1d β0 spike）。
+
 > **历史快照（zz500 era, pre-2026-05-14）** —— 保留作为对比参考，不再是当前 production 数字
 >
 > | Metric | Value (zz500 era) |

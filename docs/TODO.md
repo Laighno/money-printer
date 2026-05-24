@@ -117,6 +117,33 @@ Y1 revert 决策）
 
 ---
 
+## P3 — seed 44 BlendRanker outlier 归因
+
+**问题**：2026-05-24 β0 3-seed spike（docs/dialog/ round 36）显示 seed 44
+BlendRanker walk-forward Sharpe 1.67 vs seed 42/43 的 1.89-1.90，spread 0.23 / -1.5σ。
+
+**关键观察**：win_rate 几乎不变（51.36% vs 52.28%，spread 0.92pp），但 NAV
+compounding 量级差距大（1106% vs 1601%）—— 不是"选股能力不一致"，是"compounding 关键日 hit 与否"
+的 lottery-ticket 性质差异。
+
+**production 影响**：production 锁 `LGBM_SEED=42` deterministic，**当前 1.90 Sharpe
+是稳定数字**。但如果未来需要换 seed（例如 seed 42 模型 drift），不知道 seed 44
+那种 outlier 会不会重现。
+
+**待办**：
+- 跑 seed 44 + dump per-month NAV breakdown，看哪几个月（or 哪些 trade）
+  拉跨 cumulative NAV
+- 比对 seed 42 同月 selection diff
+- 如果是 1-2 个 large-loss event → 评估是否风控漏洞
+- 如果是 cumulative drift → BlendRanker stability 问题（model architecture issue）
+
+**不阻塞 production**（production 锁 seed=42）。要换 seed / 加 multi-seed 平均
+前必须解。
+
+**参考**：docs/dialog/ rounds 35-36（β0 spike 设计 + 数据）
+
+---
+
 ## P4 — 6 个月后 review CURATED_COLUMNS 是否可物理删除
 
 时间：2026-11-24（6 个月后）。
