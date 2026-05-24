@@ -516,7 +516,23 @@ def run_walk_forward():
     # Optional: augment panel with per-date regime features (PIT-safe,
     # computed from ZZ500 + cross-sectional breadth).  LGBM can learn
     # regime↔factor interactions via tree splits.
-    feature_cols = list(FACTOR_COLUMNS)
+    # 2026-05-24: env override for W0/W1/W2 walk-forward comparison after
+    # P0 ICIR fix (commit b023ba4). See mp/ml/feature_presets.py.
+    _wf_preset = os.environ.get("WF_FEATURE_PRESET")
+    if _wf_preset:
+        from mp.ml.feature_presets import PRESETS, preset_signature
+        if _wf_preset not in PRESETS:
+            raise SystemExit(
+                f"WF_FEATURE_PRESET={_wf_preset!r} invalid; "
+                f"choose one of {sorted(PRESETS)}"
+            )
+        feature_cols = list(PRESETS[_wf_preset])
+        logger.info(
+            "WF_FEATURE_PRESET={} ACTIVE: {} features, sig={}",
+            _wf_preset, len(feature_cols), preset_signature(_wf_preset),
+        )
+    else:
+        feature_cols = list(FACTOR_COLUMNS)
     if USE_REGIME_FEATURES:
         logger.info("Regime features: ENABLED ({} cols added)", len(REGIME_COLUMNS))
         panel = add_regime_features(panel)
