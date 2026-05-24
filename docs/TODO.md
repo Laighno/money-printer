@@ -137,6 +137,51 @@ BASELINE.md "Single-month catalyst attribution" 段)
 
 ---
 
+## P5 (followup) — manual apply of crontab + weekly_heartbeat schedule
+
+**未完事项（user action required）**：P5 chain (rounds 41-44) code-close 但
+production deploy 等 user 手动 2 个命令——macOS Full Disk Access 拦了
+Claude shell 跑 `crontab` 命令，必须 user 自己在 Terminal.app 里跑。
+
+**Command 1** — apply new crontab（去掉 `--update-only`，修 P3-1c 残余 bug）：
+
+```bash
+# 检查 /tmp/crontab_new_p5 还在不在（重启后会丢）
+cat /tmp/crontab_new_p5
+
+# 如果丢了，从 docs/cron_setup.md "Current crontab" 段抄出来：
+cat > /tmp/cron <<'EOF'
+0 18 * * 5 /Users/laighno/laighno/money-printer/.venv/bin/python scripts/walk_forward_backtest.py >> data/logs/model_update.log 2>&1
+0 6 * * 6 /Users/laighno/laighno/money-printer/.venv/bin/python scripts/monitor/weekly_heartbeat.py >> data/logs/heartbeat.log 2>&1
+EOF
+
+# Apply（这一步只能在 Terminal.app / iTerm，不能在 Claude Code shell）
+crontab /tmp/cron   # or /tmp/crontab_new_p5
+
+# Verify
+crontab -l
+```
+
+**Command 2** — confirm logs 目录存在：
+
+```bash
+mkdir -p /Users/laighno/laighno/money-printer/data/logs
+```
+
+**Until apply 完成**：
+- Friday cron 仍跑 `--update-only` → 每周五 18:00 弱化 production blend_*.lgb
+- P4-1C threshold alerts **从来没真正触发过**（因为 `--update-only` path 不调
+  `send_model_update_report`）
+
+**Apply 后**：
+- Friday 18:00 cron 跑 full walk_forward (~30 min instead of ~5 min)
+- Sat 06:00 cron 跑 weekly_heartbeat 检测前一天 cron 是否真跑了
+- P4-1C threshold alerts 真 weekly 触发
+
+**参考**：`docs/cron_setup.md`（source-of-truth）+ docs/dialog/ rounds 41-44
+
+---
+
 ## P4 — 6 个月后 review CURATED_COLUMNS 是否可物理删除
 
 时间：2026-11-24（6 个月后）。
