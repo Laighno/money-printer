@@ -1400,19 +1400,25 @@ if __name__ == "__main__":
     parser.add_argument("--cache-only", action="store_true",
                         help="Only build data cache, don't run backtest")
     parser.add_argument("--update-only", action="store_true",
-                        help="Only retrain production models (no backtest)")
+                        help="[DEPRECATED 2026-05-24 P6-A2] DO NOT USE. "
+                             "Triggered the P3-1c residual train_fast bug "
+                             "(IC=-0.005 weak blend overwrites production). "
+                             "Now raises SystemExit. See docs/dialog/ round 47.")
     args = parser.parse_args()
 
     if args.update_only:
-        t0 = time.time()
-        codes = _merged_current()
-        model_results = update_production_models(codes)
-        elapsed_min = (time.time() - t0) / 60
-        logger.info("Production models updated! ({:.1f} min)", elapsed_min)
-        send_model_update_report(
-            model_results=model_results,
-            elapsed_min=elapsed_min,
-            update_only=True,
+        raise SystemExit(
+            "ERROR: --update-only is deprecated (P3-1c residual bug — it would\n"
+            "       train_fast on full panel and overwrite production blend\n"
+            "       models with a weaker non-walk-forward fit; IC=-0.005 vs\n"
+            "       baseline +0.038).\n"
+            "\n"
+            "       Use full walk-forward retrain instead:\n"
+            "         python scripts/walk_forward_backtest.py [other args]\n"
+            "\n"
+            "       Production crontab was migrated 2026-05-24 (commit f5b5255,\n"
+            "       see docs/cron_setup.md). If you're seeing this from your own\n"
+            "       script/alias, update it too."
         )
     elif args.cache_only:
         codes = _merged_current()
