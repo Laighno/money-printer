@@ -41,12 +41,43 @@ Schedule
 Saturday 06:30 (heartbeat 06:00 + 30 min — independent fail domain but
 same batch).  See ``docs/cron_setup.md``.
 
-Thresholds (initial; will need σ-grounding in deferred P8)
+Thresholds (current; not yet σ-grounded — deferred to P8)
 -----------
-- YELLOW: ``|Δ Sharpe| > 0.5``
-- RED:    ``|Δ Sharpe| > 1.0  AND  paper_trade rolling Sharpe < 0``
+- YELLOW: ``|Δ Sharpe| > 1.0``
+- RED:    ``|Δ Sharpe| > 1.5  AND  paper_trade rolling Sharpe < 0``
   (a large divergence is only RED-worthy if paper is actually losing —
   otherwise it's "we got lucky" not "execution is broken")
+
+THRESHOLD CALIBRATION HISTORY
+-----------------------------
+v1 (b46f2e3, P6-X3): YELLOW 0.5 / RED 1.0
+    Anchor: cross-seed σ ≈ 0.13 (training noise from LGBM_SEED rotation)
+            + production Sharpe scale ≈ 1.90.
+    ❌ ERROR: cross-seed σ measures *training noise* (same data, different
+       seed). Rolling 20d realized Sharpe σ measures *time-series drift*
+       (different 20d windows of actual NAV). Those are different
+       distributions with different magnitudes. Substituting cross-seed σ
+       as the scale anchor for the rolling Sharpe threshold produced a
+       wrongly-calibrated threshold.
+    Source of error: advisor spec in docs/dialog/to_engineer.md round 47;
+    same anchoring error the advisor had just caught the engineer making
+    in P5-A-light docstring (round 41) failed to transfer to the
+    advisor's own spec writing. Caught by external reviewer in the P6
+    evaluation pass.
+
+v2 (P7-α): YELLOW 1.0 / RED 1.5  ← current
+    Anchor: reviewer's intuition that short-window realized Sharpe σ is
+            "0.5–1.0 magnitude in noise band". Conservative loosen to
+            reduce false positives until real σ grounding is available.
+    Still NOT statistically grounded — deferred to P8 chain:
+      (a) 8–12 weeks of paper_trade NAV → empirical σ backfit, or
+      (b) synthetic NAV simulation from walk_forward backtest →
+          theoretical σ under no-execution-drift hypothesis.
+    Pick (a) or (b) when P8 opens.
+
+(Permanent rule #6, P7-α: when using σ from one distribution as scale
+ anchor for a threshold in another distribution, verify both σ measure
+ the same underlying quantity. See docs/TODO.md.)
 
 Exit codes
 ----------
@@ -84,8 +115,8 @@ MIN_NAV_HISTORY = 15        # cold-start floor (>= 14 returns + 1 std signal)
 ROLLING_WINDOW = 20         # daily NAV returns for rolling Sharpe
 TRADING_DAYS_PER_YEAR = 252
 
-YELLOW_THRESHOLD = 0.5      # |Δ Sharpe|
-RED_THRESHOLD = 1.0         # combined with paper_rolling < 0
+YELLOW_THRESHOLD = 1.0      # |Δ Sharpe| — P7-α loosen from 0.5 (σ-anchor fix)
+RED_THRESHOLD = 1.5         # combined with paper_rolling < 0 — P7-α loosen from 1.0
 
 WALK_FORWARD_STALE_DAYS = 21  # if history latest > 21 d old, skip — heartbeat
                               # would already have alerted; don't double-fire

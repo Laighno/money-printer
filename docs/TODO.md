@@ -54,35 +54,27 @@ LGBM_SEED=42 python scripts/walk_forward_backtest.py` and:
 Production fallback chain (`scripts/daily_report.py:2519`) now uses
 consistent 64-feature + winsorize models.
 
+**P6-A3 (commit `80f8a64`)** added `tests/test_model_60d_feature_count.py` as
+a regression guard: any future retrain on stale CURATED 32 features will
+fail the test in CI rather than silently going into production. See
+decision_log.md #28.
+
 ---
 
-## P3 — update_production_models() clobbers blend_*.lgb when RANKER_KIND=stock
+## ✅ ~~P3 — update_production_models() clobbers blend_*.lgb when RANKER_KIND=stock~~ — RESOLVED 2026-05-24
 
-**问题**（2026-05-24 P3-1a 发现）：`scripts/walk_forward_backtest.py::update_production_models()`
-line 1167-1191 在 `ranker_is_blend == False` 路径下 unconditionally retrains
-BlendRanker via `train_fast(ds_20)` on full panel — produces a much worse
-model (val IC ≈ -0.005) than walk-forward expanding-window training, and
-silently overwrites `data/blend_*.lgb`.
+P3-1c (commit `14f7dbc`) added the 3-way dispatch (`ranker_is_blend` /
+`ranker_20d is None` / else SKIP+warn).  P6-A2 (commit `feac3c6`) then
+killed the latent `--update-only` path entirely via `raise SystemExit`,
+closing the remaining residual clobber surface.
 
-**实测**：P3-1a 跑 `RANKER_KIND=stock ...` 期间，blend_primary.lgb 被
-覆盖为 285KB / IC=-0.005 模型（vs P2-verify-1 walk-forward 训出的 81KB /
-Sharpe 1.90 模型）。手动 rollback：`git show 5be2856:data/blend_*.lgb >`。
+Production blend `.lgb` files are now only overwritten by the legitimate
+Friday walk-forward retrain path.  `RANKER_KIND=stock` runs hit the
+SKIP+warn branch.  `--update-only` runs hit a clear deprecation error
+instead of silently producing IC ≈ -0.005 weak models.
 
-**后果**：任何人跑 `RANKER_KIND=stock` 不带 `--skip-update`（包括
-cron / ad-hoc training）都会 silently nuke production blend model。
-
-**待办**：修 `update_production_models()` 在 `ranker_is_blend == False`
-路径下：
-- 要么 skip blend retrain 完全（保持现有 blend_*.lgb 不变）
-- 要么 fail-loudly：`raise RuntimeError("Cannot retrain BlendRanker via
-  RANKER_KIND=stock walk-forward path. Pass --skip-update if running stock
-  for the StockRanker fallback only.")`
-
-我倾向第一个（skip + warning），与 README / BASELINE.md 当前"blend is the
-primary production model"语义一致。**P3 但建议优先做**——production 一行
-误操作就 nuke 1.90 Sharpe 模型。
-
-**参考**：docs/dialog/ round 32-33 + commit `7079b5f` 末段披露
+**参考**：docs/dialog/ rounds 34 (P3-1c dispatch) + 47 (P6-A2 SystemExit) +
+decision_log.md #22, #29
 
 ---
 
@@ -137,48 +129,36 @@ BASELINE.md "Single-month catalyst attribution" 段)
 
 ---
 
-## P5 (followup) — manual apply of crontab + weekly_heartbeat schedule
+## P7 (followup) — manual apply of P6-X1/X3 crontab entries
 
-**未完事项（user action required）**：P5 chain (rounds 41-44) code-close 但
-production deploy 等 user 手动 2 个命令——macOS Full Disk Access 拦了
-Claude shell 跑 `crontab` 命令，必须 user 自己在 Terminal.app 里跑。
+**未完事项（user action required）**：P5 manual apply 已完成（用户已在 Terminal
+跑 `crontab /tmp/cron`，验证 2 条 entries 在）。P6 chain 加了 **2 条新 entry**，
+需要 user 再做一次手动 apply：
 
-**Command 1** — apply new crontab（去掉 `--update-only`，修 P3-1c 残余 bug）：
+- **Daily 07:00** `cron_drift_detect.py`（P6-X1）
+- **Saturday 06:30** `paper_trade_drift_detect.py`（P6-X3）
 
-```bash
-# 检查 /tmp/crontab_new_p5 还在不在（重启后会丢）
-cat /tmp/crontab_new_p5
-
-# 如果丢了，从 docs/cron_setup.md "Current crontab" 段抄出来：
-cat > /tmp/cron <<'EOF'
-0 18 * * 5 /Users/laighno/laighno/money-printer/.venv/bin/python scripts/walk_forward_backtest.py >> data/logs/model_update.log 2>&1
-0 6 * * 6 /Users/laighno/laighno/money-printer/.venv/bin/python scripts/monitor/weekly_heartbeat.py >> data/logs/heartbeat.log 2>&1
-EOF
-
-# Apply（这一步只能在 Terminal.app / iTerm，不能在 Claude Code shell）
-crontab /tmp/cron   # or /tmp/crontab_new_p5
-
-# Verify
-crontab -l
-```
-
-**Command 2** — confirm logs 目录存在：
+**Command** — 抄 `docs/cron_setup.md "## Current crontab"` block 到 /tmp/cron
+然后在 Terminal.app（**不是** Claude shell — FDA 拦截写操作）：
 
 ```bash
-mkdir -p /Users/laighno/laighno/money-printer/data/logs
+crontab /tmp/cron
+crontab -l   # verify 4 条 entries 都在
 ```
 
 **Until apply 完成**：
-- Friday cron 仍跑 `--update-only` → 每周五 18:00 弱化 production blend_*.lgb
-- P4-1C threshold alerts **从来没真正触发过**（因为 `--update-only` path 不调
-  `send_model_update_report`）
+- `cron_drift_detect` 跑会 RED alert（live missing 07:00 entry vs docs has it）
+  — 这是 expected state，确认 X1 wired up end-to-end
+- `paper_trade_drift_detect` 没 cron 跑；ad-hoc 跑会"insufficient NAV (N=14)"
+  cold-start 信息
 
 **Apply 后**：
-- Friday 18:00 cron 跑 full walk_forward (~30 min instead of ~5 min)
-- Sat 06:00 cron 跑 weekly_heartbeat 检测前一天 cron 是否真跑了
-- P4-1C threshold alerts 真 weekly 触发
+- 4 监控 weekly batch（Friday walk_forward / Sat heartbeat / Sat drift / daily cron_drift）
+  全部真 firing
+- cron_drift_detect 转 OK（live ≡ docs）
 
-**参考**：`docs/cron_setup.md`（source-of-truth）+ docs/dialog/ rounds 41-44
+**参考**：`docs/cron_setup.md`（source-of-truth）+ docs/dialog/ rounds 41-44 (P5) +
+47-48 (P6+P7-α)
 
 ---
 
@@ -201,6 +181,67 @@ import 语句。
 
 ---
 
+## P8 — real σ grounding for X3 thresholds（opened 2026-05-24 P7-α）
+
+**问题**：`scripts/monitor/paper_trade_drift_detect.py` 当前阈值
+YELLOW=1.0 / RED=1.5（P7-α loosen from 0.5/1.0 after external reviewer
+catch — round-47 spec used cross-seed σ ≈ 0.13 as anchor，跟 paper_trade
+rolling 20d Sharpe 的 time-series σ 不是同一 distribution）。
+
+**当前 1.0/1.5 是 reviewer 凭直觉建议的 conservative loosen 值**——
+比 v1 的 0.5/1.0 更 conservative 但**仍然没有真 grounding**。
+
+**待办**：择一：
+- **(a) 8-12 周 paper_trade NAV 实测 backfit**: 等积累 8-12 周
+  daily NAV，算 rolling 20d Sharpe time-series σ；用真分布定 ±2σ 黄 / ±3σ 红
+- **(b) Synthetic NAV simulation from walk_forward backtest**: 拿
+  walk_forward 期间 daily NAV 历史（已存在 backtest snapshot），做 rolling
+  20d Sharpe；用其 time-series σ 作 no-execution-drift 假设下的 baseline
+
+**优先级 P8**：当前 1.0/1.5 conservative，false-positive 风险已降；真
+grounding 是 1-2 hr 工作但只能在 (a) 路径累积足够 NAV 后才有意义。
+
+**参考**：`paper_trade_drift_detect.py::THRESHOLD CALIBRATION HISTORY` +
+docs/dialog/ round 48 (P7-α)
+
+---
+
+## P8 — alert channel diversification（opened 2026-05-24 P7-α）
+
+**问题**：当前 4 监控 (model_update / heartbeat / cron_drift / paper_drift)
+**全走 lark-cli 飞书** = single point of failure。如果 webhook secret
+revoke / lark-cli binary 缺失 / 网络分区 → 所有 alert silently drop。
+
+**待办**：加 **file-based fallback**：
+- 每个 alert 除发 Feishu 外，append 一行到 `data/logs/alerts.jsonl`
+  （timestamp + level + source + body hash）
+- Cron stderr capture（已经 `2>&1 >> log` 写入）保证最低限度 audit
+- Optional: weekly heartbeat 同时检测 `alerts.jsonl` mtime / line count，
+  无新 alert 一段时间 + walk_forward 时间正常 → log "alert pipeline 静默"
+
+**优先级 P8**：production 已经有飞书一路 alert + cron log；fallback 是
+defense-in-depth 不阻塞 daily ops。
+
+**参考**：docs/dialog/ round 48 (P7-α)
+
+---
+
+## P8 — 2023-03 catalyst stock-level investigation（carry from P3 round 39）
+
+**问题**（P4-1A 已 narrow）：seed 44 落后 seed 42 主要来自 **2023-03
+single-month +17pp catalyst gap**。当前 production 锁 seed=42 deterministic，
+不阻塞 daily ops，但**如未来切 seed 或上 multi-seed averaging，必须先
+做 stock-level attribution**（per-day portfolio dump 比对 seed 42 vs 44
+在那一月的 stock picks）。
+
+**预算**：~80 min（脚本 dump + 跑 + 分析）。
+
+**触发条件**：考虑切 `LGBM_SEED` 或上 multi-seed ensemble 时解禁。
+
+**参考**：docs/dialog/ rounds 35-36 (β0 spike) + 38-39 (1A monthly attribution)
+
+---
+
 ## 教训（永久规则）
 
 以下规则按发现顺序累积，每条**对应一次具体 incident**，违反成本明确：
@@ -220,3 +261,32 @@ import 语句。
    ACK 的"安全"动作。Q16 + P3-1a 教训
    （P3-1a 漏备份 blend_*.lgb，update_production_models bug 直接覆盖了
    1.90 Sharpe 模型，靠 git show recover）
+5. **统计判定 framework 不该预设 outlier 位置** — 当 spread > threshold
+   时，distribution shape（uniform vs cluster + 1 outlier）必须先看再
+   决定哪个 seed/sample 是 lucky/unlucky。round-35 教训
+   （advisor 3-档判定表 implicitly 假设 "seed 42 outlier"，round-36
+   3-seed 数据出来 seed 44 才是 outlier，险些把 1.90 production figure
+   误降。修复：(ε) 路径 keep 1.90 + 加 seed-stability caveat）
+6. **σ-anchor cross-check before scale-matching thresholds** — 用某个
+   distribution 的 σ 作为 scale anchor 给另一个 distribution 的 threshold
+   时，必须 verify 两个 σ 测的是同一 underlying quantity。常见混淆：
+     - cross-seed σ (training noise, same data different seed)
+     - time-series σ (drift noise, same model different time window)
+     - cross-stock σ (dispersion noise, same date different stock)
+     - rolling-window realized σ (e.g. rolling 20d Sharpe across NAV time series)
+   这些 σ **量级不同 + 不可互替**。Spec docs + commit messages **必须显式
+   写出 anchor type**。
+
+   **Why**: P7-α (round 48) 教训。Round-47 X3 threshold spec 用 cross-seed
+   σ ≈ 0.13 当 anchor 给 paper_trade rolling 20d Sharpe σ 的 threshold
+   （0.5 / 1.0）—— cross-seed σ 测 LGBM seed lottery，rolling Sharpe σ 测
+   time-series drift，substitution 给出 wrongly-calibrated (likely too tight)
+   阈值。external reviewer P6 review pass 捕获。**同款 anchor 错 advisor
+   刚在 P5-A-light (round 41) catch 过 engineer 做**，lesson 没 transfer 到
+   advisor 自己的 spec writing。
+
+   **How to apply**: spec 写 "threshold X, anchored to σ=Y" 时必须 name
+   what Y measures, what the threshold target measures, 并 assert 两者是
+   same distribution type（或 document why they're close enough）。Reviewer
+   side: 任何 spec 提 σ anchor 但 missing this clarification → push back
+   before implementation.

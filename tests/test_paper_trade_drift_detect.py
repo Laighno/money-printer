@@ -6,7 +6,9 @@ Covers:
 - rolling_sharpe happy path (mocked rising trend → positive Sharpe)
 - rolling_sharpe zero-std → None
 - check() cold-start guard (NAV history < 15 → OK with skip msg)
-- check() drift detection: |Δ| > 0.5 → YELLOW, |Δ| > 1.0 + paper<0 → RED
+- check() drift detection: |Δ| > 1.0 → YELLOW, |Δ| > 1.5 + paper<0 → RED
+  (P7-α loosened from 0.5/1.0 — see paper_trade_drift_detect.py
+  THRESHOLD CALIBRATION HISTORY for σ-anchor error fix)
 - check() with walk_forward stale (>21d) → skip
 - main() --dry-run does not call Feishu
 """
