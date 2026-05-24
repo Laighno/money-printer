@@ -188,6 +188,15 @@ FACTOR_COLUMNS: List[str] = (
 # Label column names
 EXCESS_LABEL = "excess_ret"
 
+# Winsorization cap for excess_ret training label, applied symmetrically in
+# build_dataset() and add_excess_ret(). Recovered from prior-session WIP via
+# docs/dialog/ round 20-22 (Claude Code transcript). Value 0.50 was chosen
+# empirically by prior session without documented justification; preserved
+# here because round-11 walk-forward (with winsorize active) reproduced
+# Sharpe 1.90 at 64-feature scale vs 1.53 without it. See P2-fix-1 commit
+# message for full caveats. Tuning is a P3 question.
+EXCESS_CAP = 0.50
+
 # Curated factors selected by cross-sectional IC analysis (|ICIR| >= 0.15).
 # 34 noise factors removed — improves out-of-sample generalization.
 #
@@ -1037,6 +1046,21 @@ def build_dataset(
             dataset.drop(columns=["bench_fwd_ret"], inplace=True)
             n_valid = dataset[EXCESS_LABEL].notna().sum()
             logger.info("Excess return computed: {}/{} rows with valid bench", n_valid, len(dataset))
+
+            # Winsorize extreme excess_ret outliers — usually qfq adjustment
+            # artefacts (splits/rights offerings that DB hasn't fully reconciled).
+            # MSE-trained LGBM is sensitive to tail values: |excess| > 50% in
+            # 20 days is almost always a data error, not a real signal.
+            # Cap at ±EXCESS_CAP (≈ 4.4σ given std ~0.114) to keep training
+            # stable without losing real extreme moves. See module-level
+            # constant for full caveats.
+            n_clipped = (dataset[EXCESS_LABEL].abs() > EXCESS_CAP).sum()
+            if n_clipped > 0:
+                dataset[EXCESS_LABEL] = dataset[EXCESS_LABEL].clip(
+                    lower=-EXCESS_CAP, upper=EXCESS_CAP,
+                )
+                logger.info("Winsorized {} excess_ret outliers at ±{:.0%} ({:.3f}% of rows)",
+                            n_clipped, EXCESS_CAP, n_clipped/len(dataset)*100)
         except Exception as e:
             logger.warning("Failed to compute benchmark fwd_ret, excess_ret unavailable: {}", e)
 
@@ -1083,6 +1107,11 @@ def add_excess_ret(df: pd.DataFrame, horizon: int = 20) -> pd.DataFrame:
         df[EXCESS_LABEL] = df["fwd_ret"] - df["bench_fwd_ret"]
         df.drop(columns=["bench_fwd_ret"], inplace=True)
         logger.info("Added excess_ret to {} rows", df[EXCESS_LABEL].notna().sum())
+        # Same winsorize as build_dataset — see EXCESS_CAP module constant.
+        n_clipped = (df[EXCESS_LABEL].abs() > EXCESS_CAP).sum()
+        if n_clipped > 0:
+            df[EXCESS_LABEL] = df[EXCESS_LABEL].clip(-EXCESS_CAP, EXCESS_CAP)
+            logger.info("Winsorized {} excess_ret outliers at ±{:.0%}", n_clipped, EXCESS_CAP)
     except Exception as e:
         logger.warning("Failed to add excess_ret: {}", e)
     return df
