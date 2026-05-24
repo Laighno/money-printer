@@ -287,6 +287,8 @@ class StockRanker:
             else:
                 dtrain = lgb.Dataset(X, label=y)
             self.model = lgb.train(params, dtrain, num_boost_round=200)
+            importance = self.model.feature_importance(importance_type="gain")
+            self.feature_importance = dict(zip(self.feature_cols, importance.tolist()))
             return {"mae": float("nan"), "ic": float("nan"), "best_rounds": 200}
 
         if is_rank:
@@ -310,6 +312,8 @@ class StockRanker:
             params, dtrain, num_boost_round=1000,
             valid_sets=[dval], callbacks=callbacks,
         )
+        importance = self.model.feature_importance(importance_type="gain")
+        self.feature_importance = dict(zip(self.feature_cols, importance.tolist()))
 
         preds = self.model.predict(X[split_idx:])
 

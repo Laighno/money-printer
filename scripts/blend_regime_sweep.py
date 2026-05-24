@@ -20,6 +20,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from scripts.prediction_diagnostics import REGIMES, _classify_regime  # noqa: E402
+from mp.ml.ic_utils import icir as _icir  # noqa: E402
 
 
 CACHE = Path("data/wf_cache/diagnostics_blend_best.parquet")
@@ -53,7 +54,7 @@ def _metrics(df: pd.DataFrame, w: float) -> dict:
         "top20_excess": (pm["top_ret"] - pm["med_ret"]).mean(),
         "win_rate": (pm["top_ret"] > pm["med_ret"]).mean(),
         "ic_mean": ics.mean() if len(ics) else np.nan,
-        "icir": ics.mean() / ics.std() if len(ics) > 1 and ics.std() > 0 else np.nan,
+        "icir": _icir(ics) if len(ics) > 1 else np.nan,
     }
 
 
