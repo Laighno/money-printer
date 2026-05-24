@@ -1297,6 +1297,22 @@ def send_model_update_report(
                 lines.append(f"- **超额收益(alpha)**: {excess:+.2%}")
         lines.append("")
 
+        # --- P4-1C threshold-breach alerts (BASELINE §4.1) ---
+        try:
+            from mp.monitor.threshold_alert import (
+                check_thresholds,
+                format_for_feishu,
+            )
+            _alerts = check_thresholds(bt_metrics)
+            if _alerts:
+                _alert_block = format_for_feishu(_alerts)
+                if _alert_block:
+                    lines.append(_alert_block)
+                    lines.append("")
+        except Exception as _e:
+            # Alert dispatch must never break the existing weekly report
+            logger.warning("threshold_alert dispatch failed: {}", _e)
+
         # --- Comparison with previous run ---
         prev = _load_prev_backtest_snapshot()
         if prev:
