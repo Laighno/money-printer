@@ -23,6 +23,41 @@ health, style drift etc. (BASELINE §4.2-4.4) remain manual review per
 BASELINE §4 intent ("看这些"). Adding more here is a P5 decision; do
 not extend without advisor sign-off (round-39 spec was explicit on
 keeping this minimal).
+
+Threshold rationale (P5-A-light, docs/dialog/ round 41)
+-------------------------------------------------------
+The YELLOW / RED constants below are **absolute pain levels** copied
+from BASELINE.md §4.1 (commit a947303 era). They are NOT statistically
+grounded against a weekly walk-forward Sharpe distribution.
+
+Specifically:
+- Cross-seed σ from β0 spike (round 36, commit b73834a) = 0.13, but
+  this measures **seed lottery**, not weekly walk-forward drift
+- **Weekly walk-forward time-series σ has never been measured**.
+  Production runs deterministic ``LGBM_SEED=42``; weekly drift comes
+  from data-window shifting only (one more week of training data per
+  weekly cron + any new factor-cache invalidations)
+- Therefore framing "RED Sharpe 0.9 = -7σ from cross-seed mean" is a
+  type error — the right σ for tuning these thresholds doesn't exist
+  in this repo yet
+
+Known limitations of the current calibration:
+- RED Sharpe < 0.9 may rarely trigger if true weekly σ is small —
+  Sharpe halving is a catastrophic regime change, not a typical
+  weekly fluctuation
+- YELLOW Sharpe < 1.4 may be too lax if true weekly σ is small enough
+  that real degradation manifests as Δ ~ -0.2 Sharpe, not Δ ~ -0.5
+- Proper grounding requires a "P5-A-mid" follow-up (currently NOT
+  scheduled): rerun weekly walk-forward N weeks back, measure
+  time-series σ, then re-derive YELLOW/RED bands as e.g. (mean −kσ).
+  Cost ~4-6 hr per N=8-12 weeks. Deferred to a separate research chain
+  per advisor round 41.
+
+For now: treat the alerts here as **"absolute pain level" gates**, not
+"statistically significant departure" gates. Manual review of weekly
+``data/reports/walk_forward_result.md`` remains the primary monitoring
+path; the Feishu auto-alert is a backstop for severe breaches, not the
+sole detector of model drift.
 """
 from __future__ import annotations
 
