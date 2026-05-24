@@ -643,31 +643,10 @@ def get_zz500_close(today: pd.Timestamp) -> Optional[tuple[float, float]]:
         return None
 
 
-def is_trading_day(today: pd.Timestamp) -> bool:
-    """Check if today is an A-share trading day using akshare's official
-    trading calendar (`tool_trade_date_hist_sina`).
-
-    Old approach (probing ZZ500 EOD bar) was too strict: it required EOD
-    data to already be published, which doesn't happen until ~30-60 min
-    after market close.  A 16:00 cron firing 1 min after close would see
-    no data yet and incorrectly mark the day as non-trading (this exact
-    bug skipped paper_trade on 2026-04-30).
-
-    New approach: use the canonical trading calendar.  Falls back to weekday
-    check + conservative skip if calendar API is unavailable.
-    """
-    if today.weekday() >= 5:   # Sat=5 Sun=6
-        return False
-    try:
-        import akshare as ak
-        cal = ak.tool_trade_date_hist_sina()
-        cal["trade_date"] = pd.to_datetime(cal["trade_date"])
-        return today.normalize() in set(cal["trade_date"])
-    except Exception as e:
-        logger.warning("Trade calendar fetch failed ({}); falling back to "
-                       "ZZ500 data probe", e)
-        bench = get_zz500_close(today)
-        return bench is not None
+# is_trading_day moved to mp/data/trading_calendar.py (P6-X2,
+# docs/dialog/ round 47) — re-exported here for backward-compat with
+# any external importers.
+from mp.data.trading_calendar import is_trading_day  # noqa: E402,F401
 
 
 def run() -> None:
