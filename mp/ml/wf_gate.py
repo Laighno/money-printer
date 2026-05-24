@@ -1,10 +1,35 @@
-"""Mini walk-forward gate for feature audit (P2-#1).
+"""Mini walk-forward Δ Sharpe gate — standalone ad-hoc tool (P2-#1).
 
-Used by `scripts/feature_importance_audit.py --wf-gate` to test whether
-each in-sample REAL CONTRIBUTOR candidate actually contributes positive
-out-of-sample alpha. Computes Δ Sharpe = Sharpe(with feature) -
-Sharpe(without feature) on a recent K-fold expanding-window walk-forward
-restricted to a fixed evaluation window.
+Computes Δ Sharpe = Sharpe(with feature) - Sharpe(without feature) on a
+recent K-fold expanding-window walk-forward restricted to a fixed
+evaluation window.
+
+⚠ KNOWN CALIBRATION FAILURE 2026-05-24 (docs/dialog/ round 30): when
+``base_features=FACTOR_COLUMNS`` this gate does NOT reproduce the
+W2-vs-W1 small-CURATED experiment Δ Sharpe values. Direction of effect
+flipped (max_drawdown_20d: mini WF +0.11 vs full WF -0.18). Root cause:
+the gate tests 64-feature leave-one-out counterfactual while W1/W2
+ground truth is 28/30-feature add/remove — different baselines, conditional
+on feature-set capacity (see round-21 winsorize reversal for the same
+pattern). This is NOT a bug in this module; it is a property of feature
+contribution being conditional on baseline.
+
+**Therefore**:
+  - Δ Sharpe here is meaningful WITHIN this gate run only (64-feature LOO).
+  - Do NOT use this gate's verdict as a binding "REAL CONTRIBUTOR"
+    confirmation for CURATED decisions — that requires either explicit
+    same-baseline ground truth or a different design.
+  - audit script (scripts/feature_importance_audit.py) intentionally
+    does NOT integrate this gate as a verdict-promoter (reverted in
+    P2-#1-fix-3 after calibration failed). Use this module for ad-hoc
+    per-feature LOO experiments where you control the counterfactual.
+
+See docs/TODO.md P2 ("multi-counterfactual problem"), docs/dialog/
+rounds 25-30 for the full design + calibration history.
+
+Used by `scripts/wf_gate_calibrate.py` (the calibration script that
+caught the failure) and available for any future caller that needs an
+ad-hoc per-feature Δ Sharpe measurement.
 
 Why a separate "mini" walk-forward
 ----------------------------------

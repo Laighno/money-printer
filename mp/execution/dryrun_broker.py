@@ -49,6 +49,10 @@ class DryRunBroker:
         # If True, "fill" each limit order immediately at its limit price
         # (good for preview / NAV projection).  If False, orders stay pending.
         self.autofill = autofill
+        # Print the "not for PnL reconciliation" warning at most once per
+        # process — paper_trade loops connect() per cycle and we don't want
+        # to spam logs. See docs/dialog/ round 30 (external-review item 2).
+        self._not_for_pnl_warned = False
 
     # ── lifecycle ────────────────────────────────────────────────
 
@@ -56,11 +60,13 @@ class DryRunBroker:
         self._connected = True
         logger.info("DryRunBroker: connected (cash={:.2f}, {} positions)",
                     self._cash, len(self._positions))
-        logger.warning(
-            "DryRunBroker fills at limit with no slippage model; "
-            "do NOT use its NAV/PnL for reconciliation against backtest "
-            "or live QMT — use a dedicated BacktestShadowBroker for that."
-        )
+        if not self._not_for_pnl_warned:
+            logger.warning(
+                "DryRunBroker fills at limit with no slippage model; "
+                "do NOT use its NAV/PnL for reconciliation against backtest "
+                "or live QMT — use a dedicated BacktestShadowBroker for that."
+            )
+            self._not_for_pnl_warned = True
         return True
 
     def disconnect(self):

@@ -1,5 +1,4 @@
-"""Compare 3 feature-importance metrics to audit CURATED_COLUMNS,
-optionally with a mini walk-forward second-stage gate.
+"""Compare 3 feature-importance metrics to audit CURATED_COLUMNS.
 
 The cross-sectional IR test (|IR| >= 0.15) is *univariate* — it can't see
 non-linear interactions or feature substitution.  This script trains a
@@ -14,21 +13,23 @@ complementary importance metrics:
 If a feature has low IR but high gain + permutation drop, it's a real
 multi-variate contributor and we may have wrongly dropped it from CURATED.
 
-⚠ in-sample only by default. The "in-sample positive" verdict requires
-walk-forward validation before being used for CURATED decisions —
+⚠ IN-SAMPLE ONLY — verdicts here are NOT binding for CURATED decisions.
 P2 2026-05-24 W1/W2 walk-forward A/B showed audit's "REAL CONTRIBUTOR"
 classification disagreed with out-of-sample evidence (max_drawdown_20d /
-roe_qoq added Sharpe -0.18 / Max DD -3.36pp, opposite of in-sample
-prediction). Run with ``--wf-gate`` to add walk-forward Δ Sharpe as
-a conditional second-stage gate. See docs/TODO.md P2 / docs/dialog/
-rounds 12-14 (origin) and 25-28 (--wf-gate design).
+roe_qoq added Sharpe -0.18 / Max DD -3.36pp on the W1=28 baseline, opposite
+of in-sample prediction). Use ``mp/ml/wf_gate.py`` for ad-hoc per-feature
+OOS experiments, but read its calibration-failure note first: in 2026-05-24
+calibration the gate's Δ Sharpe direction did NOT match W1/W2 ground truth
+because the counterfactuals differ (wf_gate tests 64-feature LOO, W1/W2
+tests small-CURATED add/remove). Feature contribution is conditional on
+the baseline feature set; there is no universal ground truth — see
+docs/TODO.md P2 ("multi-counterfactual problem") and docs/dialog/ rounds
+12-14 (W1/W2 origin) + 25-30 (wf_gate design + calibration failure).
 
-Output: ranked feature table with all three metrics + recommendation
-(and, when ``--wf-gate``, a fourth column ``wf_gate_delta_sharpe``).
+Output: ranked feature table with all three metrics + recommendation.
 """
 from __future__ import annotations
 
-import argparse
 import sys
 import time
 from pathlib import Path
@@ -49,8 +50,6 @@ from mp.ml.dataset import (
     build_dataset,
 )
 from mp.ml.model import StockRanker
-from mp.ml.wf_gate import TRAIN_START as WF_GATE_TRAIN_START
-from mp.ml.wf_gate import wf_gate_delta_sharpe
 
 
 def _ir_from_panel(panel: pd.DataFrame, feature: str) -> float:
@@ -91,36 +90,8 @@ def _val_ic(model, X: pd.DataFrame, y: pd.Series, feature_cols: list[str]) -> fl
     return float(np.mean(ics)) if ics else float("nan")
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "--wf-gate", action="store_true",
-        help="Run mini walk-forward Δ Sharpe gate on each in-sample positive "
-             "candidate. Adds wf_gate_delta_sharpe column. ~5-10 min per "
-             "candidate; expect ~10 candidates → ~30-60 min total. See "
-             "mp/ml/wf_gate.py and docs/dialog/ rounds 25-28.",
-    )
-    p.add_argument(
-        "--wf-gate-folds", type=int, default=3,
-        help="Number of expanding-window folds for --wf-gate mini WF (default 3).",
-    )
-    p.add_argument(
-        "--wf-gate-threshold", type=float, default=None,
-        help="Δ Sharpe threshold to upgrade verdict to 'WF-confirmed'. "
-             "Default: None (only mark as in-sample-positive). Threshold should "
-             "be calibrated empirically — see docs/dialog/ round 28.",
-    )
-    return p
-
-
 def main() -> int:
-    args = _build_parser().parse_args()
-
     logger.info("=== Feature importance audit ===")
-    if args.wf_gate:
-        logger.info("--wf-gate ACTIVE: will validate in-sample positives via "
-                    "mini walk-forward (folds={}, threshold={})",
-                    args.wf_gate_folds, args.wf_gate_threshold)
     codes = get_recommendation_universe()
     panel = build_dataset(codes, "20220101", horizon=20)
     logger.info("Panel: {:,} rows × {} factors", len(panel), len(FACTOR_COLUMNS))
@@ -189,79 +160,31 @@ def main() -> int:
     # Sort by permutation importance (gold standard)
     audit = audit.sort_values("ic_delta", ascending=False)
 
-    # --- Optional: walk-forward Δ Sharpe gate ----------------------------
-    audit["wf_gate_delta_sharpe"] = np.nan
-    if args.wf_gate:
-        # Defensive: enforce wf_gate's TRAIN_START boundary at caller site
-        # (round 28). wf_gate's internal train_mask doesn't filter by
-        # TRAIN_START itself; we enforce here to make the contract explicit.
-        gate_panel = panel_clean[
-            pd.to_datetime(panel_clean["date"]) >= pd.Timestamp(WF_GATE_TRAIN_START)
-        ].copy()
-        # In-sample positive candidates: same rule the old verdict used
-        candidates = audit[
-            (audit["ic_delta"] > 0.005) & (audit["gain_pct"] > 0.5)
-        ].index.tolist()
-        logger.info("--wf-gate: {} in-sample-positive candidates to validate "
-                    "(panel ≥ {}: {:,} rows × {} dates)",
-                    len(candidates), WF_GATE_TRAIN_START, len(gate_panel),
-                    gate_panel["date"].nunique())
-        base = list(FACTOR_COLUMNS)
-        for j, feat in enumerate(candidates, 1):
-            try:
-                t_g0 = time.time()
-                result = wf_gate_delta_sharpe(
-                    panel=gate_panel,
-                    feature_to_test=feat,
-                    base_features=base,
-                    n_folds=args.wf_gate_folds,
-                    ranker_kind="blend",
-                    label_col=EXCESS_LABEL,
-                )
-                audit.loc[feat, "wf_gate_delta_sharpe"] = result["delta_sharpe"]
-                logger.info("  [{}/{}] {}: Δ Sharpe = {:+.4f}  "
-                            "(with={:+.3f} / without={:+.3f}, {:.0f}s)",
-                            j, len(candidates), feat, result["delta_sharpe"],
-                            result["sharpe_with"], result["sharpe_without"],
-                            time.time() - t_g0)
-            except Exception as e:
-                logger.warning("  wf_gate failed for {}: {}", feat, e)
-
-    # --- Print report ----------------------------------------------------
-    print("\n" + "=" * 120)
+    # Print report
+    print("\n" + "=" * 105)
     print(f"FEATURE IMPORTANCE AUDIT (val baseline IC = {baseline_ic:.4f})")
-    if not args.wf_gate:
-        print("⚠  IN-SAMPLE ONLY — verdicts marked 'in-sample positive' need walk-forward")
-        print("    validation before CURATED decisions. Rerun with --wf-gate to add the gate.")
-        print("    See docs/dialog/ rounds 12-14 (origin) and 25-28 (--wf-gate design).")
-    print("=" * 120)
-    wf_col = "WF Δ Sharpe" if args.wf_gate else ""
+    print("⚠  IN-SAMPLE ONLY — 'REAL CONTRIBUTOR' here is NOT a binding CURATED decision.")
+    print("    Use mp/ml/wf_gate.py for ad-hoc per-feature OOS experiments, but read its")
+    print("    calibration-failure note first (different counterfactual than W1/W2 ground truth).")
+    print("    See docs/TODO.md P2 (multi-counterfactual) + docs/dialog/ rounds 12-14, 25-30.")
+    print("=" * 105)
     print(f"{'Rank':>4} {'Feature':<26} {'|IR|':>7} {'LGBM gain%':>11} {'Perm ΔIC':>10} "
-          f"{wf_col:>12} {'InCURATED':>10}  Verdict")
-    print("-" * 120)
+          f"{'InCURATED':>10}  Verdict")
+    print("-" * 105)
     for i, (feat, row) in enumerate(audit.iterrows(), 1):
         ir, gain, dic = row["abs_ir"], row["gain_pct"], row["ic_delta"]
-        wf_delta = row["wf_gate_delta_sharpe"]
         in_cur = "✓" if row["in_curated"] else "✗"
-        # Verdict — staged: in-sample positive vs WF-confirmed
-        in_sample_positive = dic > 0.005 and gain > 0.5
-        if in_sample_positive and args.wf_gate and args.wf_gate_threshold is not None:
-            if np.isfinite(wf_delta) and wf_delta > args.wf_gate_threshold:
-                verdict = "REAL CONTRIBUTOR (WF-confirmed)"
-            else:
-                verdict = "in-sample positive (WF rejected)"
-        elif in_sample_positive:
-            verdict = "in-sample positive (NEEDS WF VALIDATION)"
+        # Verdict (in-sample only — see header warning)
+        if dic > 0.005 and gain > 0.5:
+            verdict = "REAL CONTRIBUTOR"
         elif dic > 0.001:
             verdict = "weak signal"
         elif dic > -0.001:
             verdict = "no signal"
         else:
             verdict = "NOISE (hurts)"
-        wf_disp = f"{wf_delta:>+8.4f}" if (args.wf_gate and np.isfinite(wf_delta)) else (
-            "      —" if args.wf_gate else "")
         print(f"  {i:>2} {feat:<26} {ir:>7.3f} {gain:>10.2f}% {dic:>+10.5f} "
-              f"{wf_disp:>12} {in_cur:>10}  {verdict}")
+              f"{in_cur:>10}  {verdict}")
 
     # Cross-check: which dropped features have HIGH permutation importance?
     dropped = audit[~audit["in_curated"]].copy()

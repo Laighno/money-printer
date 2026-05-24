@@ -86,6 +86,37 @@ P2-verify-1 跑 Sharpe **1.90 bit-perfect 复现** round-11。0.37 Sharpe 完全
 
 ---
 
+## P2 — feature 评估的多 counterfactual 问题（2026-05-24 P2-#1 calibration 失败发现）
+
+**问题**：同一个 feature 的"贡献"在不同 counterfactual 下方向可能完全相反：
+
+- W2 vs W1（28-feature universe 上加 max_drawdown_20d）：Sharpe **-0.18**
+- wf_gate LOO（64-feature universe 上砍 max_drawdown_20d）：Sharpe **+0.11**
+
+方向相反。这不是 bug，是因子贡献 **conditional on feature set 容量**（与
+docs/dialog/ round 21 的 winsorize conditional 反转同款）。
+amount_ratio 的 wf_gate Δ Sharpe |-0.12| 也超出 0.10 noise band，
+没有 universal "noise feature" 的判定。
+
+**implication**：没有 single audit tool 能给出"feature X 是否应该用"
+的 universal answer。任何 audit / 校准 / 决策**必须显式声明 counterfactual
+baseline**。
+
+**待办（P2 但低优先级，无 production 影响）**：
+- 在 `data/reports/framework_evaluation.md` §3 因子表里加一段
+  "counterfactual specification" 说明（哪些数字是 LOO from W_BASELINE
+  64 / 哪些是 W1-vs-W2 add/remove / 哪些是 univariate 截面 IR）
+- 任何未来的 feature 选择决策都必须先定义 "vs which baseline"
+- 如果以后真要做"binding 二级 gate"：需要 64-feature full LOO walk-forward
+  (~8.5 hr) 作为 ground truth，**没有快捷路径**
+- `mp/ml/wf_gate.py` 模块保留作 ad-hoc 工具但禁止当 binding decision
+  output（其 docstring 已显式说明）
+
+**参考**：docs/dialog/ rounds 25-30（wf_gate 设计 + calibration 失败 +
+Y1 revert 决策）
+
+---
+
 ## 教训（永久规则）
 
 任何 `git checkout HEAD -- <file>` / `git reset --hard` / `git stash drop`
