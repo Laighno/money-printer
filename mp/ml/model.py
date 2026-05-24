@@ -56,7 +56,11 @@ class StockRanker:
                  lgb_params: Optional[Dict[str, object]] = None):
         self.model: Optional[lgb.Booster] = None
         self.model_path = model_path
-        self.feature_cols = feature_cols or FACTOR_COLUMNS
+        # Default = full FACTOR_COLUMNS (64). Wrapped in list() so callers
+        # mutating self.feature_cols don't touch the global. Walk-forward
+        # 2026-05-24 (docs/dialog/) showed any precomputed subset
+        # (CURATED 23/28/30/32) underperforms full set by 0.6+ Sharpe.
+        self.feature_cols = feature_cols or list(FACTOR_COLUMNS)
         self.feature_importance: Dict[str, float] = {}
         self.objective = objective
         self.label_col = label_col
@@ -457,7 +461,7 @@ class TwoStageRanker:
         from mp.ml.stage2_features import STAGE2_COLUMNS
 
         self.top_pct = top_pct
-        s1_cols = stage1_feature_cols or FACTOR_COLUMNS
+        s1_cols = stage1_feature_cols or list(FACTOR_COLUMNS)
 
         self.stage1 = StockRanker(
             feature_cols=s1_cols,
@@ -568,7 +572,7 @@ class BlendRanker:
         self.weight_primary = weight_primary
         self.weight_secondary = 1.0 - weight_primary
         self.extreme_pctile = extreme_pctile
-        self.feature_cols = feature_cols or FACTOR_COLUMNS
+        self.feature_cols = feature_cols or list(FACTOR_COLUMNS)
         self.score_type = "rank_percentile"  # rank-normalized blend output ∈ [0,1]
 
         self.primary = StockRanker(
