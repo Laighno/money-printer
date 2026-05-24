@@ -1056,8 +1056,17 @@ def update_production_models(
         ranker_20d.save("data/blend")
         logger.info("Production BlendRanker: saved from walk-forward (no retrain)")
         results["blend"] = {"source": "walk-forward", "saved": True}
-    else:
-        # Need to retrain BlendRanker from scratch
+    elif ranker_20d is None:
+        # --update-only path (no walk-forward ranker): legitimate request to
+        # refresh BlendRanker from scratch.
+        # NOTE 2026-05-24 (P3-1c, docs/dialog/ round 34): train_fast(ds_20) on
+        # full panel is known to produce a weak model (P3-1a evidence: val IC
+        # ~ -0.005). This is a SEPARATE bug (--update-only mode produces an
+        # inferior blend) tracked as a follow-up; not fixed in this commit
+        # because --update-only is rare and the failure is loud (logs show
+        # primary IC immediately, advisor will catch). Touching it here would
+        # widen scope beyond the P3-1c "don't clobber from non-blend caller"
+        # fix.
         logger.info("Training production BlendRanker (0.8 primary + 0.2 extreme)...")
         if ds_20 is None:
             ds_20 = build_dataset(codes, TRAIN_START, horizon=20)
@@ -1082,6 +1091,23 @@ def update_production_models(
                 results["blend"] = {"error": str(e)}
         else:
             results["blend"] = {"error": "no dataset"}
+    else:
+        # P3-1c (docs/dialog/ round 34): caller passed a non-blend ranker
+        # (typically RANKER_KIND=stock walk-forward path with ranker_20d =
+        # StockRanker). Refresh-from-scratch via train_fast(ds_20) here was
+        # silently clobbering production blend_*.lgb with a model whose val
+        # IC ~ -0.005 (P3-1a incident: 1.90 Sharpe model overwritten;
+        # required manual git-show rollback). Skip the retrain entirely.
+        logger.warning(
+            "update_production_models: caller's ranker_20d is {} (not "
+            "BlendRanker); SKIPPING blend_*.lgb retrain to avoid clobbering "
+            "production blend model. Use --update-only to explicitly refresh "
+            "blend from scratch.",
+            type(ranker_20d).__name__,
+        )
+        results["blend"] = {"skipped": True,
+                            "reason": f"non-blend ranker ({type(ranker_20d).__name__}) passed; "
+                                      "use --update-only to refresh blend"}
 
     # ── StockRanker fallback (data/model.lgb) ──
     if ranker_is_stock:
