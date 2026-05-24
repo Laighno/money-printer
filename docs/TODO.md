@@ -48,42 +48,41 @@ commit b023ba4 (Bug 1 ICIR 修复)
 
 ---
 
-## P2 — dataset.py prior-session 80 行改动遗失（2026-05-24 收尾时发现）
+## ✅ ~~P2 — dataset.py prior-session 80 行改动遗失~~ — RESOLVED 2026-05-24
 
-**问题**：2026-05-23（上一会话）在 `mp/ml/dataset.py` 工作树里有 80 行
-改动（包括 `_add_industry_relative_features` / `_align_fundamentals_to_dates`
-等可能的因子计算改进），从未 commit。2026-05-24 `collab/advisor-dialog`
-分支 Q16 commit 05be047 用 `git checkout HEAD -- mp/ml/dataset.py` 整文件
-还原 → 那 80 行永久销毁。
+通过 `.claude/projects/-Users-laighno-laighno-money-printer/006a1a75-...jsonl`
+transcript 取证找回，cherry-pick `excess_ret` winsorize（commit `1674e69` + `5be2856`）。
+P2-verify-1 跑 Sharpe **1.90 bit-perfect 复现** round-11。0.37 Sharpe 完全回收。
 
-**量化影响**：用同样 W_BASELINE preset + LGBM_SEED=42 + RANKER_KIND=blend
-跑 walk_forward：
-- 改动 still in working tree（round-11，2026-05-24 12:04）：Sharpe **1.90** /
-  年化 60.41% / Max DD -36.30%
-- 改动被销毁后（round-16，2026-05-24 13:04）：Sharpe **1.53** /
-  年化 52.49% / Max DD -38.49%
-- 净损失：**-0.37 Sharpe / -7.9 pp 年化 / -2.2 pp Max DD**
+详见 docs/dialog/ rounds 20-22。
 
-**已知线索**：
-- prior-session 在 `CURATED_COLUMNS` 注释里写了 "Added 2026-05-23 after
-  permutation audit"
-- 涉及 `pb_ind_rank` / `pe_ind_rank` / `mom_20d_ind_rank` 这些因子的
-  计算实现 / PIT 对齐 / 行业相对 ranking 的某些细节
-- HEAD 的 FACTOR_COLUMNS 里这些 factor 名都存在，所以 prior-session 改的
-  是**计算逻辑**，不是新增 factor
+---
+
+## P3 — StockRanker fallback `.lgb` 一致性
+
+**问题**：2026-05-24 P2-fix-1 + P2-verify-1（commit `1674e69`+`5be2856`）
+重训了 BlendRanker (`data/blend_*.lgb`) 用新 winsorize 配置，但
+`data/model.lgb` (20d StockRanker fallback) 和 `data/model_60d.lgb`
+(60d StockRanker) 仍是 P1 close-out commit `89515cb` 时的 winsorize-less 版本。
+原因：`walk_forward_backtest.py::update_production_models()` 在
+`RANKER_KIND=blend` 路径下只重训 BlendRanker，不重训 StockRanker。
+
+**后果**：
+- production 主路径走 BlendRanker，**不受影响**
+- 但 daily_report 的 fallback 链路（`scripts/daily_report.py:2519`）触发时
+  会用 winsorize-less 的 StockRanker → 行为不一致
 
 **待办**：
-- 通过 git log / 上一会话 transcript（如果存档）尝试找回那 80 行
-- 如果找不回 → 重新实现：基于 round-11 vs round-16 跑出来的 Sharpe 差异
-  反推可能的改进方向
-- 实现后跑 walk_forward 验证 Sharpe 是否回到 1.90 量级
+- 跑一次 `RANKER_KIND=stock WF_FEATURE_PRESET=W_BASELINE LGBM_SEED=42 \
+   python scripts/walk_forward_backtest.py`（不带 --skip-update）重训
+  StockRanker `data/model.lgb`。预计 5 min
+- 60d StockRanker 当前 walk-forward 无对应 HORIZON 切换，可能需要 ad-hoc
+  retrain or 修 `update_production_models()` 让它在任何 RANKER_KIND 下
+  都跑一遍 60d 重训
 
-**关联**：这个修复路径可能与"audit 方法学评估"重叠 —— 如果未来用
-walk-forward Δ 作为新 audit gold standard，扫一遍 `_add_industry_relative_features`
-/ `_align_fundamentals_to_dates` 等可能被改良的函数，借机找回部分丢失逻辑。
-两条 P2 一起做可以省工。
+**优先级 P3**：fallback 路径触发概率低，不阻塞日常 production。
 
-**参考**：docs/dialog/ rounds 16-17（gap 发现 + 不可逆销毁确诊）
+**参考**：docs/dialog/ round 22
 
 ---
 

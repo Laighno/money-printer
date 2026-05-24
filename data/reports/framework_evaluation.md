@@ -209,23 +209,64 @@ EM(估值)       因子表达式引擎    20日收益预测     换仓建议    
 
 ### 3.2 因子筛选: IC分析
 
-通过截面 IC (Spearman相关系数) 和 ICIR 筛选:
+> ⚠ **2026-05-24 re-baseline**：本节数字基于修复后的 ICIR 公式（commit `b023ba4` 修了 Bug 1：
+> 旧公式 `mean/std * sqrt(N)` 实际是 t-stat，被 √N ≈ 28 倍放大）+ 新 universe (hs300+zz500, 800 只)
+> + 新 panel（653,191 行，2022-01 至 2026-05，979 个交易日）。
+> 旧表（zz500 era）已废，下方保留作对比。
+
+**新口径 (★ 当前)**：通过截面 IC (Spearman) 和 标准 ICIR = mean(IC) / std(IC) 筛选：
 
 | 强度 | 筛选标准 | 数量 | 代表因子 |
 |------|----------|------|----------|
-| 强因子 | ICIR ≥ 0.5 | 1 | **amihud_illiq** (ICIR=1.32) |
-| 中等因子 | ICIR ≥ 0.3 | 1 | **vwap_dev** |
-| 弱因子 | 0.15 ≤ ICIR < 0.3 | 22 | ma_alignment, rsi_14, vol_20d... |
-| **淘汰因子** | **ICIR < 0.15** | **34** | **信号噪音比过低** |
+| 中等因子 | 0.30 ≤ \|ICIR\| < 0.50 | 6 | **pb_ind_rank** (-0.475), **pe_ind_rank** (-0.455), **amihud_illiq** (+0.455), vwap_dev, total_mv_log, ma_alignment |
+| 弱因子 | 0.15 ≤ \|ICIR\| < 0.30 | 22 | close_ma60_dev, volume_volatility, amount_volatility, low_distance_60d, mom_60d, mom_20d, lower_shadow, pb... |
+| **淘汰因子** | \|ICIR\| < 0.15 | **36** | **信号噪音比过低** |
 
-**结论**: 57个因子中仅 **24个** 进入最终模型。但LightGBM对噪音因子有一定鲁棒性，全量因子在某些变体中表现也可接受。
+**新结论**: 64 个因子中 **28 个** 通过 \|ICIR\| ≥ 0.15 阈值。**但 P2 walk-forward A/B 实证（commit `5be2856`，
+docs/dialog/ rounds 11-14）显示精选子集（28/30/32 features）显著劣于全量 64**：
+
+| Preset | 特征数 | Walk-forward Sharpe |
+|---|---:|---:|
+| W_BASELINE (64 全量) | 64 | **1.90** ⭐ |
+| W0 (旧 CURATED 32) | 32 | 1.29 |
+| W1 (W0 - 4 audit-failing) | 28 | 1.34 |
+| W2 (W1 + max_drawdown_20d + roe_qoq) | 30 | 1.16 |
+
+→ **生产决策：不做 IR 维度预筛，直接用 FACTOR_COLUMNS 全量**。LightGBM 多变量非线性交互价值远超 univariate IR 筛选。
+
+数据源：`data/ic_curated.json`（IC 表）+ `data/reports/wf_experiments_20260524/`（4 组 walk-forward）。
+
+> **历史快照（zz500 era, pre-2026-05-14, pre Bug 1 fix）** ——
+>
+> | 强度 | 筛选标准 | 数量 | 代表因子 |
+> |---|---|---:|---|
+> | 强因子 | ICIR ≥ 0.5 | 1 | amihud_illiq (ICIR=1.32) <sub>(zz500 era, 错公式)</sub> |
+> | 中等因子 | ICIR ≥ 0.3 | 1 | vwap_dev |
+> | 弱因子 | 0.15 ≤ ICIR < 0.3 | 22 | ma_alignment, rsi_14, vol_20d... |
+> | 淘汰因子 | ICIR < 0.15 | 34 | |
+>
+> 老结论："57 个因子中仅 24 个进入最终模型" —— **该决策已被 P0/P1 链推翻**。
+> amihud_illiq ICIR=1.32 实测在新口径下 = **+0.455**（仍是强信号，但量级是 universe widening 后真实值）。
 
 ### 3.3 被验证最强的因子
 
-1. **Amihud非流动性** (ICIR=1.32): 低流动性股票往往有流动性溢价，是最稳定的alpha来源
-2. **VWAP偏离**: 收盘价相对成交量加权均价的偏离，捕捉日内资金流向
-3. **均线排列 (MA Alignment)**: MA5/MA60相对位置，经典趋势指标
-4. **收盘/MA60偏离**: 中期趋势的均值回归信号
+**新口径 (★ 当前, ICIR top 6)**：
+
+1. **pb_ind_rank** (ICIR=-0.475): 行业内 PB 排名，**负向意味着低估值组合更优** —— 行业相对估值修复
+2. **pe_ind_rank** (ICIR=-0.455): 行业内 PE 排名，同上 —— 价值因子在行业中性后仍有效
+3. **amihud_illiq** (ICIR=+0.455): 流动性溢价仍稳定（zz500 era 1.32 是错公式 + 窄 universe；新 0.455 仍是 top 3）
+4. **vwap_dev** (ICIR=-0.347): VWAP 偏离（负向 = 当日跑赢 VWAP 的票后续反而走弱），日内资金均值回归
+5. **total_mv_log** (ICIR=-0.335): 市值因子，**小盘溢价**显著
+6. **ma_alignment** (ICIR=-0.306): MA 排列趋势因子（hs300+zz500 上反向：均线发散后均值回归）
+
+注意：ICIR 符号方向反映"高分位 vs 低分位"组合的预期 spread。
+
+> **历史快照（zz500 era）** —— top 4 / 全 +号方向：
+>
+> 1. Amihud非流动性 (ICIR=1.32) <sub>(错公式 + 窄 universe)</sub>
+> 2. VWAP偏离
+> 3. 均线排列 (MA Alignment)
+> 4. 收盘/MA60偏离
 
 ---
 
@@ -241,7 +282,11 @@ EM(估值)       因子表达式引擎    20日收益预测     换仓建议    
 
 **综合得分 > 0.3 → 牛市 | < -0.3 → 熊市 | 其他 → 震荡**
 
-### 4.2 各市场状态下模型表现
+### 4.2 各市场状态下模型表现 <sub>(zz500 era, pre-2026-05-14)</sub>
+
+> ⚠ 以下 ICIR 数字基于 zz500 universe + 旧 ICIR 公式（Bug 1 修复前）。
+> 新 universe (hs300+zz500) 下的各市场状态分析未重做。**绝对数字不可直接比对当前 production**，
+> 但定性结论（"熊市 IC 骤降但仍正超额"）大概率仍成立。
 
 | 状态 | 月数 | 相对胜率 | 月均超额 | IC | ICIR | 多空价差 |
 |------|------|---------|---------|-----|------|---------|
@@ -249,7 +294,7 @@ EM(估值)       因子表达式引擎    20日收益预测     换仓建议    
 | 震荡 | 23 | 54.3% | +1.68% | 0.123 | 1.49 | +3.44% |
 | 熊市 | 25 | 54.4% | +3.09% | 0.052 | 0.33 | +2.10% |
 
-**关键发现**: 模型在熊市 IC 骤降 (0.052)，但仍能保持正超额，说明 **选股alpha在各市场状态下都存在**，只是强弱不同。
+**关键发现** <sub>(zz500 era)</sub>: 模型在熊市 IC 骤降 (0.052)，但仍能保持正超额，说明 **选股alpha在各市场状态下都存在**，只是强弱不同。
 
 ---
 
@@ -257,17 +302,51 @@ EM(估值)       因子表达式引擎    20日收益预测     换仓建议    
 
 ### 5.1 核心指标
 
+> ⚠ **2026-05-24 re-baseline**：数字基于当前 production 配置（hs300+zz500 + BlendRanker conviction
+> + FACTOR_COLUMNS 64 + EXCESS_CAP=0.50 winsorize）。
+> 数据源：`data/reports/wf_experiments_20260524/wf_p2fix_20260524_1510.log`（commit `5be2856`）。
+
+**★ 当前 production**：
+
 | 指标 | 值 | 评级 |
 |------|-----|------|
-| 总回报 | 1409% | A+ |
-| 年化回报 | 57.25% | A+ |
-| 年化波动率 | 32.00% | B (偏高) |
-| 夏普比率 | 1.79 | A |
-| 卡玛比率 | 1.23 | A |
-| 最大回撤 | -46.72% | B- (可接受) |
-| 胜率 | 54.47% | B+ |
+| 总回报 | 1601% | A+ |
+| 年化回报 | 60.42% | A+ |
+| 年化波动率 | 31.85% | B (偏高) |
+| 夏普比率 | **1.90** | A+ |
+| 卡玛比率 | 1.66 | B+ |
+| 最大回撤 | -36.30% | C (universe 固有，hs300+zz500 上 -34~-39% 是合理区间)|
+| 胜率 | 52.28% | B |
 | 基准(ZZ500) | 41.95% | — |
-| **超额** | **+1367%** | **A+** |
+| **超额** | **+1559%** | **A+** |
+
+#### 1.90 vs zz500 era 1.79（或 2.01 conviction）的归因拆分
+
+为避免读者把 "1.79 → 1.90" 当作"P0/P1/P2 链路净 +0.11 Sharpe"理解，按事件拆分：
+
+| 配置 | Sharpe | 来源 |
+|---|---:|---|
+| zz500 + 旧 walk_forward (StockRanker, post-fix) | 1.79 | §5.1 (zz500 era) |
+| zz500 + Blend conviction + winsorize | 2.01 | BASELINE.md §一 (zz500 era) |
+| hs300+zz500 + Blend conviction，**无** winsorize | 1.53 | P1 close-out (commit 89515cb) |
+| **hs300+zz500 + Blend conviction，有 winsorize** ★ | **1.90** | P2-verify-1 (commit 5be2856) |
+
+- **Universe widening alone (2.01 → 1.53)**: -0.48 Sharpe / -17 pp 年化 / +15.8 pp Max DD（结构性损失，因子在大盘股上信号弱化）
+- **Winsorize 标签去噪 (1.53 → 1.90)**: +0.37 Sharpe / +8 pp 年化 / -2.2 pp Max DD（救回 universe 损失的 77%）
+- **净 vs 2.01 era**: -0.11 Sharpe
+
+详见 docs/dialog/ rounds 9-22 + BASELINE.md 顶部 admonition。
+
+> **历史快照（zz500 era）** —— 不再是当前 production 数字
+>
+> | 指标 | 值 (zz500 era) | 评级 |
+> |------|-----|------|
+> | 总回报 | 1409% | A+ |
+> | 年化回报 | 57.25% | A+ |
+> | 夏普比率 | 1.79 | A |
+> | 卡玛比率 | 1.23 | A |
+> | 最大回撤 | -46.72% | B- |
+> | 胜率 | 54.47% | B+ |
 
 ### 5.2 年度表现
 

@@ -1,9 +1,34 @@
 # 冻结基线（Frozen Baseline）
 
-**定稿日期**: 2026-04-22 · **2026-04-29 重大更新**：volume 单位 bug 修复 + BlendRanker 完整 walk_forward 验证
+**定稿日期**: 2026-04-22 · **2026-04-29 更新**：volume 单位 bug 修复 + BlendRanker 完整 walk_forward 验证 · **2026-05-24 re-baseline**：universe 扩到 hs300+zz500 + Bug 1/2 修复 + winsorize 入栈
 **状态**: 研究收敛 — 进入"观察 + 监控退化"阶段，主线不再频繁改动。
 
 本文档是单一事实来源（single source of truth）。如果未来出现"是不是该 X"的冲动，先查这里：X 可能已经被否决过。
+
+---
+
+> ## ⚠ 2026-05-14 universe 切换 + 2026-05-24 P0+P1+P2 链条后的关键变化
+>
+> 本文档下文的数字分两套：
+> - **当前 production（hs300+zz500 + 64 features + winsorize + BlendRanker conviction）**：写在表格 ★ 标记的行
+> - **历史 zz500 era（pre-2026-05-14，pre-P0/P1/P2 链）**：保留作为对照参考，标 `(zz500 era)` 字样
+>
+> ### 三段对比（按事件拆分）
+>
+> | 配置 | 时间 | Sharpe | 年化 | Max DD |
+> |---|---|---:|---:|---:|
+> | zz500 + Blend conviction + winsorize | 2026-04-29 | 2.01 | 69.84% | -22.74% |
+> | hs300+zz500 + 同模型，**无** winsorize（Q16 销毁后） | 2026-05-24 P1 | 1.53 | 52.49% | -38.49% |
+> | hs300+zz500 + 同模型，**有** winsorize（P2-fix-1 恢复） | 2026-05-24 P2 ★ | **1.90** | **60.42%** | **-36.30%** |
+>
+> ### 归因
+> - **Universe widening alone**: **-0.48 Sharpe / -17 pp 年化 / +15.8 pp Max DD**（结构性损失，因子在大盘股上信号弱化；amihud_illiq ICIR 从 1.32 → 0.455）
+> - **Winsorize 标签去噪**: **+0.37 Sharpe / +8 pp 年化 / -2.2 pp Max DD**（救回 universe 损失的 77%）
+> - **净结果**: -0.11 Sharpe / -9.4 pp 年化 / +13.6 pp Max DD
+>
+> 这不是 bug。universe 扩 60% 是已决策的研究范围调整（覆盖大盘股，paper_trade 也用 hs300+zz500），winsorize 在 64-feature 上是 net positive（与 28-feature 的反向效应不同，见 docs/dialog/ round 21 conditional 分析）。
+>
+> 详见 docs/dialog/ rounds 9-22（universe widening 归因 + P0/P1/P2 决策链）。
 
 ---
 
@@ -11,7 +36,7 @@
 
 | 参数 | 值 | 位置 |
 |---|---|---|
-| Universe | `zz500` | `scripts/walk_forward_backtest.py::UNIVERSE` |
+| Universe ★ | **`hs300+zz500`**（~800 只，2026-05-14 起）| `scripts/walk_forward_backtest.py::UNIVERSES` |
 | TOP_K | 10 | env `TOP_K` / 默认 10 |
 | HORIZON | 20 个交易日 | `HORIZON` 常量 |
 | REBALANCE_POLICY | `on_change` | env `REBALANCE_POLICY` / 默认 on_change |
@@ -22,30 +47,53 @@
 | **模型（生产）** | **BlendRanker(0.80 primary + 0.20 extreme)** | `mp/ml/model.py` · 训练 label = `excess_ret` |
 | RANKER_KIND（walk_forward 验证用） | 默认 `stock`，`blend` 用于验证 BlendRanker | env `RANKER_KIND` |
 | **POSITION_SIZING** | **`conviction`**（weight ∝ 模型超额预测） | env `POSITION_SIZING`，2026-04-29 起从 `equal` 切换 |
-| 因子集 | `FACTOR_COLUMNS`（51 技术 + 6 基本面 + 4 行业相对 + 3 基本面趋势）| `mp/ml/dataset.py` |
+| 因子集 ★ | `FACTOR_COLUMNS` 全量 64（51 技术 + 6 基本面 + 4 行业相对 + 3 基本面趋势）。固化在 `mp/ml/feature_presets.py::W_BASELINE_PRESET` (sig=3000062054) | `mp/ml/dataset.py` |
+| Winsorize ★ | `EXCESS_CAP = 0.50` 对 excess_ret label clip（2026-05-24 P2-fix-1 cherry-pick from prior-session WIP）| `mp/ml/dataset.py::EXCESS_CAP` |
 | USE_REGIME_FEATURES | **OFF** (False) | env，保留开关仅作为否定实验 artefact |
 
-### 实测基线绩效（2020-01 ~ 2026-04，PIT-clean，**volume 单位修复后 + conviction sizing**）
+### 实测基线绩效
 
-**生产配置：BlendRanker + Conviction Sizing**
+**★ 当前 production：BlendRanker + Conviction + FACTOR_COLUMNS 64 + EXCESS_CAP winsorize**
+（2020-01 ~ 2026-04，PIT-clean，hs300+zz500 universe，2026-05-24 P2-verify-1 retrain）
 
 | Metric | Value |
 |---|---:|
-| 年化收益 | **69.84%** |
-| Sharpe | **2.01** |
-| Calmar | **3.07** |
-| 最大回撤 | -22.74% |
-| 年化波动率 | 34.72% |
-| 月度胜率 | 52.88% |
-| 总收益 | 2294.91% |
+| 年化收益 | **60.42%** |
+| Sharpe | **1.90** |
+| Calmar | **1.66** |
+| 最大回撤 | -36.30% |
+| 年化波动率 | 31.85% |
+| 月度胜率 | 52.28% |
+| 总收益 | 1601.12% |
 | ZZ500 年化 | 6.02% |
-| **超额（α）** | **+63.82pp** |
+| **超额（α）** | **+54.39pp** |
 
-#### Position-sizing 完整对比（BlendRanker 下，5 种 sizing 全部跑过）
+数据源：`data/reports/wf_experiments_20260524/wf_p2fix_20260524_1510.log`
+（commit `5be2856`：P2-verify-1）。
+
+> **历史快照（zz500 era, pre-2026-05-14）** —— 保留作为对比参考，不再是当前 production 数字
+>
+> | Metric | Value (zz500 era) |
+> |---|---:|
+> | 年化收益 | 69.84% |
+> | Sharpe | 2.01 |
+> | Calmar | 3.07 |
+> | 最大回撤 | -22.74% |
+> | 年化波动率 | 34.72% |
+> | 月度胜率 | 52.88% |
+> | 总收益 | 2294.91% |
+> | 超额（α）| +63.82pp |
+>
+> 数据源：`data/reports/walk_forward_blend_conviction.md`
+
+#### Position-sizing 完整对比 <sub>(zz500 era, pre-2026-05-14)</sub>
+
+> ⚠ 以下表是 zz500 universe 上 5 种 sizing 的完整对比，2026-05-24 后未在 hs300+zz500 上重做。
+> conviction 仍是生产默认，但**绝对数字应参考 §一 新表，不要混用**。
 
 | Sizing | 年化 | Sharpe | Calmar | Max DD | Vol |
 |---|---:|---:|---:|---:|---:|
-| **conviction（生产）** ⭐ | **69.84%** | **2.01** | **3.07** | -22.74% | 34.72% |
+| **conviction（生产）** ⭐ | 69.84% | 2.01 | 3.07 | -22.74% | 34.72% |
 | equal（旧默认）| 54.25% | 1.88 | 2.21 | -24.59% | 28.81% |
 | inverse_vol | 36.71% | 1.49 | 1.94 | -18.96% | 24.68% |
 | vol_target (25%) | 27.21% | 1.44 | 1.70 | -15.99% | 18.93% |
@@ -60,12 +108,18 @@
 
 > **口径校准**：这是"已经认真测试过的靠谱替代方案里最优"，不等于全空间全局最优。
 
-> **历史口径修正（2026-04-29）**：
-> 1. 之前 BASELINE 写的 1.62 Sharpe / 49.34% 是**污染数据 + StockRanker** 的结果
+> **历史口径修正（2026-04-29，zz500 era）**：
+> 1. 之前 BASELINE 写的 1.62 Sharpe / 49.34% <sub>(zz500 era)</sub> 是**污染数据 + StockRanker** 的结果
 > 2. 之前从未跑过 BlendRanker 的 walk_forward，但 paper_trade / daily_report 一直用 BlendRanker
-> 3. 数据修复（volume × 100 单位 bug）后两个模型都重训：StockRanker 1.81/57.10%、**BlendRanker 1.88/54.25%**
-> 4. **生产模型最终选 BlendRanker**：风险调整后全面占优（Sharpe / Calmar / DD / 波动率 / 胜率）
+> 3. 数据修复（volume × 100 单位 bug）后两个模型都重训：StockRanker 1.81/57.10% <sub>(zz500 era)</sub>、**BlendRanker 1.88/54.25%** <sub>(zz500 era)</sub>
+> 4. **生产模型最终选 BlendRanker**：风险调整后全面占优
 > 5. StockRanker 模型保留作 fallback，但生产只用 BlendRanker
+>
+> **追加（2026-05-24 P0/P1/P2 链）**：
+> 6. **Bug 1**：`scripts/cross_sectional_ic.py` ICIR 公式实际是 t-stat × √N（commit `b023ba4` 修复）
+> 7. **Bug 2**：`StockRanker.train_fast` 未 populate `feature_importance`（同 commit 修复）
+> 8. **P1**：ranker default `feature_cols` fallback 改 `list(FACTOR_COLUMNS)`（commit `a3cb98c`+`05be047`）。production 实际训练特征集统一到 64-feature 全量
+> 9. **P2**：cherry-pick prior-session 的 excess_ret winsorize (EXCESS_CAP=0.50) 回到 dataset.py（commit `1674e69`+`5be2856`）。Sharpe 从 1.53 → **1.90**（hs300+zz500 universe 下；与 zz500 era 的 2.01 仍差 0.11，但 universe 不可逆）
 
 运行记录：
 - StockRanker post-fix walk_forward: `data/reports/walk_forward_postfix.md`
@@ -134,17 +188,17 @@
 
 ### 4.1 性能退化告警
 
-阈值为 BASELINE 新基线（年化 69.84% / Sharpe 2.01 / DD -22.74%，post conviction sizing 2026-04-29）的 ~50% / 50% / 1.3× 安全裕度。
+阈值基于 ★ 当前 BASELINE（年化 60.42% / Sharpe 1.90 / DD -36.30%，post-P2 2026-05-24）的 ~50% / 50% / 1.1× 安全裕度（DD 阈值放宽因为 hs300+zz500 固有 Max DD 已经偏深）。
 
-| 指标 | BASELINE | 黄色告警 | 红色告警（即停模拟交易）| 为什么 |
+| 指标 | BASELINE ★ | 黄色告警 | 红色告警（即停模拟交易）| 为什么 |
 |---|---:|---:|---:|---|
-| 最近 12 月滚动年化 | 69.84% | < 35% | < 20% 或 < 3× ZZ500 | 策略核心假设失效 |
-| Sharpe（最近 252 日）| 2.01 | < 1.5 | < 1.0 | 风险调整后已无明显优势 |
-| 最大回撤（新高）| -22.74% | > -30% | > -40% | 突破回测历史最差 1.3× |
-| 月度胜率（最近 12 月）| 52.88% | < 47% | < 42% | 系统性掉队 |
-| paper_trade 1 月累计 | ≈ +5% | < 0% | < -5% | 实盘短期偏差 |
-| paper_trade 3 月累计 | ≈ +15% | < +5% | < 0% 或 < ZZ500 | 实盘中期偏差 |
-| paper_trade 6 月累计 | ≈ +35% | < +20% | < +10% 或 DD > -25% | 实盘长期偏差 |
+| 最近 12 月滚动年化 | 60.42% | < 30% | < 15% 或 < 3× ZZ500 | 策略核心假设失效 |
+| Sharpe（最近 252 日）| 1.90 | < 1.4 | < 0.9 | 风险调整后已无明显优势 |
+| 最大回撤（新高）| -36.30% | > -42% | > -50% | 突破 hs300+zz500 实测最差 1.15× / 1.4× |
+| 月度胜率（最近 12 月）| 52.28% | < 47% | < 42% | 系统性掉队 |
+| paper_trade 1 月累计 | ≈ +4% | < 0% | < -5% | 实盘短期偏差 |
+| paper_trade 3 月累计 | ≈ +12% | < +3% | < 0% 或 < ZZ500 | 实盘中期偏差 |
+| paper_trade 6 月累计 | ≈ +30% | < +15% | < +5% 或 DD > -32% | 实盘长期偏差 |
 
 ### 4.2 模型健康度
 
