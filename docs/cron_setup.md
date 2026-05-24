@@ -7,7 +7,7 @@ Reason for not auto-applying: macOS requires Full Disk Access for
 
 ---
 
-## Current crontab (post P5-2, 2026-05-24)
+## Current crontab (post P6-X1, 2026-05-24)
 
 ```cron
 # Friday 18:00 — full walk-forward + retrain production models
@@ -23,11 +23,21 @@ Reason for not auto-applying: macOS requires Full Disk Access for
 0 18 * * 5 /Users/laighno/laighno/money-printer/.venv/bin/python scripts/walk_forward_backtest.py >> data/logs/model_update.log 2>&1
 
 # Saturday 06:00 — weekly heartbeat (P5-B dead-man-switch)
-# Reads data/reports/backtest_history.json mtime; if > 7 days ago,
-# sends RED ALERT to Feishu indicating weekly cron likely failed.
-# Independent of walk_forward_backtest.py to avoid dependency loop
-# (if walk_forward broke, this still fires).
+# Reads data/reports/backtest_history.json mtime; > 5 trading days →
+# YELLOW, > 10 trading days → RED (P6-X2 round 47: was 7 calendar days,
+# false-positives across CNY / National Day). Sends Feishu alert when
+# weekly cron likely silently failed.  Independent of
+# walk_forward_backtest.py — if walk_forward broke, this still fires.
 0 6 * * 6 /Users/laighno/laighno/money-printer/.venv/bin/python scripts/monitor/weekly_heartbeat.py >> data/logs/heartbeat.log 2>&1
+
+# Daily 07:00 — cron drift detect (P6-X1 round 47)
+# SHA256-compares the live `crontab -l` output against the
+# "## Current crontab" block in this very file (docs/cron_setup.md).
+# Mismatch → RED Feishu alert. Catches: someone ran `crontab -e` outside
+# this docs workflow, or the manual apply step was skipped after a docs
+# update.  Runs 60 min after the heartbeat slot — independent failure
+# domain. Reads crontab; never modifies it.
+0 7 * * * /Users/laighno/laighno/money-printer/.venv/bin/python scripts/monitor/cron_drift_detect.py >> data/logs/cron_drift.log 2>&1
 ```
 
 ## How to apply
@@ -72,5 +82,7 @@ If any of these change, add to the table above + commit.
 ## References
 
 - docs/dialog/ round 41-43 — P5 chain background + design + crontab bug discovery
+- docs/dialog/ round 47 — P6-X1/X2 cron drift detect + trading-day-aware heartbeat
 - mp/monitor/threshold_alert.py — P4-1C breach alerts (now actually triggers because we removed --update-only)
-- scripts/monitor/weekly_heartbeat.py — P5-B dead-man-switch implementation
+- scripts/monitor/weekly_heartbeat.py — P5-B dead-man-switch implementation (trading-day-aware as of P6-X2)
+- scripts/monitor/cron_drift_detect.py — P6-X1 drift detector
