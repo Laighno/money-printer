@@ -190,6 +190,17 @@ EXCESS_LABEL = "excess_ret"
 
 # Curated factors selected by cross-sectional IC analysis (|ICIR| >= 0.15).
 # 34 noise factors removed — improves out-of-sample generalization.
+#
+# DEPRECATED 2026-05-24: walk-forward A/B (docs/dialog/ on branch
+# collab/advisor-dialog) shows FACTOR_COLUMNS full set beats any precomputed
+# subset by 0.56–0.74 Sharpe on the hs300+zz500 universe with BlendRanker
+# + conviction sizing. Ranker defaults now resolve to FACTOR_COLUMNS
+# (see mp/ml/model.py and commit a3cb98c). This list is kept ONLY so
+# legacy callers passing `feature_cols=CURATED_COLUMNS` explicitly still
+# work; new code should NOT reference it.
+#
+# Historical snapshots of expanded CURATED variants (32/28/30 features)
+# are frozen as W0/W1/W2 in mp/ml/feature_presets.py.
 CURATED_COLUMNS: List[str] = [
     # STRONG (|ICIR| >= 0.5)
     "amihud_illiq",
