@@ -1313,6 +1313,14 @@ def send_model_update_report(
         lines.append("")
 
         # --- P4-1C threshold-breach alerts (BASELINE §4.1) ---
+        # Inline path: append the markdown block to the weekly report so
+        # the operator reading the Feishu weekly summary sees the breach.
+        # P8-α-3 (docs/dialog/ round 53): ALSO dispatch the breach event
+        # through alert_dispatch (Feishu + JSONL audit + stderr) so the
+        # breach record survives even if the weekly report's Feishu send
+        # is silent (e.g. lark-cli broken / webhook muted). Belt-and-
+        # suspenders — the weekly report is for visibility, alert_dispatch
+        # is for audit + SPOF mitigation.
         try:
             from mp.monitor.threshold_alert import (
                 check_thresholds,
@@ -1324,6 +1332,18 @@ def send_model_update_report(
                 if _alert_block:
                     lines.append(_alert_block)
                     lines.append("")
+                # Parallel multi-channel dispatch (P8-α-3)
+                try:
+                    from mp.monitor.alert_dispatch import dispatch_alert
+                    _max_level = "RED" if any(a["level"] == "RED" for a in _alerts) else "YELLOW"
+                    dispatch_alert(
+                        level=_max_level,
+                        title=f"{_max_level}: walk_forward threshold breach ({len(_alerts)} indicator(s))",
+                        body=_alert_block,
+                        source="threshold_alert",
+                    )
+                except Exception as _de:
+                    logger.warning("alert_dispatch failed (inline weekly path still ran): {}", _de)
         except Exception as _e:
             # Alert dispatch must never break the existing weekly report
             logger.warning("threshold_alert dispatch failed: {}", _e)

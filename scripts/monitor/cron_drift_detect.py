@@ -287,19 +287,27 @@ def main(argv: list[str] | None = None) -> int:
 
     block = format_for_feishu(status)
     if dry_run:
-        print("=== DRY RUN — would send to Feishu ===")
+        print("=== DRY RUN — would dispatch alert ===")
         print(block)
         return 0
 
+    # P8-α-3 (docs/dialog/ round 53): multi-channel dispatch (lark SPOF
+    # mitigation). Drift alerts are essential for production scheduler
+    # integrity — must survive lark-cli outage.
     try:
-        from scripts.daily_report import send_to_feishu
+        from mp.monitor.alert_dispatch import dispatch_alert
     except Exception as e:
-        print(f"[cron_drift_detect] cannot import send_to_feishu: {e}",
+        print(f"[cron_drift_detect] cannot import alert_dispatch: {e}",
               file=sys.stderr)
         return 0
 
-    ok = send_to_feishu(block)
-    print(f"[cron_drift_detect] Feishu send returned {ok}")
+    results = dispatch_alert(
+        level=status["level"],
+        title=f"{status['level']}: production crontab drift",
+        body=block,
+        source="cron_drift",
+    )
+    print(f"[cron_drift_detect] dispatch results: {results}")
     return 0
 
 

@@ -248,21 +248,30 @@ def main(argv: list[str] | None = None) -> int:
 
     block = format_for_feishu(status)
     if dry_run:
-        print("=== DRY RUN — would send to Feishu: ===")
+        print("=== DRY RUN — would dispatch alert: ===")
         print(block)
         return 0
 
+    # P8-α-3 (docs/dialog/ round 53): dispatch through multi-channel
+    # alert_dispatch (Feishu + JSONL audit + stderr) instead of direct
+    # send_to_feishu — kills lark-cli SPOF that would silently swallow
+    # alerts in live trading.
     try:
-        from scripts.daily_report import send_to_feishu
+        from mp.monitor.alert_dispatch import dispatch_alert
     except Exception as e:
-        print(f"[weekly_heartbeat] cannot import send_to_feishu: {e}",
+        print(f"[weekly_heartbeat] cannot import alert_dispatch: {e}",
               file=sys.stderr)
         # Still exit 0 — script-level catch already logged, no point in
         # retrying via cron mail
         return 0
 
-    ok = send_to_feishu(block)
-    print(f"[weekly_heartbeat] Feishu send returned {ok}")
+    results = dispatch_alert(
+        level=status["level"],
+        title=f"{status['level']}: weekly walk-forward heartbeat",
+        body=block,
+        source="heartbeat",
+    )
+    print(f"[weekly_heartbeat] dispatch results: {results}")
     return 0
 
 
