@@ -59,46 +59,62 @@ For now: treat the alerts here as **"absolute pain level" gates**, not
 path; the Feishu auto-alert is a backstop for severe breaches, not the
 sole detector of model drift.
 
-THRESHOLD ANCHOR STATUS (P7-3 update, docs/dialog/ rounds 50-51)
-================================================================
-The current thresholds (1.4 / 0.9 Sharpe, 30% / 15% annual,
--42% / -50% Max DD) were inherited from BASELINE.md §4.1 when
-production Sharpe was claimed to be 1.90.  P7-3 Walk B spike
-(rule #7 deterministic verification) revealed that the
-**deterministic baseline is 1.20, not 1.90** — the original
-anchoring rationale "RED 0.9 = roughly half of production Sharpe"
-no longer holds (0.9 / 1.20 = 75% of baseline, not 47%).
+THRESHOLD ANCHOR STATUS (P8-α-1 update, 2026-05-25, docs/dialog/ rounds 53-54)
+==============================================================================
+**Re-anchoring complete.**  Operator selected new thresholds anchored
+to the P7-3 deterministic baseline (Sharpe 1.20).  Previous P7-3
+"awaits operator re-anchoring" caveat is RESOLVED.
 
-These remain in effect **AS-IS** pending operator (user) re-anchoring.
-Per P5-A-light + P7-α semantic clarification, these are
-"operator-set absolute pain thresholds" — advisor/engineer cannot
-mechanically rescale them; only the operator can re-express
-"I cannot tolerate Sharpe below X".  See P8 ticket in docs/TODO.md:
-"operator re-anchor threshold_alert post-deterministic baseline".
+| Indicator      | Old (1.90 anchor) | **New (1.20 anchor)** | Scale relation |
+|----------------|-------------------|------------------------|----------------|
+| YELLOW Sharpe  | 1.40              | **0.90**               | 75% of baseline |
+| RED Sharpe     | 0.90              | **0.50**               | 42% of baseline |
+| YELLOW Max DD  | -42%              | **-30%**               | TIGHTENED      |
+| RED Max DD     | -50%              | **-40%**               | TIGHTENED      |
 
-**Heads-up**: with the deterministic baseline at 1.20 < YELLOW 1.4,
-every weekly walk-forward run now trips a YELLOW Sharpe alert.  This
-is **expected**, not a bug, until the operator decides whether to
-loosen the YELLOW band or keep the current pain threshold as-is.
-Acknowledged in the alert body: see ``format_for_feishu`` source.
+Operator rationale (docs/dialog/ round 54):
+ - **Sharpe**: keep the same 75% / 42% scale ratio that the old
+   thresholds had to the old baseline — preserves the semantic
+   ("YELLOW = noticeable degradation, RED = catastrophic regime
+   change") without changing the operator's pain function.
+ - **Max DD**: tightened (-42→-30 YELLOW, -50→-40 RED) because live
+   slippage / overnight gap risk is higher than backtest simulation
+   models.  The deterministic backtest Max DD is -32.74%, which
+   straddles the new YELLOW -30 — expected: the first weekly cron
+   under the new thresholds will likely trip a YELLOW Max DD alert
+   from BACKTEST history (not live).  See "Heads-up" note in
+   docs/dialog/ round 54 — that is calibration noise, not a real
+   live-trading breach.  Operator chose to leave the threshold tight.
+
+annual_return thresholds (30% / 15% YELLOW/RED) are UNCHANGED — the
+operator did not re-anchor that indicator (deterministic baseline
+38.74% still well above 30% YELLOW).
+
+These remain "operator-set absolute pain thresholds" per P5-A-light +
+P7-α semantics.  rule #6 σ-anchor cross-check does NOT apply (these
+are not σ-grounded; see P8 docs ticket in docs/TODO.md for the
+explicit categorization rationale).  If future evidence shifts the
+deterministic baseline, the operator (only) re-runs this anchoring
+exercise.
 """
 from __future__ import annotations
 
 from typing import Optional
 
 
-# YELLOW alert threshold (≈ 50% degradation from BASELINE)
+# YELLOW alert threshold — re-anchored to deterministic baseline 1.20
+# (P8-α-1, 2026-05-25, docs/dialog/ round 54). Operator selection.
 YELLOW = {
-    "sharpe_ratio":        1.40,
-    "annual_return_pct":   30.0,
-    "max_drawdown_pct":   -42.0,    # less negative than this = pass (i.e. > -42% is healthy)
+    "sharpe_ratio":        0.90,    # was 1.40 (75% of 1.20 baseline)
+    "annual_return_pct":   30.0,    # unchanged
+    "max_drawdown_pct":   -30.0,    # was -42.0 (TIGHTENED — live slippage > backtest)
 }
 
 # RED alert threshold (immediate paper-trade halt per BASELINE §4)
 RED = {
-    "sharpe_ratio":        0.90,
-    "annual_return_pct":   15.0,
-    "max_drawdown_pct":   -50.0,
+    "sharpe_ratio":        0.50,    # was 0.90 (42% of 1.20 baseline)
+    "annual_return_pct":   15.0,    # unchanged
+    "max_drawdown_pct":   -40.0,    # was -50.0 (TIGHTENED)
 }
 
 
