@@ -58,6 +58,29 @@ For now: treat the alerts here as **"absolute pain level" gates**, not
 ``data/reports/walk_forward_result.md`` remains the primary monitoring
 path; the Feishu auto-alert is a backstop for severe breaches, not the
 sole detector of model drift.
+
+THRESHOLD ANCHOR STATUS (P7-3 update, docs/dialog/ rounds 50-51)
+================================================================
+The current thresholds (1.4 / 0.9 Sharpe, 30% / 15% annual,
+-42% / -50% Max DD) were inherited from BASELINE.md §4.1 when
+production Sharpe was claimed to be 1.90.  P7-3 Walk B spike
+(rule #7 deterministic verification) revealed that the
+**deterministic baseline is 1.20, not 1.90** — the original
+anchoring rationale "RED 0.9 = roughly half of production Sharpe"
+no longer holds (0.9 / 1.20 = 75% of baseline, not 47%).
+
+These remain in effect **AS-IS** pending operator (user) re-anchoring.
+Per P5-A-light + P7-α semantic clarification, these are
+"operator-set absolute pain thresholds" — advisor/engineer cannot
+mechanically rescale them; only the operator can re-express
+"I cannot tolerate Sharpe below X".  See P8 ticket in docs/TODO.md:
+"operator re-anchor threshold_alert post-deterministic baseline".
+
+**Heads-up**: with the deterministic baseline at 1.20 < YELLOW 1.4,
+every weekly walk-forward run now trips a YELLOW Sharpe alert.  This
+is **expected**, not a bug, until the operator decides whether to
+loosen the YELLOW band or keep the current pain threshold as-is.
+Acknowledged in the alert body: see ``format_for_feishu`` source.
 """
 from __future__ import annotations
 

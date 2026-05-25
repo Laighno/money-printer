@@ -47,7 +47,34 @@ def _topk_metrics(preds: np.ndarray, actuals: np.ndarray,
 
 
 class StockRanker:
-    """LightGBM wrapper for stock scoring."""
+    """LightGBM wrapper for stock scoring.
+
+    PRODUCTION ARTIFACT PROVENANCE (P7-3, docs/dialog/ rounds 50-51)
+    ================================================================
+    ``data/blend_primary.lgb`` / ``data/blend_extreme.lgb`` (committed in
+    5be2856, 2026-05-24) were trained under the legacy nondeterministic
+    setup (multi-thread LightGBM, no PYTHONHASHSEED, no
+    deterministic/force_row_wise flags).  That training cohort produced a
+    backtest Sharpe distribution spanning [1.15, 1.90] across N=10
+    reruns; the committed artifacts correspond to the **1.90 tail** of
+    that distribution (a lucky sample).
+
+    P7-3 spike introduced deterministic training as the in-code default
+    (no longer env opt-in; see ``train_fast`` _seed_params block) and
+    re-baselined Sharpe to **1.20** under deterministic settings.  The
+    current production ``.lgb`` artifacts have NOT been retrained under
+    deterministic settings — they remain as the nondet lucky sample.
+
+    This is intentional (advisor + user decision, round 51): retraining
+    to a single deterministic draw 1.20 is not provably more robust than
+    the existing lucky draw — both are single samples from the same
+    underlying distribution.  True remediation requires multi-seed
+    ensemble (deferred to P8 ticket, see docs/TODO.md).
+
+    Inference is deterministic regardless — same ``.lgb`` + same input =
+    same prediction.  Only training was nondeterministic (cross-thread
+    gradient accumulation in LightGBM histogram building).
+    """
 
     def __init__(self, model_path: str = DEFAULT_MODEL_PATH,
                  feature_cols: Optional[List[str]] = None,
@@ -56,10 +83,6 @@ class StockRanker:
                  lgb_params: Optional[Dict[str, object]] = None):
         self.model: Optional[lgb.Booster] = None
         self.model_path = model_path
-        # Default = full FACTOR_COLUMNS (64). Wrapped in list() so callers
-        # mutating self.feature_cols don't touch the global. Walk-forward
-        # 2026-05-24 (docs/dialog/) showed any precomputed subset
-        # (CURATED 23/28/30/32) underperforms full set by 0.6+ Sharpe.
         self.feature_cols = feature_cols or list(FACTOR_COLUMNS)
         self.feature_importance: Dict[str, float] = {}
         self.objective = objective
@@ -111,6 +134,11 @@ class StockRanker:
         cv_precisions: List[float] = []
         best_rounds_list: List[int] = []
 
+        # Seed plumbed from env so multi-seed walk-forward stress-tests
+        # the model's robustness to random column/row sampling.  Default
+        # 42 matches LightGBM's previous implicit fixed behavior.
+        import os as _os
+        _seed = int(_os.environ.get("LGBM_SEED", "42"))
         params = {
             "objective": "regression",
             "metric": "mae",
@@ -122,6 +150,9 @@ class StockRanker:
             "reg_alpha": 0.1,
             "reg_lambda": 0.1,
             "verbose": -1,
+            "seed": _seed,
+            "bagging_seed": _seed + 1,
+            "feature_fraction_seed": _seed + 2,
         }
 
         for fold in range(n_splits):
@@ -260,7 +291,25 @@ class StockRanker:
         n = len(df)
         split_idx = int(n * (1 - val_frac))
 
-        # --- Build LGB params ---
+        # --- Build LGB params (with env-controlled seed for multi-seed runs) ---
+        import os as _os
+        _seed = int(_os.environ.get("LGBM_SEED", "42"))
+        _seed_params = {"seed": _seed, "bagging_seed": _seed + 1,
+                         "feature_fraction_seed": _seed + 2}
+        # P7-γ (docs/dialog/ rounds 50-51): deterministic by default to kill
+        # LightGBM cross-thread gradient/histogram nondeterminism. The Walk B
+        # spike (round 51) demonstrated that without these flags, walk_forward
+        # Sharpe drifted in [1.15, 1.90] across reruns of identical input;
+        # with them, two fresh-process runs produce byte-identical metrics.
+        # See rule #7 in docs/TODO.md.
+        # WF_NONDETERMINISTIC=1 escape hatch — only for reproducing legacy
+        # nondet behavior (pre-P7-γ commits). Do not use in production.
+        if _os.environ.get("WF_NONDETERMINISTIC", "0") != "1":
+            _seed_params.update({
+                "deterministic": True,
+                "num_threads": 1,
+                "force_row_wise": True,
+            })
         if is_rank:
             params = {
                 "objective": "lambdarank",
@@ -270,6 +319,7 @@ class StockRanker:
                 "min_child_samples": 50, "subsample": 0.8,
                 "colsample_bytree": 0.8, "reg_alpha": 0.1,
                 "reg_lambda": 0.1, "verbose": -1,
+                **_seed_params,
             }
         else:
             params = {
@@ -278,6 +328,7 @@ class StockRanker:
                 "min_child_samples": 50, "subsample": 0.8,
                 "colsample_bytree": 0.8, "reg_alpha": 0.1,
                 "reg_lambda": 0.1, "verbose": -1,
+                **_seed_params,
             }
 
         # Apply user overrides
@@ -655,3 +706,5 @@ class BlendRanker:
         ok1 = self.primary.load(f"{path_prefix}_primary.lgb")
         ok2 = self.extreme.load(f"{path_prefix}_extreme.lgb")
         return ok1 and ok2
+
+

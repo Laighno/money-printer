@@ -19,12 +19,13 @@
 > |---|---|---:|---:|---:|
 > | zz500 + Blend conviction + winsorize | 2026-04-29 | 2.01 | 69.84% | -22.74% |
 > | hs300+zz500 + 同模型，**无** winsorize（Q16 销毁后） | 2026-05-24 P1 | 1.53 | 52.49% | -38.49% |
-> | hs300+zz500 + 同模型，**有** winsorize（P2-fix-1 恢复） | 2026-05-24 P2 ★ | **1.90** | **60.42%** | **-36.30%** |
+> | hs300+zz500 + 同模型，**有** winsorize（nondet, lucky tail of N=10 reruns） | 2026-05-24 P2 | <sub>1.90</sub> | <sub>60.42%</sub> | <sub>-36.30%</sub> |
+> | hs300+zz500 + 同模型 + **deterministic** (P7-3 spike) | 2026-05-25 P7-3 ★ | **1.20** | **38.74%** | **-32.74%** |
 >
 > ### 归因
 > - **Universe widening alone**: **-0.48 Sharpe / -17 pp 年化 / +15.8 pp Max DD**（结构性损失，因子在大盘股上信号弱化；amihud_illiq ICIR 从 1.32 → 0.455）
-> - **Winsorize 标签去噪**: **+0.37 Sharpe / +8 pp 年化 / -2.2 pp Max DD**（救回 universe 损失的 77%）
-> - **净结果**: -0.11 Sharpe / -9.4 pp 年化 / +13.6 pp Max DD
+> - **Winsorize 标签去噪**: <sub>+0.37 Sharpe / +8 pp 年化 / -2.2 pp Max DD（基于 nondet lucky tail；见 P7-3 history 段）</sub>
+> - **净结果**（nondet → deterministic re-baseline）: P2 lucky 1.90 → P7-3 deterministic 1.20 = **-0.70 Sharpe**（sampling bias kill，非真实退化；见 "Deterministic Baseline History (P7-3)" 段）
 >
 > 这不是 bug。universe 扩 60% 是已决策的研究范围调整（覆盖大盘股，paper_trade 也用 hs300+zz500），winsorize 在 64-feature 上是 net positive（与 28-feature 的反向效应不同，见 docs/dialog/ round 21 conditional 分析）。
 >
@@ -53,23 +54,101 @@
 
 ### 实测基线绩效
 
-**★ 当前 production：BlendRanker + Conviction + FACTOR_COLUMNS 64 + EXCESS_CAP winsorize**
-（2020-01 ~ 2026-04，PIT-clean，hs300+zz500 universe，2026-05-24 P2-verify-1 retrain）
+**★ 当前 production deterministic baseline：BlendRanker + Conviction + FACTOR_COLUMNS 64 + EXCESS_CAP winsorize + WF_DETERMINISTIC=1**
+（2020-01 ~ 2026-04，PIT-clean，hs300+zz500 universe，2026-05-25 P7-3 Walk B spike — see "Deterministic Baseline History" §）
 
 | Metric | Value |
 |---|---:|
-| 年化收益 | **60.42%** |
-| Sharpe | **1.90** |
-| Calmar | **1.66** |
-| 最大回撤 | -36.30% |
-| 年化波动率 | 31.85% |
-| 月度胜率 | 52.28% |
-| 总收益 | 1601.12% |
+| 年化收益 | **38.74%** |
+| Sharpe | **1.20** |
+| Calmar | **1.18** |
+| 最大回撤 | -32.74% |
+| 年化波动率 | 32.20% |
+| 月度胜率 | 51.69% |
+| 总收益 | 612.42% |
 | ZZ500 年化 | 6.02% |
-| **超额（α）** | **+54.39pp** |
+| **超额（α）** | **+32.72pp** |
 
-数据源：`data/reports/wf_experiments_20260524/wf_p2fix_20260524_1510.log`
-（commit `5be2856`：P2-verify-1）。
+数据源：`data/reports/walk_forward_result.md` (2026-05-25 spike Run 1，
+`PYTHONHASHSEED=0 LGBM_SEED=42 WF_FEATURE_PRESET=W_BASELINE` + LightGBM
+`deterministic=True num_threads=1 force_row_wise=True`)。Two fresh-process
+reruns produced byte-identical metric block (md5 of backtest_history.json
+identical)；nondeterminism eliminated.
+
+#### Deterministic Baseline History (P7-3, docs/dialog/ rounds 50-51)
+
+The previous 1.90 baseline came from a **single sample out of N=10
+reruns** of the same nondeterministic walk_forward setup (LightGBM
+multi-thread gradient/histogram accumulation + Python set iteration
+ordering). The 10 entries in `data/reports/backtest_history.json` at
+that time spanned Sharpe **[1.15, 1.90]** — same code, same input data,
+same `LGBM_SEED=42`. The 5be2856 commit cherry-picked the lucky tail
+1.90 and labelled it "production truth".
+
+P7-β Walk B spike (round 51) confirmed via byte-perfect diff that
+turning on three flags
+(`deterministic=True / num_threads=1 / force_row_wise=True` in
+LightGBM + `PYTHONHASHSEED=0` env + already-sorted universe codes)
+eliminates the nondeterminism. The deterministic re-baseline is
+**Sharpe 1.20**, not 1.90.
+
+Both numbers are real (training was not buggy), but only one is a
+defensible point estimate:
+- **1.90** = lucky tail (1 of ~10 nondet samples)
+- **1.20** = byte-perfect reproducible deterministic baseline ✓
+
+The 0.70 Sharpe gap is **sampling bias killed**, not a true performance
+regression. It also exposed that the entire chain (BASELINE,
+`threshold_alert.py` anchoring, "+X Sharpe" claims in commit msgs) was
+built on a point estimate that was actually a distribution sample.
+That triggered permanent **rule #7** (deterministic vs nondeterministic
+claims — see docs/TODO.md).
+
+##### Production `.lgb` artifact provenance
+
+`data/blend_primary.lgb` / `blend_extreme.lgb` (committed `5be2856`)
+were trained under the **nondet** setup and correspond to the 1.90
+lucky-tail sample. They were **NOT retrained** under the deterministic
+setup (advisor + user decision, round 51):
+- A single deterministic draw (1.20-era ranker) is not provably more
+  robust than the existing lucky draw — both are samples of the
+  underlying distribution
+- True remediation = multi-seed ensemble (P8 ticket)
+- Inference is deterministic regardless (same `.lgb` + same input =
+  same prediction); only training was nondet
+
+So **production live signals continue to come from the lucky-sample
+ranker**, while **backtest reports** (this BASELINE, weekly
+`walk_forward_result.md`) now show the deterministic 1.20 number going
+forward. This is intentional decoupling: backtest is for honesty about
+the model class's typical performance; deployed model is for stable
+day-to-day predictions.
+
+##### Implications for downstream
+
+- **`mp/monitor/threshold_alert.py`** anchors (1.4 / 0.9 Sharpe etc.)
+  were calibrated against the 1.90 baseline (e.g. "0.9 ≈ half of
+  production"). With deterministic baseline 1.20, those anchors are
+  no longer valid by the original rationale — but they remain in
+  effect AS-IS pending operator (user) re-anchoring (see P8 ticket).
+  Heads-up: weekly walk_forward now runs deterministic = 1.20 < YELLOW
+  1.4, so a YELLOW Sharpe alert will fire every Friday until the
+  operator decides whether to loosen the band or keep current pain
+  threshold.
+- **"+X Sharpe" claims** in BASELINE, decision_log, commit messages,
+  TODO.md, etc. that were anchored to 1.90 are not retroactively
+  rewritten (would touch dozens of files); rule #7 now requires
+  future claims to carry a distribution descriptor (`N=k, range,
+  median`) or explicit "deterministic verified" annotation.
+
+##### Forward path (P8)
+
+Multi-seed ensemble (train K deterministic models with
+seeds {42, 43, ..., 42+K-1}, ensemble predictions via mean / median /
+rank-aggregate, backtest as one ranker). Sharpe likely lands between
+cross-seed mean and cross-seed top decile with reduced variance.
+Tooling needed: multi-seed train orchestrator, ensemble inference
+wrapper, backtest variance reporter. See P8 ticket in docs/TODO.md.
 
 #### Seed-stability caveat（β0 spike 2026-05-24, commit `_P3-1d_`）
 
@@ -89,13 +168,13 @@ realized**，不是 distribution mean。3-seed spike 数据：
 - win_rate spread 仅 0.92 pp（51.36-52.28%）→ 选股能力跨 seed 稳定，差异在
   NAV compounding（lottery-ticket / 关键日 hit 与否）
 
-**Implications**：
-- production deployment confidence: **1.90 deterministic, reproducible**（cron 永远跑 seed 42）
-- generalization confidence (cross-seed): **1.82 ± 0.13**（n=3 估算）
-- §4.1 alert thresholds 仍 anchor 在 1.90（production 实测真值），不改
+**Implications** <sub>(superseded by P7-3 deterministic re-baseline; see "Deterministic Baseline History" § above)</sub>：
+- ~~production deployment confidence: **1.90 deterministic, reproducible**（cron 永远跑 seed 42）~~ — actually nondet lucky tail (P7-3)
+- ~~generalization confidence (cross-seed): **1.82 ± 0.13**（n=3 估算）~~ — this whole 3-seed sweep was run under the nondet setup, so each cell mixes seed effect + nondet noise; deterministic re-sweep not yet done
+- ~~§4.1 alert thresholds 仍 anchor 在 1.90~~ — anchor lost meaning (deterministic baseline is 1.20); thresholds remain AS-IS per P5-A-light + P7-α operator-pain semantics, awaits operator re-anchor (P8 ticket)
 
 数据源：`data/reports/wf_experiments_20260524/wf_b0_seed{42,43,44}_*.log`
-（P3-1d β0 spike）。
+（P3-1d β0 spike，**nondet era**）。
 
 #### Single-month catalyst attribution (P4-1A, round 39)
 

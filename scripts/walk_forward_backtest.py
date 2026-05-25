@@ -35,6 +35,21 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 os.chdir(_PROJECT_ROOT)
 
+# P7-γ (docs/dialog/ rounds 50-51, rule #7): PYTHONHASHSEED must be 0 for
+# deterministic universe iteration / set ordering across processes. It is
+# environment-only (cannot be set after Python starts), so we warn loudly
+# instead of failing — the run will still produce reasonable numbers but
+# may not be byte-perfect reproducible across processes if hashseed varies.
+if os.environ.get("PYTHONHASHSEED") != "0":
+    sys.stderr.write(
+        "WARNING: PYTHONHASHSEED != 0 -> universe iteration / set ordering "
+        "may be nondeterministic across processes. For byte-perfect "
+        "reproducible backtest, run as:\n"
+        "  PYTHONHASHSEED=0 LGBM_SEED=42 WF_FEATURE_PRESET=W_BASELINE "
+        "python scripts/walk_forward_backtest.py [...]\n"
+        "See P7-3 docs/dialog/ rounds 50-51 + rule #7 in docs/TODO.md.\n"
+    )
+
 from mp.account.broker import FeeSchedule, SimulatedBroker
 from mp.backtest.engine import calc_performance
 from mp.backtest.ml_backtest import _build_factor_panel, _prefetch_bars
