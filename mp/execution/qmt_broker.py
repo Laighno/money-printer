@@ -95,6 +95,130 @@ class OrderStatus:
     error_msg: Optional[str] = None
 
 
+@dataclass
+class EmergencyResult:
+    """Outcome of :meth:`emergency_liquidate_all` (P8-β-1b, docs/dialog/ round 57).
+
+    ``total_realized_cash`` reflects the broker's *immediate* cash delta
+    between the emergency call's start and end.  For sync-fill brokers
+    (DryRunBroker with ``autofill=True``) this is the actual proceeds.
+    For async brokers (QMTBroker, QMTMockBroker before
+    ``process_pending_orders``) it will usually be ~0 — the orders are
+    submitted but not yet filled.  Caller is responsible for downstream
+    fill-tracking in those cases.
+    """
+    attempted_codes: list[str]
+    succeeded_codes: list[str]
+    failed_codes: list[tuple[str, str]]
+    total_realized_cash: float
+    cancelled_order_ids: list[str]
+    duration_seconds: float
+
+
+def _emergency_liquidate_impl(
+    broker,
+    confirm_string: str,
+    mode: Literal["limit", "market"] = "limit",
+    limit_offset_pct: float = -0.5,
+    prev_close: Optional[dict[str, float]] = None,
+) -> "EmergencyResult":
+    """Shared implementation for ``emergency_liquidate_all`` across all
+    broker types (P8-β-1b).
+
+    Sequence
+    --------
+    1. Validate ``confirm_string == f"EMERGENCY_LIQUIDATE_{broker.account_id}"``
+       — ValueError raised before any state is touched if mismatched.
+    2. Require connection (RuntimeError if not connected).
+    3. Cancel every pending / partial order; collect the order_ids that
+       cancelled successfully.
+    4. For each position with ``shares_available > 0``:
+       - Compute reference price from ``prev_close`` (caller-supplied)
+         falling back to ``Position.market_price``.
+       - ``mode='limit'``: ``limit = ref × (1 + limit_offset_pct/100)``
+         (default -0.5% — aggressive sell limit that should fill against
+         the bid).
+       - ``mode='market'``: ``limit = ref × 0.90`` — *aggressive limit*
+         that approximates a market order.  True market orders are NOT
+         implemented (out of scope for β-1b); see broker docstrings.
+       - Round shares down to nearest 100 lot.
+       - Submit; record success/fail without aborting subsequent codes.
+    5. Compute ``total_realized_cash = cash_after - cash_before`` and
+       return :class:`EmergencyResult`.
+
+    Fault-tolerance
+    ---------------
+    Per-code submission failure is recorded into ``failed_codes`` but
+    does *not* abort the loop — the rationale is that in a true
+    emergency, partial liquidation is strictly better than no
+    liquidation.
+    """
+    import time as _time
+
+    t0 = _time.monotonic()
+    expected = f"EMERGENCY_LIQUIDATE_{broker.account_id}"
+    if confirm_string != expected:
+        raise ValueError(
+            f"emergency_liquidate_all: confirm_string mismatch "
+            f"(expected={expected!r}, got={confirm_string!r}). "
+            f"No orders were touched."
+        )
+
+    broker._require_connected()
+
+    cancelled_ids: list[str] = []
+    for o in broker.get_orders():
+        if o.status in ("pending", "partial"):
+            r = broker.cancel_order(o.order_id)
+            if r.success:
+                cancelled_ids.append(o.order_id)
+
+    cash_before = broker.get_account_info().cash_available
+    attempted: list[str] = []
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    pc_map = prev_close or {}
+    for p in broker.get_positions():
+        if p.shares_available <= 0:
+            continue
+        attempted.append(p.code)
+        ref = pc_map.get(p.code, p.market_price)
+        if ref is None or ref <= 0:
+            failed.append((p.code, "no reference price (prev_close + market_price both unusable)"))
+            continue
+        if mode == "market":
+            limit = round(ref * 0.90, 2)
+        else:
+            limit = round(ref * (1 + limit_offset_pct / 100.0), 2)
+        shares = (p.shares_available // 100) * 100
+        if shares < 100:
+            failed.append((p.code, f"shares_available={p.shares_available} < 1 lot"))
+            continue
+        try:
+            r = broker.place_limit_order(p.code, "sell", shares, limit,
+                                           order_remark="emergency_liquidate")
+        except Exception as e:
+            failed.append((p.code, f"submit raised: {e}"))
+            continue
+        if r.success:
+            succeeded.append(p.code)
+        else:
+            failed.append((p.code, r.error or "unknown error"))
+
+    cash_after = broker.get_account_info().cash_available
+    realized = cash_after - cash_before
+
+    return EmergencyResult(
+        attempted_codes=attempted,
+        succeeded_codes=succeeded,
+        failed_codes=failed,
+        total_realized_cash=realized,
+        cancelled_order_ids=cancelled_ids,
+        duration_seconds=_time.monotonic() - t0,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────
 # Code formatting
 # ──────────────────────────────────────────────────────────────────
@@ -374,6 +498,33 @@ class QMTBroker:
             return OrderResult(success=False, order_id=order_id,
                                 error=f"cancel rc={rc}")
         return OrderResult(success=True, order_id=order_id)
+
+    # ── emergency liquidation (P8-β-1b) ─────────────────────────
+
+    def emergency_liquidate_all(
+        self,
+        confirm_string: str,
+        mode: Literal["limit", "market"] = "limit",
+        limit_offset_pct: float = -0.5,
+        prev_close: Optional[dict[str, float]] = None,
+    ) -> EmergencyResult:
+        """Sell all sell-able positions + cancel all pending orders.
+
+        See :func:`_emergency_liquidate_impl` for the full contract and
+        the fault-tolerance / mode semantics.
+
+        Note for QMTBroker specifically: order submission is async, so
+        ``total_realized_cash`` will typically be ~0 immediately after
+        return.  Caller should poll account state / orders over the
+        following seconds to observe fills.  True ``mode='market'`` is
+        *not* a real xtquant market order (would need
+        ``xtconstant.MARKET_PEER_PRICE_FIRST``) — it is approximated as
+        a -10% limit instead.  See module docstring for the QMT
+        lifecycle.
+        """
+        return _emergency_liquidate_impl(
+            self, confirm_string, mode, limit_offset_pct, prev_close,
+        )
 
     # ── internal ────────────────────────────────────────────────
 

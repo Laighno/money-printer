@@ -316,6 +316,98 @@ def run(
     return results
 
 
+def _print_emergency_result(result) -> None:
+    """Pretty-print EmergencyResult to stdout / logger (CLI side)."""
+    logger.info("EMERGENCY LIQUIDATE complete:")
+    logger.info("  attempted:        {} codes", len(result.attempted_codes))
+    logger.info("  succeeded submit: {} codes", len(result.succeeded_codes))
+    logger.info("  failed submit:    {} codes", len(result.failed_codes))
+    logger.info("  cancelled orders: {} ({})",
+                len(result.cancelled_order_ids),
+                ",".join(result.cancelled_order_ids) or "-")
+    logger.info("  realized cash:    ¥{:,.2f}", result.total_realized_cash)
+    logger.info("  duration:         {:.2f}s", result.duration_seconds)
+    for code, err in result.failed_codes:
+        logger.error("  FAIL {}: {}", code, err)
+
+
+def _run_emergency(args) -> int:
+    """Handle the --emergency CLI path.  Returns the process exit code."""
+    if not args.confirm:
+        logger.error("--emergency requires --confirm=EMERGENCY_LIQUIDATE_<account_id>")
+        return 1
+
+    if args.mode == "dryrun":
+        from mp.execution.qmt_broker import Position
+        plan_positions: list[Position] = []
+        approx_cash = 0.0
+        plan_path = Path(args.plan)
+        if plan_path.exists():
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan_acct = plan.get("account_snapshot", {}) or {}
+            plan_positions = [
+                Position(code=h["code"], name=h["name"],
+                         shares_total=int(h.get("shares") or 0),
+                         shares_available=int(h.get("shares") or 0),
+                         avg_cost=float(h.get("avg_cost") or 0),
+                         market_price=float(h.get("avg_cost") or 0),
+                         market_value=int(h.get("shares") or 0) * float(h.get("avg_cost") or 0))
+                for h in (plan.get("holdings_at_plan_time", []) or [])
+            ]
+            approx_mv = sum(p.market_value for p in plan_positions)
+            plan_total = float(plan_acct.get("total_assets") or 0)
+            approx_cash = plan_total - approx_mv
+            if approx_cash < 0:
+                approx_cash = float(plan_acct.get("cash_available") or 0)
+        else:
+            logger.warning("No plan at {} — running --emergency on empty DryRunBroker (no positions to liquidate)",
+                           plan_path)
+        account_id = args.qmt_account or "dryrun"
+        broker = DryRunBroker(
+            cash=approx_cash, positions=plan_positions, autofill=True,
+            account_id=account_id,
+        )
+    else:
+        if not args.qmt_account or not args.qmt_userdata:
+            logger.error("--qmt-account and --qmt-userdata are required for live --emergency")
+            return 1
+        broker = QMTBroker(
+            account_id=args.qmt_account,
+            qmt_userdata_path=args.qmt_userdata,
+        )
+
+    broker.connect()
+    try:
+        result = broker.emergency_liquidate_all(confirm_string=args.confirm)
+    except ValueError as e:
+        logger.error("emergency_liquidate_all rejected: {}", e)
+        if broker.is_connected():
+            broker.disconnect()
+        return 1
+    _print_emergency_result(result)
+
+    log_dir = ROOT / "data" / "orders" / "executions"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out = log_dir / f"emergency_{stamp}.json"
+    out.write_text(json.dumps({
+        "executed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "mode": "emergency",
+        "broker_mode": args.mode,
+        "attempted_codes": result.attempted_codes,
+        "succeeded_codes": result.succeeded_codes,
+        "failed_codes": result.failed_codes,
+        "cancelled_order_ids": result.cancelled_order_ids,
+        "total_realized_cash": result.total_realized_cash,
+        "duration_seconds": result.duration_seconds,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Emergency log → {}", out)
+
+    if broker.is_connected():
+        broker.disconnect()
+    return 0 if not result.failed_codes else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", default="data/orders/latest.json",
@@ -330,7 +422,22 @@ def main() -> int:
     parser.add_argument("--price-drift-pct", type=float, default=0.02)
     parser.add_argument("--feishu", action="store_true",
                         help="push summary to Feishu when done")
+    parser.add_argument(
+        "--emergency", action="store_true",
+        help="EMERGENCY: cancel pending orders + liquidate all sell-able "
+             "positions. Requires --confirm=EMERGENCY_LIQUIDATE_<account_id>. "
+             "Bypasses the normal plan execution path entirely.",
+    )
+    parser.add_argument(
+        "--confirm",
+        help="confirmation string for --emergency (must equal "
+             "f'EMERGENCY_LIQUIDATE_{account_id}'). Mandatory when "
+             "--emergency is passed; ignored otherwise.",
+    )
     args = parser.parse_args()
+
+    if args.emergency:
+        return _run_emergency(args)
 
     plan_path = Path(args.plan)
     if not plan_path.exists():

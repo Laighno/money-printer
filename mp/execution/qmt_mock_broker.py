@@ -45,7 +45,10 @@ from typing import Literal, Optional
 from loguru import logger
 
 from .dryrun_broker import DryRunBroker
-from .qmt_broker import AccountInfo, OrderResult, OrderStatus, Position
+from .qmt_broker import (
+    AccountInfo, EmergencyResult, OrderResult, OrderStatus, Position,
+    _emergency_liquidate_impl,
+)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -123,8 +126,12 @@ class QMTMockBroker(DryRunBroker):
         cash: float = 0.0,
         positions: list[Position] | None = None,
         config: _QMTMockConfig | None = None,
+        account_id: str = "mock",
     ):
-        super().__init__(cash=cash, positions=positions, autofill=False)
+        super().__init__(
+            cash=cash, positions=positions, autofill=False,
+            account_id=account_id,
+        )
         self._config = config or _QMTMockConfig()
         self._rng = random.Random(self._config.seed)
         self._cash_frozen: float = 0.0
@@ -226,6 +233,25 @@ class QMTMockBroker(DryRunBroker):
             success=True, order_id=order_id,
             code=code, action=action,
             shares=shares, limit_price=limit_price,
+        )
+
+    def emergency_liquidate_all(
+        self,
+        confirm_string: str,
+        mode: Literal["limit", "market"] = "limit",
+        limit_offset_pct: float = -0.5,
+        prev_close: dict[str, float] | None = None,
+    ) -> EmergencyResult:
+        """Sell all sell-able positions + cancel all pending orders.
+
+        Delegates to :func:`mp.execution.qmt_broker._emergency_liquidate_impl`.
+        Because this broker is async-fill (``autofill=False``),
+        ``total_realized_cash`` will be ~0 immediately after return —
+        sells are queued in the pending list.  Caller can advance the
+        clock with :meth:`process_pending_orders` to observe fills.
+        """
+        return _emergency_liquidate_impl(
+            self, confirm_string, mode, limit_offset_pct, prev_close,
         )
 
     def cancel_order(self, order_id: str) -> OrderResult:

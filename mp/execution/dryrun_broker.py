@@ -28,7 +28,10 @@ from typing import Literal
 
 from loguru import logger
 
-from .qmt_broker import AccountInfo, OrderResult, OrderStatus, Position
+from .qmt_broker import (
+    AccountInfo, EmergencyResult, OrderResult, OrderStatus, Position,
+    _emergency_liquidate_impl,
+)
 
 
 class DryRunBroker:
@@ -39,6 +42,7 @@ class DryRunBroker:
         cash: float = 0.0,
         positions: list[Position] | None = None,
         autofill: bool = True,
+        account_id: str = "dryrun",
     ):
         self._cash = float(cash)
         self._positions: dict[str, Position] = {
@@ -53,6 +57,10 @@ class DryRunBroker:
         # process — paper_trade loops connect() per cycle and we don't want
         # to spam logs. See docs/dialog/ round 30 (external-review item 2).
         self._not_for_pnl_warned = False
+        # P8-β-1b: confirm_string for emergency_liquidate_all is
+        # f"EMERGENCY_LIQUIDATE_{account_id}". Default "dryrun" keeps
+        # existing test fixtures working without modification.
+        self.account_id = account_id
 
     # ── lifecycle ────────────────────────────────────────────────
 
@@ -207,6 +215,26 @@ class DryRunBroker:
                 o.status = "cancelled"
                 return OrderResult(success=True, order_id=order_id)
         return OrderResult(success=False, order_id=order_id, error="not found")
+
+    # ── emergency liquidation (P8-β-1b) ─────────────────────────
+
+    def emergency_liquidate_all(
+        self,
+        confirm_string: str,
+        mode: Literal["limit", "market"] = "limit",
+        limit_offset_pct: float = -0.5,
+        prev_close: dict[str, float] | None = None,
+    ) -> EmergencyResult:
+        """Sell all sell-able positions + cancel all pending orders.
+
+        Delegates to :func:`mp.execution.qmt_broker._emergency_liquidate_impl`.
+        With ``autofill=True`` (default) the realized cash and position
+        cleanup happen synchronously, so ``EmergencyResult.total_realized_cash``
+        is the actual proceeds.
+        """
+        return _emergency_liquidate_impl(
+            self, confirm_string, mode, limit_offset_pct, prev_close,
+        )
 
     def _require_connected(self):
         if not self._connected:
