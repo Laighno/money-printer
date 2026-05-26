@@ -6436,6 +6436,53 @@ P9-P10 chain 真正最后的 systemic-gap fix. 起.
 
 P10-2 是 measurement default + audit doc 更新, 跟实盘 path **完全独立**. β-3 user Windows QMT-paper Approach B 可并行启动.
 
+## [2026-05-26 16:23] 第 72 轮 (P10-2-FINAL-ACK) · bundle 全 land · 整条 chain 完结
+
+### ACK commit `94e63f4`
+
+5 项全 land, 一次 bundle commit. 干净.
+
+- ✅ (A) `RANKER_KIND` default = blend, verify Sharpe=1.90 byte-identical P10-1 NEW seed 42
+- ✅ (B) BASELINE.md ★ 3rd rewrite (N=3 distribution table, 不是 single-point)
+- ✅ (C) threshold_alert YELLOW 1.00 (worst-seed anchor), test 锁同步
+- ✅ (D) framework_evaluation.md "十、结论" 段**开头** retraction marker (强 marker, 不只 footer)
+- ✅ (E) decision_log Rule #11 + Catch #11
+
+### P9-P10-P10-2 整条 chain 总结 (rounds 56-71, 16 轮 dialog)
+
+| chain | trigger | catches | rules | commits | final takeaway |
+|---|---|---|---|---|---|
+| P9 | advisor "winsorize -0.34" claim | #7 #8 | #9 | 6eef98e + 795db4a | StockRanker walk_forward: winsorize no-op |
+| P10 | advisor measurement-production gap spec | #10 | #10 | 925cc12 | BlendRanker walk_forward: winsorize +0.26 |
+| P10-2 | advisor Nuance follow-up (seed 44 vol-compression + RANKER_KIND root cause) | #11 | #11 | 94e63f4 | walk_forward default = blend (production-aligned) |
+
+**permanent rules added (3 in 1 chain)**:
+- #9: env/flag consume verify 3-tier
+- #10: A/B strict single-var + holding constant clause
+- #11: measurement RANKER_KIND must equal production loaded ranker
+
+**production state**:
+- `data/blend_*.lgb` (winsorize ON, single BlendRanker since 2026-05-24 ensemble deprecate) — 不动, 配置正确
+- `mp/monitor/threshold_alert.py` YELLOW 1.0 / RED 0.5
+- `scripts/walk_forward_backtest.py` RANKER_KIND default = blend (production-aligned)
+- baseline lock: N=3 mean 1.82, worst-seed 1.67, production-realized seed=42 = 1.90
+
+### 这一轮你
+
+**无 work** — chain wind-down. 等下一个 user gate.
+
+### 后续路径 (none blocking)
+
+1. **γ 实盘**: user 端 Windows QMT-paper β-3 Approach B 1-case (用户操作)
+2. **P10-3 (如果 user 重启 ensemble)**: 改 walk_forward 支持 RANKER_KIND=ensemble 测量 (Rule #11 caveat)
+3. **β fidelity**: 已 land 不动
+
+### 主动给 user
+
+P10-2 bundle 全 land (commit 94e63f4). 整条 P9-P10-P10-2 chain (3 sub-chain, 16 轮 dialog, 3 permanent rules, 5 catches) 正式 wind-down. production state 锁定: winsorize ON 正确 (+0.26 Sharpe vs OFF, BlendRanker 路径), baseline 1.82 mean / 1.67 worst / 1.90 seed=42, threshold YELLOW 1.0 RED 0.5, weekly cron 现在测 production-aligned 路径 (从今天起 backtest_history.json 数字会跳到 ~1.82). γ 实盘可推进, 等 user 端 Windows QMT-paper β-3 Approach B 1-case.
+
+谢谢这个 sub-chain (P10-2) 的精准执行 — 5 项 1 commit + verify run 全自洽. 整条 chain 收尾干净.
+
 
 
 
