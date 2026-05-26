@@ -6286,6 +6286,156 @@ P10 chain CLOSED.
 
 谢谢这一连串 chain 的细致工作. P9 chain 收尾的 Catch #7 + P10 chain 反转都是你抓的关键 insight.
 
+## [2026-05-26 15:58] 第 70 轮 (P10-2/3 bundle) · root-cause fix + 第 3 次 baseline 重写
+
+### Context
+
+User 端读完 P10-1 6 数字 + 工程方 P10-CLOSE commit, 提出 5 个 follow-up:
+
+1. **Nuance 1**: seed 44 NEW Sharpe 1.67 的 +0.06 lift 100% 来自 vol-compression (annual 51.66% 比 OLD 54.05% **还低**, vol 30.93% 比 OLD 33.59% 缩 8%). Winsorize 在 seed 44 上**不加 alpha 只平滑 ride**. NEW config cross-seed σ = 0.130 vs OLD σ = 0.047 (~3× 放大).
+2. **Nuance 2**: BASELINE.md 第 3 次 walk-back: 原 1.90 (P2) → 1.20 (P7-γ, StockRanker 误测) → 1.18 ± 0.12 (P9-CLOSE, StockRanker) → **应回 1.82 mean (or 1.90 seed-42-realized / 1.67 worst-seed)**.
+3. **Nuance 3 → P10-2**: `RANKER_KIND` default = `"stock"` 是 root cause. Weekly cron 跑 StockRanker (1.18), threshold_alert 拿这数字, 跟 production BlendRanker (1.82) 脱节. 1 行 fix.
+4. **Nuance 4**: framework_evaluation.md retraction 应加到 conclusion 段**开头** (advisor 上轮只加了 footer, 不够强). 已加 footer (commit `a60ab4c`), 需要补 conclusion 开头 marker.
+5. **Rule #11**: walk_forward measurement 的 ranker 必须与 production 加载的一致, 否则报告 prefix 必须 explicit.
+
+### Advisor 端 verify (作为 spec 前置 input)
+
+- `data/ensemble/seed_42/` **空目录** (rm 过, 或从未填充), `*.lgb` no match.
+- `data/logs/paper_trade.log` 2026-05-25 18:02:45 显示 `Using single BlendRanker (no ensemble found)`
+- ✅ **当前 production = single BlendRanker = P10-1 测量路径**, Rule #11 当前满足
+- 但 `data/ensemble.deprecated_20260524_1558/` 存在, suggests user 在 2026-05-24 主动 deprecate 了 ensemble. 如果 future 重启 ensemble, 必须重测 (Rule #11 caveat)
+
+### P10-2/3 bundle spec (建议 5 个动作合 1-2 个 commit)
+
+#### A. P10-2 — `RANKER_KIND` default = `"blend"` (1 行 + 1 verify)
+
+```python
+# scripts/walk_forward_backtest.py:148
+- RANKER_KIND = os.environ.get("RANKER_KIND", "stock")
++ RANKER_KIND = os.environ.get("RANKER_KIND", "blend")  # P10-2: default to production path
+```
+
+verify:
+- 跑 1 个 `PYTHONHASHSEED=0 LGBM_SEED=42 WF_FEATURE_PRESET=W_BASELINE .venv/bin/python scripts/walk_forward_backtest.py --skip-update` (~16 min, no RANKER_KIND env)
+- expect: Sharpe ≈ 1.90 (跟 P10-1 NEW seed 42 byte-identical), `grep -c Winsorized` ≥ 1
+- 这是 Rule #11 在当前 codebase 的 verification
+
+#### B. BASELINE.md 第 3 次重写 (Rule #11 lesson 反映)
+
+原 P7-γ table 写的 1.20 (StockRanker, walk_forward 默认) — replace 为 N=3 BlendRanker distribution:
+
+```markdown
+## ★ Production deterministic baseline (BlendRanker walk_forward, N=3, seeds 42/43/44)
+
+| metric | seed 42 (production-realized) | seed 43 | seed 44 (worst) | mean | std |
+|---|---:|---:|---:|---:|---:|
+| Sharpe | 1.90 | 1.89 | 1.67 | 1.82 | 0.13 |
+| annual_return | 60.42% | 60.32% | 51.66% | 57.47% | — |
+| annual_vol | 31.85% | 31.86% | 30.93% | 31.55% | — |
+| max_drawdown | -36.30% | -33.31% | -38.16% | -35.92% | — |
+
+config: RANKER_KIND=blend (P10-2 default), EXCESS_CAP=0.50 winsorize ON,
+        WF_FEATURE_PRESET=W_BASELINE, deterministic chain, --skip-update
+
+**Audit trail**: P10-1 6-run A/B (advisor round 66-68, engineer P10-CLOSE 925cc12).
+Previous baseline numbers (1.90 single-point P2, 1.20 P7-γ, 1.18 P9-CLOSE) all measured
+StockRanker or single-seed; this is N=3 BlendRanker (production-aligned) distribution.
+```
+
+#### C. threshold_alert re-anchor (基于 N=3 distribution, 不是回 P2 时代旧 anchor)
+
+User 推荐 **1.0 / 0.5** (而不是 1.4/0.9):
+- YELLOW 1.0 = "below worst-seed normal 1.67" (Sharpe 比 worst-case 还低 ~0.67 → 异常)
+- RED 0.5 = "严重 degrade" (worst-case / 3)
+- 旧 0.9/0.5 太宽容 (worst-seed 1.67 跑出 0.9 应该 alert, 不该等 0.5)
+- 旧 1.4/0.9 (P2 时代) 太严 (worst-seed 正常波动 1.67 会误报 YELLOW)
+
+```python
+# mp/monitor/threshold_alert.py
+- SHARPE_YELLOW = 0.9
+- SHARPE_RED = 0.5
++ SHARPE_YELLOW = 1.0  # P10-2: re-anchor based on N=3 worst-seed 1.67 (below = anomaly)
++ SHARPE_RED = 0.5     # P10-2: severe degrade ≈ worst-case / 3
+```
+
+#### D. framework_evaluation.md conclusion 段开头加 retraction marker
+
+原文 [data/reports/framework_evaluation.md](data/reports/framework_evaluation.md) "十、结论" 段开头加:
+
+```markdown
+> 🚨 **2026-05-26 retraction notice (P10-1)**:
+> 本节及上游"winsorize OLD ≡ NEW byte-identical"的结论仅在 RANKER_KIND=stock walk_forward 测量下成立.
+> Production 用 BlendRanker (excess_ret label), 后续 P10-1 测量 (commit 925cc12 decision_log)
+> 显示 winsorize 在 production 路径下 **HELP +0.26 Sharpe** (N=3 deterministic, 3/3 seed directional).
+> production data/blend_*.lgb 配置正确, 不要按下面叙事 revert winsorize. 详见报告末尾附录.
+
+## 十、结论
+| 维度 | 评价 |
+|---|---|
+...
+```
+
+#### E. decision_log.md 加 Rule #11 + Catch #11 (seed 44 vol-compression observation)
+
+```markdown
+## P10-2 chain · default ranker + Rule #11 (2026-05-26)
+
+### Decision: walk_forward default RANKER_KIND = "blend"
+... (措辞按 A 段)
+
+### Rule #11 (new permanent)
+walk_forward measurement 的 RANKER_KIND 必须与 production paper_trade/daily_report 加载的 ranker 一致.
+当前 production = single BlendRanker (data/ensemble/ 空, fallback path). 如果 user 重启 ensemble
+(填充 data/ensemble/seed_X/blend_*.lgb), walk_forward 必须测 EnsembleBlendRanker 路径 (currently 不支持,
+需 RANKER_KIND=ensemble extension OR ensemble averaging 在 walk_forward 内部).
+
+不一致时, 报告必须 prefix:
+> "(measurement ranker = X, production ranker = Y, results not directly comparable; see Rule #11)"
+
+### Catch #11 (advisor, P10-2 round 70 衍生): seed 44 vol-compression
+P10-1 NEW seed 44: annual 51.66% (比 OLD 54.05% **低 2.4pp**), vol 30.93% (比 OLD 33.59% 缩 8%).
+Sharpe lift 1.61→1.67 (+0.06) 100% 来自 vol denominator 收缩, 不是 alpha 提升. NEW config
+cross-seed σ (0.130) 是 OLD (0.047) 的 ~3 倍. seed 44 outlier 跟 P3-1d β0 spike 同因 (可能 winsorize
+压的 tail event 在 seed 44 训练采样下不是关键信号).
+
+implication: production 锁 seed=42 = 1.90 是 N=3 上端. 如果未来需切 seed (panel 问题/multi-seed averaging),
+~33% 概率落到 ~1.67 量级. Sharpe 1.67 仍 > OLD mean 1.557, 但比 1.90 落 0.23.
+```
+
+### 时间预估
+
+| 项 | 时间 |
+|---|---|
+| P10-2 1 行 commit + 跑 1 个 verify run | ~17 min |
+| BASELINE.md 第 3 次重写 | ~5 min |
+| threshold_alert re-anchor | ~3 min |
+| framework_evaluation.md conclusion marker | ~2 min |
+| decision_log Rule #11 + Catch #11 | ~8 min |
+| **total** | **~35 min** (1-2 个 commit) |
+
+### Rule reminders
+
+- ✅ Rule #1: 改 walk_forward_backtest.py / threshold_alert.py / BASELINE.md / framework_evaluation.md / decision_log.md staged 前 diff 看
+- ✅ Rule #4: 不 touch production .lgb (verify run 全程 --skip-update)
+- ✅ Rule #7: verify run report 含 N=1 deterministic config + Sharpe 跟 P10-1 NEW seed 42 byte-identical
+- ✅ Rule #9: verify run 跑前 `grep -c Winsorized` expect ≥1 (default 现在 EXCESS_CAP=0.50 winsorize ON)
+- ✅ Rule #11 (new): 当前 production = single BlendRanker, measurement = walk_forward RANKER_KIND=blend ⟹ 一致
+
+### 这一轮你
+
+1. (A) P10-2 commit + verify run (~17 min)
+2. (B) BASELINE.md 第 3 次重写
+3. (C) threshold_alert re-anchor 1.0/0.5
+4. (D) framework_evaluation.md conclusion 开头加 retraction marker
+5. (E) decision_log.md 加 Rule #11 + Catch #11
+6. 写 round 71 1 行 ACK (commit hashes)
+
+P9-P10 chain 真正最后的 systemic-gap fix. 起.
+
+### 不阻塞 γ
+
+P10-2 是 measurement default + audit doc 更新, 跟实盘 path **完全独立**. β-3 user Windows QMT-paper Approach B 可并行启动.
+
 
 
 
