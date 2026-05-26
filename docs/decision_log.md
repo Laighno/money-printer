@@ -133,3 +133,74 @@ walk_forward Sharpe baseline = 1.18 (StockRanker, `fwd_ret` label) does not dire
 ### Defer trigger
 
 Queued, not started. Will activate after β-prep finishes (user QMT-paper Approach B) or by explicit advisor green light. P9 chain is closed.
+
+## P10 chain · BlendRanker A/B winsorize lift confirmed (2026-05-26)
+
+### Trigger
+
+Activated by user round 66 ACK after reading `data/reports/framework_evaluation.md` (P9 chain post-mortem). Engineer (C) grep confirmed `RANKER_KIND=blend` switches `scripts/walk_forward_backtest.py:721-741` to `BlendRanker(primary_label="excess_ret")` — winsorize impact would actually be visible (unlike P9 StockRanker measurement which proved no-op).
+
+### Final finding
+
+N=3 deterministic A/B (seeds 42/43/44, `RANKER_KIND=blend` walk_forward, post-`6eef98e`):
+
+| Config | seed 42 | seed 43 | seed 44 | mean (N=3) | std |
+|---|---:|---:|---:|---:|---:|
+| OLD (winsorize OFF, `EXCESS_CAP=999.0`) | 1.54 | 1.52 | 1.61 | 1.557 | 0.047 |
+| NEW (winsorize ON, `EXCESS_CAP=0.50`) | 1.90 | 1.89 | 1.67 | 1.820 | 0.130 |
+| NEW − OLD spread | +0.36 | +0.37 | +0.06 | **+0.263** | — |
+
+3/3 seed directionally consistent (NEW > OLD). **Winsorize HELPS BlendRanker** (opposite direction to P9-0's original "hurts" claim — see Catch #8 revision below). Production `data/blend_primary.lgb` is the better config (NEW seed 42 = 1.90 is the production-realized number).
+
+annual / vol / max_dd matrix:
+
+| 指标 | OLD seed 42 | OLD seed 43 | OLD seed 44 | NEW seed 42 | NEW seed 43 | NEW seed 44 |
+|---|---:|---:|---:|---:|---:|---:|
+| annual_return | 52.90% | 52.90% | 54.05% | 60.42% | 60.32% | 51.66% |
+| annual_volatility | 34.38% | 34.88% | 33.59% | 31.85% | 31.86% | 30.93% |
+| max_drawdown | -39.08% | -35.34% | -26.47% | -36.30% | -33.31% | -38.16% |
+
+Seed 44 anomaly: NEW − OLD spread = +0.06 (vs ~+0.37 for seeds 42/43). NEW config cross-seed σ = 0.130 (3× OLD's 0.047). Seed 44 retains its outlier behavior previously documented in P3-1d (row 23) and P7-β (row 34).
+
+### Catch #8 revision (P10-1 finding)
+
+P9-CLOSE (row 36 in `docs/decision_log.md ## P9 chain` section) flagged "P9-0 OLD seed 42 = 1.54 not reproducible / phantom (likely IV data entry)". **Wrong**. P10-1 reproduces OLD blend seed 42 = 1.54 exactly. The phantom was the **comparison frame**, not the data:
+
+- P9-0 "OLD seed 42 = 1.54" was BlendRanker OLD config — verified reproducible at P10-1
+- P9-0 "NEW seed 42 = 1.20" was StockRanker NEW config — verified at P9-CLOSE as `RANKER_KIND=stock` deterministic baseline
+- Computing spread (1.54 − 1.20) attributed the difference to winsorize but actually mixed two changes: (i) ranker_kind: blend→stock, (ii) winsorize: off→on. Real attribution requires isolating one variable.
+
+Catch #8 corrected wording: **P9-0 baseline was correct data; the error was apples-to-oranges comparison across different ranker paths.** Not a data entry phantom.
+
+### Permanent rules / catches added
+
+- **Catch #10** (advisor, P10-1): P9-0 conclusion was wrong because two config variables changed simultaneously (ranker_kind + winsorize). The implied spread therefore can't be attributed to either variable alone. Same class of error as P5-A-light σ-anchor type-mismatch (row 26): the methodology was unsound, not the data.
+- **Rule #10** (new permanent rule, candidate per advisor round 67): A/B tests must hold all other variables constant and the report must explicitly list the "holding constant" clause. Multi-variable spread cannot be attributed to a single variable. Companion to Rule #9 — where #9 verifies that the override is consumed, #10 verifies that nothing else changed.
+
+### Decision: no production change, no threshold re-anchor
+
+- `data/blend_primary.lgb` / `data/blend_extreme.lgb` retained at current winsorize-ON state (verified +0.26 mean Sharpe better than winsorize-OFF). No retrain.
+- Production-realized Sharpe 1.90 (NEW seed 42) is within N=3 distribution top: distribution mean 1.82, worst seed 1.67. Not a lucky tail outside the cone.
+- Threshold anchors (`mp/monitor/threshold_alert.py`) unchanged: 0.9 YELLOW / 0.5 RED still pre-P9 status, and 1.67 (worst-seed) >> 0.9 keeps RED dormant.
+- γ live-trading path: winsorize is **helpful**, not "known worse"; β-prep commits (65fe669 / 659c26b / f3e7055) + β-3 user-action (Windows VNC QMT-paper) remain the gating sequence.
+
+### Open question (P10-2 candidate, queued)
+
+Default `RANKER_KIND` in `scripts/walk_forward_backtest.py` is `stock`. Production uses `blend`. Future walk_forward A/B work risks repeating Catch #10 (measurement layer mismatch) unless either:
+
+- (a) Default `RANKER_KIND` flipped to `blend` so weekly walk_forward measures production-path Sharpe, OR
+- (b) New `--ranker-kind` CLI flag forces explicit declaration (no silent default mismatch)
+
+P10-2 candidate: pick one of (a)/(b), commit it, update weekly cron + threshold anchors accordingly. ~30 min wall. Queued.
+
+### Commits
+
+- `_THIS_COMMIT_` — P10-CLOSE: 6-run BlendRanker A/B + winsorize lift +0.26 + Catch #10 + Rule #10. Decision log update only; no code change.
+
+### Audit trail (rounds 66-67)
+
+| Round | Trigger | Engineer action |
+|---|---|---|
+| 66 | Advisor green light (after user reads `framework_evaluation.md`) | Ran 6 BlendRanker A/B (OLD/NEW × seeds 42/43/44), verified env per Rule #9 |
+| 67 | Engineer reports +0.26 spread + direction reversal of P9-0 + Catch #8 partial retraction | Advisor (a) decision: production correct, P10-CLOSE, write Catch #10 + Rule #10 |
+| 68 | This commit | Decision log update (~40 lines added to ## P10 chain section) |
