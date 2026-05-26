@@ -6079,6 +6079,103 @@ Catch #8 是 advisor 自己 baseline 错, 你诚实 surface + 提多种 root cau
 
 main loop 端继续 polling. 谢谢这一轮的细致工作.
 
+## [2026-05-26 13:45] 第 66 轮 (P10-1-START) · RANKER_KIND=blend A/B green light
+
+### Context
+
+User 端读了 `data/reports/framework_evaluation.md` (advisor 整理的 P9 chain post-mortem), 同意启动 P10-1. 我先做了 (C) 5-min code grep 调查, 确认 `RANKER_KIND=blend` 真改 walk_forward 测量 ranker (不是 update_production_models 的副作用):
+
+- [scripts/walk_forward_backtest.py:721-741](scripts/walk_forward_backtest.py#L721): 主训练循环 `if RANKER_KIND == "blend": ranker = BlendRanker(...)`, `current_ranker = ranker`
+- [scripts/walk_forward_backtest.py:842](scripts/walk_forward_backtest.py#L842): `scores = current_ranker.predict(today_valid)` 每日预测用的就是 BlendRanker
+- [mp/ml/model.py:618](mp/ml/model.py#L618): `BlendRanker(primary_label="excess_ret")` + extreme 也是 `excess_ret`
+- 所以 `EXCESS_CAP` winsorize 在 `RANKER_KIND=blend` 下**真有 impact** — 不像 StockRanker 路径下是 no-op
+
+(B) 6-run RANKER_KIND=blend A/B 值得跑.
+
+### P10-1 spec (执行)
+
+```
+config: deterministic chain identical to P9-CLOSE
+  PYTHONHASHSEED=0
+  num_threads=1
+  WF_FEATURE_PRESET=W_BASELINE
+  --skip-update (production .lgb 全程不动, Rule #4)
+  6eef98e + 后续 work tree state (dataset.py env-readable EXCESS_CAP)
+
+6 runs:
+  RANKER_KIND=blend EXCESS_CAP=999.0 LGBM_SEED=42  → /tmp/wf_blend_OLD_seed42.log
+  RANKER_KIND=blend EXCESS_CAP=999.0 LGBM_SEED=43  → /tmp/wf_blend_OLD_seed43.log
+  RANKER_KIND=blend EXCESS_CAP=999.0 LGBM_SEED=44  → /tmp/wf_blend_OLD_seed44.log
+  RANKER_KIND=blend EXCESS_CAP=0.50  LGBM_SEED=42  → /tmp/wf_blend_NEW_seed42.log
+  RANKER_KIND=blend EXCESS_CAP=0.50  LGBM_SEED=43  → /tmp/wf_blend_NEW_seed43.log
+  RANKER_KIND=blend EXCESS_CAP=0.50  LGBM_SEED=44  → /tmp/wf_blend_NEW_seed44.log
+
+预估: 6 × ~12 min = ~72 min wall (BlendRanker 比 StockRanker 慢 ~50%, 因为训练 primary+extreme 两个模型)
+顺序: 串行 (并行会抢 CPU/RAM)
+```
+
+### 跑前 verify (Rule #9 应用)
+
+每个 run 跑完, 抽 1 行 log verify env 真生效:
+
+```
+# OLD 应该: grep -c "Winsorized" /tmp/wf_blend_OLD_seed42.log → 0
+# NEW 应该: grep -c "Winsorized" /tmp/wf_blend_NEW_seed42.log → ≥ 1
+# 如果颠倒 → env 又没读到 → 立刻停, 别浪费剩下 5 个 run
+```
+
+### Report format (round 67 写到 to_advisor.md)
+
+```markdown
+## [<timestamp>] 第 67 轮 (P10-1-FINISH)
+
+### 6 数字 table (BlendRanker walk_forward A/B)
+
+|              | seed 42 | seed 43 | seed 44 | mean (N=3) | std |
+|---           |---:    |---:    |---:    |---:       |---: |
+| OLD Sharpe   | ?      | ?      | ?      | ?         | ?   |
+| NEW Sharpe   | ?      | ?      | ?      | ?         | ?   |
+| OLD - NEW    | ?      | ?      | ?      | ?         | —   |
+
+annual / vol 同款 3×3 (跨 OLD 内部 3 个 seed 不同是预期, OLD vs NEW 同 seed 比较是关键)
+
+### Env verify
+- OLD seeds 42/43/44 `grep -c Winsorized` → ?
+- NEW seeds 42/43/44 `grep -c Winsorized` → ?
+
+### Direction
+- 3/3 seed OLD > NEW: Y/N
+- median |spread|:
+- spread sign 一致性:
+
+### Decision rec (你拍, advisor 后审)
+- (a) spread 显著 → BlendRanker production 真受 winsorize 影响, 考虑 retrain
+- (b) spread 不显著 (< 0.10) → winsorize 在 production 路径 also no-op, P10-close
+- (c) spread 不一致方向 → seed×config interaction, 需 N=5 扩展
+
+### Caveats
+- 同 P9-CLOSE: deterministic chain 配置, 跨 commit verify, N=3
+```
+
+### Rule reminders
+
+- ✅ Rule #1: 不改任何 code, 只 set env + 跑 script
+- ✅ Rule #4: `--skip-update` 全程, production .lgb 不动
+- ✅ Rule #7: 报告含 N=3 / fixed seeds / deterministic config
+- ✅ Rule #9: env verify via `grep Winsorized` 跨 6 个 log
+
+### 这一轮你
+
+1. 串行跑 6 个 walk_forward (背景中, total ~72 min)
+2. 跑前 verify 第 1 个 OLD + 第 1 个 NEW 的 winsorize log, 确保 env 真生效, 没颠倒
+3. 6 个跑完写 round 67 报告 (6 数字 table + env verify 结果 + decision rec)
+
+### 不阻塞 γ
+
+P10-1 是 walk_forward 测量补全, **γ path 独立**. 实盘准备 (β-3 user Windows QMT-paper Approach B) 可以并行.
+
+启动 P10-1.
+
 
 
 
