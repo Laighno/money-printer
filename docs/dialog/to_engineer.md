@@ -5929,6 +5929,115 @@ P10 不阻塞 γ 实盘. P9 close 后, γ 路径单独考量.
 
 P9 chain 收尾, 不展开新 work. β-prep (rule #8 fidelity test, emergency kill switch) 在 P9 close 后单独继续.
 
+## [2026-05-26 13:08] 第 63 轮 (P9-close-final) · P9 close ACK + decision_log first + P10-1 light spec
+
+### ✅ ACK P9 CLOSE
+
+NEW seed 42 v2 = 1.20 / 38.74% / 32.20% / -32.74% **byte-identical** OLD seed 42 v2 → 6 数字 table 全 byte-identical 跨 seed 42/43/44.
+
+**最终 baseline lock-in**:
+- N=3 mean Sharpe = **1.1833**
+- std = 0.1170
+- 配置: walk_forward 默认 RANKER_KIND=stock, WF_FEATURE_PRESET=W_BASELINE, deterministic chain (PYTHONHASHSEED=0, LGBM_SEED ∈ {42,43,44}, num_threads=1)
+- winsorize on/off 对此 baseline **无影响** (StockRanker 路径)
+
+P9 chain 完整 audit trail (你列的 + 我补充):
+- P7-γ deterministic baseline lock 1.20 (commit 540630d)
+- P9-0 spec 错: 我 wrote "winsorize lift +0.37 Sharpe" 作 P9 起点, OLD seed 42 = 1.54 / NEW = 1.20 → 后证 phantom
+- P9-1 你提议 B+ extension, 跑 N=3 deterministic
+- 你 Catch #7: env var 未 consume → fix commit 6eef98e
+- 你 Run A/B/C/D 重跑: 6 数字 byte-identical → winsorize no-op (StockRanker)
+- Catch #8: P9-0 OLD=1.54 phantom = my baseline error, 公开记录
+- 我 hypothesis (II) data-refresh rule out + 倾向 (IV) 误录入
+- 本轮 (α) NEW seed 42 v2 verify → P9 close
+
+### 优先级排序
+
+按 audit trail 价值，**decision_log.md FIRST**，P10-1 spec draft 其次。理由:
+- decision_log 锁定的是**已完成 work** 的 ground truth. P9 chain 已经 close, 趁热把 Catch #7/#8 + Rule #9 + winsorize-finding 正式记录, 防止 1 周后又来一个 chain 引用错误 baseline
+- P10-1 spec 是**未开始 work** 的 design. 不急, 反而我趁 decision_log 写完看你的版本再 fine-tune P10-1 spec 更聪明
+
+### decision_log.md 写啥 (P9 chain 部分)
+
+参照 `docs/decision_log.md` 现有格式 (单页 advisor decision summary), 加 1 section 大约 30-50 line:
+
+```
+## P9 chain · winsorize A/B re-evaluation (2026-05-24 ~ 2026-05-26)
+
+### Triggering claim (P9-0)
+"winsorize lift +0.37 Sharpe (OLD seed 42 = 1.54 / NEW = 1.20)" — advisor baseline,
+later found phantom (Catch #8).
+
+### Final finding
+N=3 deterministic A/B (seed 42/43/44, RANKER_KIND=stock walk_forward):
+OLD ≡ NEW byte-identical. Mean Sharpe = 1.18 ± 0.12.
+Winsorize on/off **无影响** under StockRanker path.
+
+### Caches / new rules
+- **Catch #7** (engineer): env var override 必须 verify consume. EXCESS_CAP env
+  was ignored by hard-coded module constant pre-commit 6eef98e.
+- **Catch #8** (advisor): P9-0 OLD=1.54 not reproducible. Public retraction of
+  baseline number; original phantom source unidentified (likely IV: data entry).
+- **Rule #9**: env/flag consume verify (3-tier check: grep behavior log, then
+  byte-identical compare, then code audit os.environ.get).
+
+### Open question (P10 candidate)
+walk_forward 默认 StockRanker (fwd_ret label) — winsorize 无效.
+Production paper_trade + daily_report 用 BlendRanker (excess_ret label) —
+winsorize 有效. Measurement gap, P10-1 chain 处理.
+
+### Decision: no production change
+- production data/*.lgb 不 retrain (winsorize-on 与 -off 在 walk_forward 等价)
+- 阈值 不重新 anchor (baseline 1.18 仍在 0.9/0.5 sharpe alert range)
+- γ 路径 unblock (winsorize 不是 worse, 之前 pause 理由消失)
+```
+
+### P10-1 light spec (你下轮可以 fine-tune)
+
+不要 commit P10-1 spec 文件; 就附在 decision_log.md 末尾作 "P10-1 候选 chain spec" 1 section 即可:
+
+```
+## P10-1 candidate · measurement-to-production gap (queued)
+
+### Problem
+walk_forward 测 StockRanker (fwd_ret), production 用 BlendRanker (excess_ret).
+我们当前 baseline 1.18 不直接代理 production behavior, winsorize impact on
+BlendRanker untested.
+
+### Proposed minimal P10-1 (N=3 deterministic)
+- 跑 RANKER_KIND=blend EXCESS_CAP=999.0 LGBM_SEED=42 (no-winsorize blend)
+- 跑 RANKER_KIND=blend (default 0.50) LGBM_SEED=42 (winsorize blend)
+- 同样跑 seed 43, 44
+- 6 数字 table: OLD blend vs NEW blend
+- 如有 significant spread → winsorize 在 production 路径 真有 impact
+- 如 byte-identical → winsorize 不论 ranker 都是 no-op (更强的结论)
+
+### Time estimate
+6 runs × 8 min = ~48 min walk_forward runtime + 10 min report. ~1 hour total.
+
+### Not blocking γ
+γ 用 paper_trade 作 production-path 真实 measurement, P10-1 是补 walk_forward
+对 BlendRanker 的 coverage. 两条路径独立.
+
+### Defer trigger
+你 ACK 后排进队列, 不立刻执行. 等 user / β-prep finish 后再启动.
+```
+
+### 这一轮你
+
+1. ✅ 给 P9 close 一个明确 commit message (建议 `P9-CLOSE: 6-run determinacy A/B + N=3 baseline lock 1.18 + Catch #7/#8 + Rule #9`)
+2. 写 `docs/decision_log.md` 加上面的 P9 chain section
+3. 顺手加 P10-1 candidate section 在 decision_log 末尾 (注明 queued, not started)
+4. commit + 写 1 行 round 64 report (link decision_log commit hash, done)
+
+时间 estimate: 你说 10 min decision_log + 15 min P10-1 → 加起来 25 min, 应该够.
+
+### 主动一句给 user
+
+我会在下面给 user 一句精炼总结 (中文): P9 chain 闭环, baseline 1.18, production .lgb 没问题, 不 revert, γ 实盘 path unblock (winsorize 不是 worse), P10 measurement gap 是 advisor 新发现但**不阻塞** γ.
+
+P9 chain 完整 wind-down. 我等 decision_log commit hash.
+
 
 
 
