@@ -24,8 +24,8 @@ Requires
 Usage
 -----
     broker = QMTBroker(
-        account_id="<your account>",
-        qmt_userdata_path=r"C:\\国金证券QMT交易端\\userdata_mini",
+        account_id="8886933837",
+        qmt_userdata_path=r"C:\\guojin\\userdata_mini",  # 国金 official 2026-05
     )
     broker.connect()
     asset = broker.get_account_info()
@@ -34,6 +34,16 @@ Usage
         code="000539", action="sell", shares=18400, limit_price=6.39
     )
     broker.disconnect()
+
+ECS install (2026-05-26 verified)
+---------------------------------
+- QMT installed at C:\\guojin\\  (国金 official 2.0.8.300)
+- xtquant connects to C:\\guojin\\userdata_mini  (NOT C:\\guojin\\userdata —
+  the latter is the standard XtItClient GUI dir; xtquant requires the
+  XtMiniQmt.exe extreme-trading-mode launcher, which uses userdata_mini)
+- Account 8886933837 is REAL money (10万 asset threshold cleared).
+  β-3 N=10 fidelity test cannot run against this account without explicit
+  small-lot safety plan — see scripts/qmt_smoke_test.py for read-only verify.
 """
 from __future__ import annotations
 
