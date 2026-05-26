@@ -425,10 +425,23 @@ class QMTBroker:
         self._require_connected()
         raw = self._trader.query_stock_orders(self._account, cancelable_only=False) or []
         # Status mapping per xtconstant.ORDER_STATUS_*
+        # 48 ORDER_UNREPORTED         未报
+        # 49 ORDER_WAIT_REPORTING     待报
+        # 50 ORDER_REPORTED           已报 — accepted at exchange, awaiting fill
+        # 51 ORDER_REPORTED_CANCEL    已报待撤
+        # 52 ORDER_PARTSUCC_CANCEL    部成待撤
+        # 53 ORDER_PART_CANCEL        部撤 — partial fill + remainder cancelled
+        # 54 ORDER_CANCELED           已撤
+        # 55 ORDER_PART_SUCC          部成 — partial fill, still active
+        # 56 ORDER_SUCCEEDED          已成
+        # 57 ORDER_JUNK               废单
         _status_map = {
-            48: "pending", 49: "pending", 50: "partial", 51: "partial",
-            52: "filled", 53: "cancelled", 54: "cancelled", 55: "rejected",
-            56: "pending",
+            48: "pending", 49: "pending", 50: "pending", 51: "pending",
+            52: "partial", 53: "cancelled",
+            54: "cancelled",
+            55: "partial",
+            56: "filled",
+            57: "rejected",
         }
         out: list[OrderStatus] = []
         for o in raw:
