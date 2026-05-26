@@ -503,6 +503,11 @@ TwoStageRanker 在回测中未进入37个正式测试变体，说明早期实验
 
 ## 十、结论
 
+> 🚨 **2026-05-26 retraction notice (P10-1)**:
+> 本节及上游"winsorize OLD ≡ NEW byte-identical / 两个 model 在 walk_forward 测量下无显著差异"的结论**仅在 `RANKER_KIND=stock` walk_forward 测量路径下成立**.
+> Production 加载的是 **BlendRanker** (`excess_ret` label, `data/blend_*.lgb`), 后续 P10-1 N=3 BlendRanker A/B (commit `925cc12` `docs/decision_log.md` "## P10 chain") 显示 winsorize 在 production 路径下 **HELPS by +0.26 Sharpe** (3/3 seed directional, NEW > OLD).
+> Production `data/blend_*.lgb` 配置正确, **不要按本节叙事 revert winsorize**. 详见末尾附录 + Catch #10 (Rule #11 派生于此 — measurement ranker 必须与 production 一致).
+
 | 维度 | 评价 |
 |------|------|
 | **模型有效性** | 6年持续正超额，年化+39.4%(扣费)，alpha真实存在 |

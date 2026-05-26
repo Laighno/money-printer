@@ -102,19 +102,23 @@ from __future__ import annotations
 from typing import Optional
 
 
-# YELLOW alert threshold — re-anchored to deterministic baseline 1.20
-# (P8-α-1, 2026-05-25, docs/dialog/ round 54). Operator selection.
+# YELLOW alert threshold — re-anchored to P10-1 N=3 BlendRanker distribution
+# (P10-2, 2026-05-26, docs/dialog/ round 70). N=3 mean Sharpe = 1.82,
+# worst-seed = 1.67. YELLOW 1.0 means "below worst-seed normal by ~0.67"
+# → anomaly. Was 0.90 (anchored to old P7-γ StockRanker baseline 1.20,
+# which itself was a mis-measurement; see decision_log P10-2 chain).
 YELLOW = {
-    "sharpe_ratio":        0.90,    # was 1.40 (75% of 1.20 baseline)
+    "sharpe_ratio":        1.00,    # was 0.90 (anchored to 1.20 StockRanker; now 1.82 BlendRanker N=3 mean / 1.67 worst)
     "annual_return_pct":   30.0,    # unchanged
-    "max_drawdown_pct":   -30.0,    # was -42.0 (TIGHTENED — live slippage > backtest)
+    "max_drawdown_pct":   -30.0,    # unchanged
 }
 
 # RED alert threshold (immediate paper-trade halt per BASELINE §4)
+# RED 0.50 ≈ worst-seed (1.67) / 3 = severe degrade. Kept unchanged.
 RED = {
-    "sharpe_ratio":        0.50,    # was 0.90 (42% of 1.20 baseline)
+    "sharpe_ratio":        0.50,    # unchanged (severe degrade ≈ worst-case / 3)
     "annual_return_pct":   15.0,    # unchanged
-    "max_drawdown_pct":   -40.0,    # was -50.0 (TIGHTENED)
+    "max_drawdown_pct":   -40.0,    # unchanged
 }
 
 

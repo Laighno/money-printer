@@ -123,40 +123,34 @@ def test_red_overrides_yellow_for_same_indicator():
 
 
 # ─────────────────────────────────────────────────────────────────
-# P8-α-1 anchor lock-in (docs/dialog/ round 54)
+# P10-2 anchor lock-in (docs/dialog/ round 70)
 # ─────────────────────────────────────────────────────────────────
 
-def test_thresholds_anchored_to_120():
-    """Lock-in: thresholds preserve operator-chosen scale ratio to the
-    deterministic baseline 1.20 (P8-α-1).
+def test_thresholds_anchored_to_p10_distribution():
+    """Lock-in: P10-2 re-anchored thresholds against the N=3 BlendRanker
+    distribution measured in P10-1 (decision_log ## P10 chain).
 
-    If anyone later edits YELLOW / RED Sharpe away from the 75% / 42%
-    relation without re-running the operator anchoring exercise, this
-    test fails and flags the drift to the reviewer.
+    - YELLOW Sharpe 1.0 = "below worst-seed normal (1.67) by ~0.67" → anomaly
+    - RED Sharpe 0.5 = "severe degrade ≈ worst-case / 3" (unchanged)
+
+    Previous P8-α-1 anchor (0.90 / 0.50 against 1.20 StockRanker baseline) is
+    superseded — that baseline was a measurement-path mismatch (StockRanker
+    walk_forward vs BlendRanker production); see Catch #10 + Rule #11.
     """
-    DETERMINISTIC_BASELINE = 1.20
-
-    yellow_ratio = YELLOW["sharpe_ratio"] / DETERMINISTIC_BASELINE
-    red_ratio = RED["sharpe_ratio"] / DETERMINISTIC_BASELINE
-
-    # YELLOW ≈ 75% of baseline (0.90 / 1.20)
-    assert abs(yellow_ratio - 0.75) < 0.05, (
-        f"YELLOW Sharpe / 1.20 = {yellow_ratio:.3f}, expected ~0.75 "
-        f"(P8-α-1 operator anchor — see docs/dialog/ round 54)"
+    assert YELLOW["sharpe_ratio"] == 1.00, (
+        f"YELLOW Sharpe = {YELLOW['sharpe_ratio']}, expected 1.00 "
+        f"(P10-2 anchor — see docs/dialog/ round 70 + decision_log P10-2 chain)"
     )
-    # RED ≈ 42% of baseline (0.50 / 1.20)
-    assert abs(red_ratio - 0.42) < 0.05, (
-        f"RED Sharpe / 1.20 = {red_ratio:.3f}, expected ~0.42 "
-        f"(P8-α-1 operator anchor — see docs/dialog/ round 54)"
+    assert RED["sharpe_ratio"] == 0.50, (
+        f"RED Sharpe = {RED['sharpe_ratio']}, expected 0.50 "
+        f"(P10-2 anchor — severe degrade ≈ worst-case 1.67 / 3)"
     )
 
     # MaxDD lock — operator tightened from -42/-50 to -30/-40 to model
-    # live slippage / overnight gap risk > backtest sim.
+    # live slippage / overnight gap risk > backtest sim (P8-α-1, unchanged in P10-2).
     assert YELLOW["max_drawdown_pct"] == -30.0, (
-        f"YELLOW Max DD = {YELLOW['max_drawdown_pct']}, expected -30.0 "
-        f"(P8-α-1 operator anchor)"
+        f"YELLOW Max DD = {YELLOW['max_drawdown_pct']}, expected -30.0"
     )
     assert RED["max_drawdown_pct"] == -40.0, (
-        f"RED Max DD = {RED['max_drawdown_pct']}, expected -40.0 "
-        f"(P8-α-1 operator anchor)"
+        f"RED Max DD = {RED['max_drawdown_pct']}, expected -40.0"
     )

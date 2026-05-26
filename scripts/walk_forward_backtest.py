@@ -145,7 +145,7 @@ assert REBALANCE_POLICY in ("on_change", "drift_threshold"), \
 # 0.2 extreme), which is what daily_report.py and paper_trade.py actually use.
 # Validating "blend" here is the missing piece — until this completes we
 # don't know if BlendRanker matches/beats StockRanker on the same backtest.
-RANKER_KIND = os.environ.get("RANKER_KIND", "stock")
+RANKER_KIND = os.environ.get("RANKER_KIND", "blend")  # P10-2: default to production path (BlendRanker) — see Rule #11
 assert RANKER_KIND in ("stock", "blend"), f"Unknown RANKER_KIND={RANKER_KIND}"
 
 # Position-sizing scheme for the Top-K selection.

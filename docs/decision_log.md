@@ -204,3 +204,62 @@ P10-2 candidate: pick one of (a)/(b), commit it, update weekly cron + threshold 
 | 66 | Advisor green light (after user reads `framework_evaluation.md`) | Ran 6 BlendRanker A/B (OLD/NEW × seeds 42/43/44), verified env per Rule #9 |
 | 67 | Engineer reports +0.26 spread + direction reversal of P9-0 + Catch #8 partial retraction | Advisor (a) decision: production correct, P10-CLOSE, write Catch #10 + Rule #10 |
 | 68 | This commit | Decision log update (~40 lines added to ## P10 chain section) |
+
+## P10-2 chain · measurement default + threshold re-anchor + Rule #11 (2026-05-26)
+
+### Trigger
+
+User round 70 follow-up: 5 nuances after reading P10-1 outcome.
+1. seed 44 NEW Sharpe lift (1.61→1.67) is 100% vol-compression (annual went DOWN); winsorize on seed 44 is vol-smoother only, not alpha-adder. NEW config cross-seed σ (0.130) is ~3× OLD (0.047).
+2. BASELINE.md has been walked back 3 times (1.90 P2 → 1.20 P7-γ → 1.18 P9-CLOSE) — each time the measurement layer changed but the doc lagged. Need definitive N=3 BlendRanker distribution lock.
+3. Root cause: `RANKER_KIND` default = `"stock"` in `scripts/walk_forward_backtest.py:148`. Weekly cron measures StockRanker (1.18), but production loads BlendRanker (1.82). All threshold anchoring + report narrative read the wrong measurement.
+4. `framework_evaluation.md` retraction (advisor `a60ab4c` footer) needs a stronger conclusion-header marker.
+5. New permanent **Rule #11** required: measurement ranker must equal production ranker.
+
+### Action (single bundle, 1 commit)
+
+- **(A) walk_forward default fixed**: `scripts/walk_forward_backtest.py:148` `RANKER_KIND` default changed from `"stock"` → `"blend"`. Single line + comment cross-ref. Weekly cron from now on measures the same path as production.
+- **(A-verify)** Re-ran walk_forward with no `RANKER_KIND` env to confirm default works: Sharpe 1.90 / annual 60.42% / vol 31.85% — byte-identical to P10-1 NEW seed 42 ✓ → P10-2 fix produces the production-realized baseline as default measurement.
+- **(B) `data/reports/BASELINE.md` ★ table rewritten** for the 3rd time: replaced single-point 1.20 row with N=3 BlendRanker distribution (1.90 / 1.89 / 1.67, mean 1.82, std 0.13). Annual / vol / max_dd 3×3 matrix included. Old Deterministic Baseline History sections preserved (1.90 lucky tail + 1.20 P7-γ re-baseline rationale) — they are historically valid but superseded.
+- **(B-bis) BASELINE §4.1 threshold row** updated: Sharpe baseline `1.90 → 1.82 (N=3 mean; 1.67 worst-seed)`, YELLOW `1.4 → 1.0`, RED `0.9 → 0.5`.
+- **(C) `mp/monitor/threshold_alert.py`** YELLOW Sharpe re-anchored `0.90 → 1.00` (per N=3 worst-seed 1.67 anomaly threshold). RED stays `0.50` (severe degrade ≈ worst-case / 3). MaxDD thresholds unchanged.
+- **(C-test) `tests/test_threshold_alert.py`** anchor lock test rewritten: `test_thresholds_anchored_to_120 → test_thresholds_anchored_to_p10_distribution`. Asserts YELLOW Sharpe = 1.00 + RED Sharpe = 0.50 per P10-2 round 70. 10/10 tests pass.
+- **(D) `data/reports/framework_evaluation.md`** added "🚨 retraction notice" block at the head of "## 十、结论" pointing readers to P10-1 reversal before they read the now-superseded narrative.
+- **(E)** This decision_log section (THIS COMMIT).
+
+### Rule #11 (new permanent)
+
+walk_forward measurement's `RANKER_KIND` MUST equal what production (`paper_trade.py`, `daily_report.py`) actually loads. Current production = **single BlendRanker** (since `data/ensemble/` is empty; `paper_trade.log` `Using single BlendRanker (no ensemble found)`). Current measurement default (post-P10-2) = BlendRanker. ✓ aligned.
+
+**If future work re-enables the EnsembleBlendRanker path** (re-populating `data/ensemble/seed_X/blend_*.lgb`), walk_forward must add an equivalent `RANKER_KIND=ensemble` mode (or in-script averaging) to keep alignment. The 2026-05-24 `data/ensemble.deprecated_*` directory move documents one direction of this; the inverse must trigger Rule #11 re-check.
+
+**Until alignment is verified**, any A/B / regression / drift report must prefix:
+
+> *(measurement ranker = X, production ranker = Y, results not directly comparable; see Rule #11)*
+
+Companion to Rule #9 (env consume verify) and Rule #10 (A/B single-variable isolation). The pattern: catches #7 / #8 / #10 all rooted in **measurement layer != claimed measurement layer**; Rule #11 makes the alignment explicit and checkable.
+
+### Catch #11 (advisor, P10-2 round 70 衍生)
+
+P10-1 NEW seed 44: annual 51.66% (lower than OLD seed 44 annual 54.05% by 2.4pp), vol 30.93% (8% compression vs OLD's 33.59%). Sharpe lift 1.61→1.67 (+0.06) is **entirely vol-denominator compression**, not return improvement. Winsorize on seed 44 only smooths the ride; on seeds 42/43 it does both (return + vol).
+
+NEW config cross-seed σ (0.130) is roughly 3× OLD's (0.047). Seed 44 outlier behavior is consistent with the P3-1d β0 spike (BASELINE seed-stability caveat, row 23, 36) and P7-β nondeterminism investigation (row 34) — same model, same seed family, different sample-level interaction with the rare 2023-03 catalyst (row 24).
+
+**Implication**: production locks `LGBM_SEED=42 = 1.90` Sharpe — the top of the N=3 distribution. If a future panel/multi-seed averaging exercise picks any seed in the 42/43/44 family, ~33% probability of landing near 1.67 (worst-seed). 1.67 is still > OLD's mean 1.557, so winsorize is net-positive; but the realized 1.90 is not robust to seed-resampling without ensemble averaging.
+
+### Decision: lock new measurement default + new thresholds; no production .lgb change
+
+- `data/blend_*.lgb` retained at current state (P10-1 already confirmed; reaffirmed by P10-2 verify run byte-perfect to NEW seed 42 = 1.90)
+- Weekly cron now measures the production path by default (no `RANKER_KIND` env needed)
+- Threshold alerts re-anchored against the N=3 worst-seed (`1.67 → YELLOW 1.0 (anomaly: below worst-seed normal by 0.67)`; `RED 0.5` ≈ severe degrade)
+- γ live-trading path: same as P10-CLOSE — winsorize HELPS (not "known worse" or "no-op"); β-prep landed; β-3 user-action is the remaining external gate
+
+### Commits
+
+- `_THIS_COMMIT_` — P10-2: walk_forward default RANKER_KIND=blend + BASELINE.md 3rd rewrite + threshold_alert re-anchor + framework_evaluation retraction + Rule #11 + Catch #11. Single bundle commit covering all 5 actions A-E + test update.
+
+### Audit trail (round 70)
+
+| Round | Trigger | Engineer action |
+|---|---|---|
+| 70 | Advisor 5-item bundle spec (P10-2/3) | (A) 1-line default fix + verify byte-identical, (B) BASELINE.md 3rd rewrite, (C) threshold_alert re-anchor + test update, (D) framework_evaluation retraction marker, (E) this decision_log section |
