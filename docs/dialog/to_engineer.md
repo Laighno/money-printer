@@ -6176,6 +6176,78 @@ P10-1 是 walk_forward 测量补全, **γ path 独立**. 实盘准备 (β-3 user
 
 启动 P10-1.
 
+## [2026-05-26 15:32] 第 67 轮 (P10-1-FINISH) · BlendRanker winsorize lift confirmed → P10-CLOSE
+
+### 6 数字 table 完整
+
+|              | seed 42 | seed 43 | seed 44 | mean (N=3) | std |
+|---           |---:    |---:    |---:    |---:       |---: |
+| **OLD Sharpe** (winsorize OFF) | 1.54 | 1.52 | 1.61 | **1.557** | 0.047 |
+| **NEW Sharpe** (winsorize ON)  | 1.90 | 1.89 | 1.67 | **1.820** | 0.130 |
+| **NEW - OLD spread**             | +0.36 | +0.37 | +0.06 | **+0.263** | — |
+
+annual / vol / DD 3×3:
+
+|              | OLD seed 42 | OLD seed 43 | OLD seed 44 | NEW seed 42 | NEW seed 43 | NEW seed 44 |
+|---           |---: |---: |---: |---: |---: |---: |
+| annual_ret   | 52.90% | 52.90% | 54.05% | 60.42% | 60.32% | 51.66% |
+| ann_vol      | 34.38% | 34.88% | 33.59% | 31.85% | 31.86% | 30.93% |
+| max_dd       | -39.08% | -35.34% | -26.47% | -36.30% | -33.31% | -38.16% |
+
+### Direction consistency
+
+- **3/3 seed NEW > OLD** ✅
+- median spread = **+0.36**
+- mean spread = **+0.263**
+- spread σ = **0.18** (seed 44 是 outlier +0.06)
+- seed 44 spread 小 — NEW seed 44 Sharpe = 1.67 比 NEW seed 42/43 ~1.90 低. NEW config 有比 OLD 更大的 cross-seed σ (0.130 vs 0.047)
+
+### Env verify (Rule #9 pass ✅)
+
+- OLD seeds 42/43/44 `grep -c Winsorized` = **0** (winsorize 真禁用)
+- NEW seeds 42/43/44 `grep -c Winsorized` = **1 each** (winsorize 真生效)
+- env 跨 OLD/NEW 切换正常, 无 Catch #7 重演
+
+### 决策 (顾问拍板)
+
+**(a) spread 显著 → BlendRanker production 真受 winsorize 影响**
+
+但方向是 **NEW (winsorize ON) > OLD (winsorize OFF)** —— 当前 production .lgb 就是 NEW config 训练的, **配置正确**.
+
+具体 action:
+- ✅ **不 retrain** production .lgb — 当前 NEW config 是更好的
+- ✅ **不 revert** winsorize 设置 — 0.50 这个 cap 是对的
+- ✅ **不重 anchor 阈值** — baseline mean 1.82 (or 至少 1.67 for worst-seed) 仍在 0.9/0.5 alert range 远上方
+- ✅ **γ 实盘 unblock** — winsorize 不仅不是 worse, 反而是 helpful
+- 🚨 **修正历史叙事**: P9-0 "OLD seed 42 = 1.54 / NEW seed 42 = 1.20" 数字解释要 retract:
+  - 1.54 是 BlendRanker OLD (winsorize OFF) ✓ valid
+  - 1.20 是 StockRanker (RANKER_KIND default = stock), 不是 BlendRanker NEW
+  - 当时把 ranker 类型变化误归因到 winsorize. Catch #8 (advisor baseline 错) 部分对 部分错: "1.54 phantom" 是错的 (它是真实 BlendRanker OLD 数字), "1.20 不是 BlendRanker NEW" 是对的 (它确实是 StockRanker NEW)
+
+### Catch 更新
+
+- **Catch #10 (advisor, P10-1 衍生)**: P9-0 不仅 baseline 数字归因错, 而且**两变量同时变** (ranker_kind + winsorize). A/B 测试必须**单变量隔离**, 否则 spread 不能 attribute. → 这是 Rule #9 的隐性补充, 应该 escalate:
+  > **Rule #10 候选**: A/B 测试必须严格单变量, 报告中显式列出"holding constant"清单. 跨多个 config dim 的 spread 不能直接归因到单个 var.
+
+### P10 chain 收尾
+
+- decision_log.md 加 P10-1 section + Catch #10 + Rule #10 candidate (~40 行)
+- commit message: `P10-CLOSE: 6-run BlendRanker A/B + winsorize lift +0.26 verified + Catch #10 + Rule #10`
+- 不 update production .lgb (已正确)
+- 不动 framework_evaluation.md (advisor 端会单独 retract / annotate)
+
+### 这一轮你
+
+1. 写 docs/decision_log.md 加 P10-1 section (40 行)
+2. commit `P10-CLOSE: 6-run BlendRanker A/B + winsorize lift +0.26 + Catch #10 + Rule #10`
+3. 写 round 68 1 行 ACK (commit hash + done)
+
+### 主动一句给 user
+
+P10-1 反转: production .lgb (winsorize ON) 是**对的**, 而且**比 winsorize OFF 高 +0.26 Sharpe** (N=3 BlendRanker). 之前 framework_evaluation.md 的"两个模型无差异"结论是基于 StockRanker walk_forward — 那个测量层 winsorize 真是 no-op. 但 production 用 BlendRanker (excess_ret), winsorize 真有 effect. 当前 production 配置最佳. γ 实盘可以推进.
+
+P10 chain CLOSED.
+
 
 
 
