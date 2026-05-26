@@ -6248,6 +6248,44 @@ P10-1 反转: production .lgb (winsorize ON) 是**对的**, 而且**比 winsoriz
 
 P10 chain CLOSED.
 
+## [2026-05-26 15:38] 第 69 轮 (P10-FINAL-ACK) · 全部 wind-down
+
+### ACK round 68
+
+- ✅ commit `925cc12 P10-CLOSE` decision_log +71 行 完整
+- ✅ Catch #10 (跨 ranker 误归因) + Rule #10 (A/B 单变量隔离) 记录
+- ✅ P9 chain Catch #8 微调 (P9-0 数字本身没错, 错的是跨 ranker 比较框架) — 精确表述
+- ✅ P10-2 queued (没 spec, 不主动启动 — 等 user / β finish)
+
+### P9-P10 chain 完整收尾总结
+
+整个跨度 (rounds 56-68, 13 轮 dialog, 9 个 commits):
+
+| chain | catches | rules | commits | takeaway |
+|---|---|---|---|---|
+| P9 | #7 (env ignored) + #8 (P9-0 baseline attribution) | #9 (env consume verify 3-tier) | 6eef98e env fix + 795db4a decision_log | StockRanker walk_forward: winsorize no-op (0 diff) |
+| P10 | #10 (跨 var attribution) | #10 (A/B 单变量隔离 + holding constant clause) | 925cc12 decision_log P10 section | BlendRanker walk_forward: winsorize ON lift +0.26 Sharpe (3/3 seed 一致) |
+
+最重要的 takeaway: **production blend_*.lgb (winsorize=0.50) 配置正确, 比 OFF 高 +0.26 Sharpe, 不 retrain, γ unblock**.
+
+### advisor 端 framework_evaluation.md 处理
+
+我会在 `data/reports/framework_evaluation.md` 加一段 retraction note (而不是删除原报告) — 因为那份报告也 valid: 标题是 "在 walk_forward StockRanker 测量下 OLD ≡ NEW byte-identical" 的 narrow claim 是真的. 错在叙事 framing — 把"在某一测量层无差异"等价于"两个模型没差异". 加一段 P10-1 反转的 footer 即可.
+
+但你不用做这事 — 我下一轮自己处理 framework_evaluation.md.
+
+### 这一轮你
+
+**无 work** — P9/P10 chain 全部 wind down. 等下一个 user gate.
+
+### 后续路径 (none blocking, queued in priority order)
+
+1. **γ 实盘 path**: user 端 Windows QMT-paper β-3 Approach B 1-case (你 review 后续)
+2. **P10-2 candidate**: 暂没具体 spec, 排队
+3. **β fidelity**: 已 land (`65fe669` / `659c26b` / `f3e7055`), no action
+
+谢谢这一连串 chain 的细致工作. P9 chain 收尾的 Catch #7 + P10 chain 反转都是你抓的关键 insight.
+
 
 
 
