@@ -55,3 +55,81 @@ For active follow-ups not yet decided, see [docs/TODO.md](TODO.md).
 - **rule** — process rule, not a code change
 - **superseded** — overruled by a later decision; kept for git history
 - **reverted** — removed from HEAD by a later commit
+
+## P9 chain · winsorize A/B re-evaluation (2026-05-26)
+
+### Triggering claim (P9-0)
+
+Advisor baseline: "winsorize lift +0.37 Sharpe (OLD seed 42 = 1.54 / NEW seed 42 = 1.20)" — used as starting point for P9 revert chain. Later proven phantom (see Catch #8 below).
+
+### Final finding
+
+N=3 deterministic A/B (seeds 42/43/44, default `walk_forward_backtest.py` path = `RANKER_KIND=stock` / StockRanker / `fwd_ret` label, post-commit `6eef98e`):
+
+| Config | seed 42 | seed 43 | seed 44 | mean (N=3) | std |
+|---|---:|---:|---:|---:|---:|
+| OLD (winsorize OFF, `EXCESS_CAP=999.0`) | 1.20 | 1.29 | 1.06 | 1.183 | 0.117 |
+| NEW (winsorize ON, `EXCESS_CAP=0.50`) | 1.20 | 1.29 | 1.06 | 1.183 | 0.117 |
+| OLD − NEW | 0.00 | 0.00 | 0.00 | 0.00 | — |
+
+annual / vol metrics also byte-identical OLD vs NEW for all 3 seeds. Winsorize on/off has **no effect** under StockRanker walk_forward path.
+
+`deterministic=True, PYTHONHASHSEED=0, LGBM_SEED ∈ {42,43,44}, num_threads=1, WF_FEATURE_PRESET=W_BASELINE`. EXCESS_CAP env honored confirmed via `grep -c Winsorized` == 0 for OLD runs vs == 1 for NEW runs.
+
+### Permanent rules / catches added
+
+- **Catch #7** (engineer): `EXCESS_CAP` env var override was silently ignored before commit `6eef98e` — `mp/ml/dataset.py:198` had `EXCESS_CAP = 0.50` hard-coded with no `os.getenv` reader. Round 60 spec attempted to disable winsorize via env; all 4 runs ended up with default winsorize on. Detected via byte-identical compare of intended-OLD vs intended-NEW runs (identical Sharpe/annual/vol = override ignored).
+- **Catch #8** (advisor): P9-0 "OLD seed 42 = 1.54" not reproducible. Public retraction of the baseline number. Hypothesis (II) data-refresh ruled out (parquet files don't enter walk_forward training pipeline per `grep` of `fund_flow|margin|northbound` in dataset.py/model.py). Hypothesis (IV) — data entry error — likeliest, since `540630d` already locked "P7-γ deterministic re-baseline 1.20" which is inconsistent with P9-0 "OLD=1.54".
+- **Rule #9** (new permanent rule): any env var / CLI flag override used for A/B testing must verify the override is actually consumed before reporting deterministic numbers. 3-tier verification:
+  1. **grep behavior log** for the override's downstream side-effect (e.g. `grep Winsorized` should be empty when `EXCESS_CAP=999.0`).
+  2. **byte-identical compare** two runs across different configs — same metrics = override ignored (strong signal).
+  3. **code audit** for `os.environ.get` / `argparse` chain reading the override.
+
+### Open question (P10 candidate)
+
+walk_forward (default `RANKER_KIND=stock`) measures StockRanker on `fwd_ret` label. **Production** uses BlendRanker on `excess_ret` label (`scripts/paper_trade.py:56`, `data/blend_primary.lgb`, `data/blend_extreme.lgb`) — winsorize **is** active on production training data. P9 finding "winsorize no-op" therefore only proven for the measurement path, NOT for production. Measurement-to-production gap is the P10-1 candidate chain (queued, see below).
+
+### Decision: no production change
+
+- `data/blend_primary.lgb` / `data/blend_extreme.lgb` / `data/model.lgb` / `data/model_60d.lgb` **not retrained** (P9-0 phantom; winsorize finding only covers measurement, not production)
+- Threshold alerts (`mp/monitor/threshold_alert.py`) **not re-anchored** (baseline 1.18 still in YELLOW=0.9 / RED=0.5 alert region — pre-P9 status preserved)
+- γ live-trading path **unblock**: previous "winsorize is known worse" pause reason is now invalid. β-prep commits (65fe669 / 659c26b / f3e7055) provide fidelity test + emergency liquidate; β-3 user-action (Windows VNC QMT-paper, 1-case Approach B) remains the next gate.
+
+### Commits
+
+- `6eef98e` — P9-2: EXCESS_CAP env-readable for A/B testing (`mp/ml/dataset.py` +1 line `import os` +1 line `os.getenv` body). 1 commit total for P9 code change.
+
+### Audit trail (rounds 60-63, docs/dialog/to_engineer.md + to_advisor.md)
+
+| Round | Trigger | Engineer action |
+|---|---|---|
+| 60 | Advisor B+ spec (4 deterministic runs) | Ran Run 1/2/3; detected Catch #7 via Run 1 ≡ Run 3 byte-identical; halted Run 4; wrote emergency report |
+| 61 | Advisor ACK Catch #7 + chose (B) env fix | Commit 6eef98e; ran 4 new runs (A/B/C/D); detected Catch #8 (OLD seed 42 ≠ 1.54); wrote 6-number table report |
+| 62 | Advisor ACK Catch #8 + chose (α)(γ) closure | Ran NEW seed 42 v2 verify — byte-identical to OLD seed 42; wrote P9-close report |
+| 63 | Advisor ACK P9 close + decision_log spec | This decision_log section + P10-1 queued section (THIS COMMIT) |
+
+## P10-1 candidate · measurement-to-production gap (queued)
+
+### Problem
+
+walk_forward Sharpe baseline = 1.18 (StockRanker, `fwd_ret` label) does not directly proxy production behavior. Production uses BlendRanker on `excess_ret` label with winsorize active. Winsorize impact on the BlendRanker path is untested — P9 closed without measuring it.
+
+### Proposed minimal P10-1 (N=3 deterministic, walk_forward)
+
+- Run `RANKER_KIND=blend EXCESS_CAP=999.0 LGBM_SEED=42/43/44` (3 runs, no-winsorize blend)
+- Run `RANKER_KIND=blend` (default `EXCESS_CAP=0.50`) `LGBM_SEED=42/43/44` (3 runs, winsorize blend)
+- 6-number table: OLD blend Sharpe vs NEW blend Sharpe
+- If significant spread → winsorize **is** material on the production-path measurement
+- If byte-identical → winsorize is a no-op irrespective of ranker (stronger conclusion than P9)
+
+### Time estimate
+
+6 runs × 8 min ≈ 48 min walk_forward runtime + 10 min report. ~1 hour wall-clock.
+
+### Not blocking γ
+
+γ uses `paper_trade.py` as production-path measurement (BlendRanker live). P10-1 is supplementary walk_forward coverage of BlendRanker. Two paths independent.
+
+### Defer trigger
+
+Queued, not started. Will activate after β-prep finishes (user QMT-paper Approach B) or by explicit advisor green light. P9 chain is closed.
