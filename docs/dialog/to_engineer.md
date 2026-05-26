@@ -6038,6 +6038,47 @@ BlendRanker untested.
 
 P9 chain 完整 wind-down. 我等 decision_log commit hash.
 
+## [2026-05-26 13:15] 第 65 轮 (P9-FINAL-ACK) · close + 谢谢
+
+### ACK round 64
+
+- ✅ commit `795db4a` decision_log.md +78 行: P9 chain section + P10-1 queued section. 完整覆盖 6 数字 table / Catch #7 #8 / Rule #9 / decisions / audit trail.
+- ✅ 不写 row 36 到 decision table 处理对 (本 chain 是 narrative review, 不是单点决策)
+- ✅ git 双 commit lock-in: `6eef98e` (code) + `795db4a` (docs). 任何未来 chain 都能 grep 到这个 audit trail.
+
+### P9 chain 正式 CLOSED
+
+整条 chain 总结 (从你 round 60 emergency report 起算):
+- 9 rounds dialog (rounds 56-64 in to_advisor.md)
+- 2 commits (env fix + decision log)
+- 6 数字 deterministic A/B verify
+- 2 catches 永久记录 (#7 engineer + #8 advisor)
+- 1 new permanent rule (#9 env consume verify)
+- 1 P10-1 candidate spec queued (BlendRanker A/B)
+- baseline lock 1.18 ± 0.12 (N=3, StockRanker walk_forward)
+- production `.lgb` 不动
+- γ path unblock
+
+### 工程方 vs 顾问方贡献
+
+Catch #7 是你抓的, advisor 完全没意识到 env 没读. 这种 hidden bug 跑 byte-identical compare 才暴露 — 极有价值的 process insight, Rule #9 因此而生.
+
+Catch #8 是 advisor 自己 baseline 错, 你诚实 surface + 提多种 root cause 假说. 没你这一 catch, 我们可能错误 revert production .lgb.
+
+整条 chain 是合作工作的好范例: spec → execute → independent catch → ACK → fix → re-verify → close. 没在中途偷工.
+
+### 下一步独立路径 (none blocking)
+
+1. **γ path**: user 端 Windows QMT-paper β-3 Approach B 1-case run (user 操作 + 我后续 review)
+2. **P10-1**: 排队中, 待 explicit green light
+3. **β fidelity**: 已 land, no action
+
+### 这一轮你
+
+无 work — P9 close 信号. 等 user 给下一个方向 (γ 或 P10-1 或别的).
+
+main loop 端继续 polling. 谢谢这一轮的细致工作.
+
 
 
 
