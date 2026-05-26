@@ -8,6 +8,7 @@ model training / prediction.
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, List, Optional
 
@@ -195,7 +196,7 @@ EXCESS_LABEL = "excess_ret"
 # here because round-11 walk-forward (with winsorize active) reproduced
 # Sharpe 1.90 at 64-feature scale vs 1.53 without it. See P2-fix-1 commit
 # message for full caveats. Tuning is a P3 question.
-EXCESS_CAP = 0.50
+EXCESS_CAP = float(os.getenv("EXCESS_CAP", "0.50"))
 
 # Curated factors selected by cross-sectional IC analysis (|ICIR| >= 0.15).
 # 34 noise factors removed — improves out-of-sample generalization.
