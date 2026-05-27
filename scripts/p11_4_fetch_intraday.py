@@ -162,28 +162,49 @@ def _fetch_one_month(
     end_str = month_end_excl.strftime("%Y%m%d000000")
 
     # Step a — ensure local cache covers this month (throttled).
-    # Chunked download_history_data2: 800-code single batch hangs in production
-    # (silently dies around code 100-200). Split into 100-code chunks.
-    logger.info("[{}] download_history_data2 for {} codes (chunks of 100)...", yyyymm, len(xt_codes))
+    # Chunked download_history_data2 with thread-based timeout. xtquant has a
+    # nasty habit of hanging on some chunks (production reproducibly hangs
+    # around chunks 4-5 after restart). Run each chunk in a daemon thread with
+    # a 30s wall clock — if it doesn't return, skip the chunk. Some codes will
+    # silently fall through to get_market_data; whatever's cached gets saved.
+    import threading
+    logger.info("[{}] download_history_data2 for {} codes (chunks of 50, 30s timeout)...",
+                yyyymm, len(xt_codes))
     t0 = time.time()
-    chunk_size = 100
+    chunk_size = 50
+    chunk_timeout_s = 30.0
+
+    def _chunk_worker(stock_list, done_event):
+        try:
+            xtdata.download_history_data2(
+                stock_list=stock_list, period="1m",
+                start_time=start_str, end_time=end_str,
+                callback=lambda d: None,
+            )
+        except Exception as e:
+            logger.warning("[{}] chunk inner exception: {}", yyyymm, e)
+        finally:
+            done_event.set()
+
+    timed_out = 0
     for chunk_start in range(0, len(xt_codes), chunk_size):
         chunk = xt_codes[chunk_start:chunk_start + chunk_size]
         chunk_t0 = time.time()
-        last_msg = {"msg": ""}
-        def _cb(d):
-            last_msg["msg"] = d.get("message", "")
-        try:
-            xtdata.download_history_data2(
-                stock_list=chunk, period="1m",
-                start_time=start_str, end_time=end_str,
-                callback=_cb,
-            )
-        except Exception as e:
-            logger.warning("[{}] chunk {}-{} failed: {}", yyyymm, chunk_start, chunk_start + len(chunk), e)
-        logger.info("[{}]   chunk {}-{} done in {:.1f}s (last: {})",
-                    yyyymm, chunk_start, chunk_start + len(chunk), time.time() - chunk_t0, last_msg["msg"])
-    logger.info("[{}] download completed in {:.1f}s", yyyymm, time.time() - t0)
+        done_event = threading.Event()
+        worker = threading.Thread(target=_chunk_worker, args=(chunk, done_event), daemon=True)
+        worker.start()
+        worker.join(timeout=chunk_timeout_s)
+        elapsed = time.time() - chunk_t0
+        if done_event.is_set():
+            if chunk_start % 200 == 0 or chunk_start + chunk_size >= len(xt_codes):
+                logger.info("[{}]   chunk {}-{} done in {:.1f}s",
+                            yyyymm, chunk_start, chunk_start + len(chunk), elapsed)
+        else:
+            timed_out += 1
+            logger.warning("[{}]   chunk {}-{} TIMED OUT after {:.0f}s — skip & continue",
+                           yyyymm, chunk_start, chunk_start + len(chunk), elapsed)
+    logger.info("[{}] download completed in {:.1f}s ({} chunks timed out)",
+                yyyymm, time.time() - t0, timed_out)
 
     # Step b — read back from local cache.
     # Round 89 fix: use get_market_data (returns dict[field → DataFrame[time × codes]])
