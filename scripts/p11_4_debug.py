@@ -1,32 +1,46 @@
 from xtquant import xtdata
-import time
+import inspect
 
-print("xtdata module loaded")
+print("Available download-related functions in xtdata:")
+for name in sorted(dir(xtdata)):
+    if 'download' in name.lower():
+        if not name.startswith('_'):
+            print(f"  {name}")
 
-# Test 1: download single
-code = "000001.SZ"
-print(f"Calling download_history_data({code!r}, '1m', '20240102093000', '20240105153000')...")
-t0 = time.time()
-ret = xtdata.download_history_data(code, "1m", "20240102093000", "20240105153000")
-print(f"  returned: {ret!r}, took {time.time()-t0:.2f}s")
+print()
+print("xtdata.download_history_data:")
+try:
+    sig = inspect.signature(xtdata.download_history_data)
+    print(f"  sig: {sig}")
+except (ValueError, TypeError) as e:
+    print(f"  inspect failed: {e}")
+print(f"  doc: {(xtdata.download_history_data.__doc__ or '(none)')[:500]}")
 
-# Test 2: read back
-print(f"Calling get_local_data...")
-t0 = time.time()
-raw = xtdata.get_local_data(
-    field_list=["open", "high", "low", "close", "volume"],
-    stock_list=[code],
-    period="1m",
-    start_time="20240102093000",
-    end_time="20240105153000",
-    count=-1,
-    dividend_type="none",
-    fill_data=False,
-)
-print(f"  returned type: {type(raw).__name__}, took {time.time()-t0:.2f}s")
-if isinstance(raw, dict):
-    for k, v in raw.items():
-        print(f"  {k}: type={type(v).__name__}, shape={getattr(v, 'shape', 'N/A')}")
-        if hasattr(v, 'head'):
-            print(v.head(3))
-            print(f"  index: {v.index[:5].tolist() if len(v.index) >= 5 else v.index.tolist()}")
+for fn_name in ['download_history_data2', 'download_history_data_callback']:
+    if hasattr(xtdata, fn_name):
+        fn = getattr(xtdata, fn_name)
+        print(f"\n{fn_name}:")
+        try:
+            print(f"  sig: {inspect.signature(fn)}")
+        except (ValueError, TypeError) as e:
+            print(f"  sig fail: {e}")
+        print(f"  doc: {(fn.__doc__ or '(none)')[:500]}")
+
+# Try the actual download with callback to see what's happening
+print()
+print("Trying download_history_data2 with callback:")
+results = []
+def cb(data):
+    results.append(data)
+    print(f"  callback got: {data!r}")
+
+if hasattr(xtdata, 'download_history_data2'):
+    ret = xtdata.download_history_data2(
+        stock_list=["000001.SZ"],
+        period="1m",
+        start_time="20240102",
+        end_time="20240105",
+        callback=cb,
+    )
+    print(f"  download_history_data2 returned: {ret!r}")
+    print(f"  callback fired {len(results)} times")
