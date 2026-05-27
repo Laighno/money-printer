@@ -6610,6 +6610,74 @@ Production 9:30-entry path (current) keeps running unchanged. P11 is a
 parallel candidate, gated on positive walk_forward Sharpe diff before
 any real-money cutover.
 
+### Pre-investigation already done (advisor side, 2026-05-27 ~11:00)
+
+User asked about data sources. I probed:
+
+1. **akshare `stock_zh_a_hist_min_em`**: **NO HISTORICAL data**. Returns
+   today's intraday only; any past-date query returns 0 rows. Confirmed
+   via `/tmp/akshare_intraday_probe.py` on Mac (proxy-bypassed).
+
+2. **xtdata `get_local_data` 1m**: **5+ years of history available**
+   for 002439.SZ on ECS QMT install:
+   - today: 85 bars
+   - 30 days back: 4,664 bars (~155/day avg)
+   - 6 months: 27,800 bars
+   - 1 year: 58,407 bars
+   - 3 years: 58,458 bars
+   - 5 years: 58,458 bars (plateau — likely backfill window limit)
+
+   Caveat: 1 year ≈ 3 year ≈ 5 year results suggest QMT local cache has
+   ~1 year of deep history despite the API accepting earlier start dates.
+   Worth verifying with `download_history_data` to backfill if needed.
+
+3. User explicit fallback when data missing: **"拿不到的价格按收盘价算,
+   交易额估个百分比"** — when intraday data unavailable, proxy with EOD
+   close + volume × 0.75 (rough morning fraction).
+
+### Implications for P11-1 (feature pipeline)
+
+- **Primary path**: use xtdata to backfill 1m history for full universe
+  ZZ500+HS300 (~800 codes) × 1+ year. This is the clean approach.
+- **Fallback for codes/dates where xtdata fails**: use EOD daily bar
+  data with leak-aware fudge factors:
+  - `morning_return` ≈ `(close - open)` × 0.85 (assume ~85% of move by
+    14:30)
+  - `morning_volume` ≈ `volume` × 0.75 (assume ~75% of vol by 14:30)
+  - `morning_high/low` ≈ scale daily H/L toward open by 0.85
+- Document approximation explicitly in `mp/ml/intraday_features.py`
+  module docstring + feature column with `_approx` suffix when relevant.
+
+### Other features worth considering at 14:30
+
+Beyond the 64 existing daily features (which become "feature at T close"
+under the proxy), consider adding:
+
+- **Overnight gap**: `(T_open - T-1_close) / T-1_close` — CLEAN, no leak
+  (open price is known at 9:30 sharp). High signal in A股 (gap-up/down
+  tells a lot about overnight sentiment).
+- **Morning return**: `(T_14:30_close - T_open) / T_open` — real if xtdata
+  has 14:30 bar, else proxied.
+- **Morning VWAP / close ratio**: `morning_VWAP / 14:30_close`. Real if
+  xtdata, proxied as `(amount / volume) / close` from daily.
+- **Morning vol vs 20d avg**: surge detection.
+- **Morning H/L range**: vola signal.
+- **Sector relative strength so far**: stock 14:30 return vs sector 14:30
+  return. Useful for industry rotation strategy.
+- **Index 14:30 return**: ZZ500 / HS300 14:30 return — market beta context.
+
+### Updated 这一轮你
+
+1. ACK round 73 P11-START (1 line)
+2. Start P11-1. Use xtdata as primary, document proxy fallback for
+   missing data. Suggested 5-7 new features (overnight_gap clean, morning_*
+   approx where needed).
+3. Run download_history_data probe at full universe scale to estimate
+   data completeness before writing features. If <80% codes have full year
+   of 1m data, fall back more heavily on EOD proxy with leak warnings.
+4. STOP at end of P11-1 with round 74 report: feature column schema +
+   data availability stats + leak/approximation caveats.
+
 
 
 
