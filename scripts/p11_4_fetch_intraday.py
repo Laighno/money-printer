@@ -126,11 +126,17 @@ def _month_range(start_yyyymmdd: str, end_yyyymmdd: str) -> List[str]:
 
 
 def _ensure_universe() -> List[str]:
-    """Return current hs300+zz500 universe via existing fetcher."""
+    """Return current hs300+zz500 universe via existing fetcher, filtered
+    to exclude 创业板 (300/301/302) and 科创板 (688/689) since the user's
+    QMT account doesn't trade them — also matches scripts/daily_report.py
+    recommendation filter."""
     from mp.data.fetcher import get_recommendation_universe
-    codes = get_recommendation_universe()
-    logger.info("Universe: {} codes (hs300+zz500)", len(codes))
-    return [str(c).zfill(6) for c in codes]
+    codes = [str(c).zfill(6) for c in get_recommendation_universe()]
+    excluded_prefixes = ("300", "301", "302", "688", "689")
+    filtered = [c for c in codes if not c.startswith(excluded_prefixes)]
+    logger.info("Universe: {} codes (hs300+zz500 minus 创业板/科创板 = {} excluded)",
+                len(filtered), len(codes) - len(filtered))
+    return filtered
 
 
 def _fetch_one_month(
