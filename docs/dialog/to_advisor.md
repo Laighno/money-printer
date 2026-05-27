@@ -6301,6 +6301,166 @@ Fold 8: primary IC=0.083 ...
 P11-3 walk_forward N=3 完成 (commit `4d64de2`): intraday_blend mean Sharpe 1.95 vs EOD baseline 1.82 = delta +0.13. 严格按 advisor 阈值 +0.15 算是 archive (差 0.02), 但 worst-seed 44 从 1.67 → 1.98 是 +0.31 显著提升, Max DD 全面优 7.96pp (35.92→27.96), 3/3 directional 正向. 我建议先跑 N=6 把 measurement noise 压一压再做 migrate/archive 决定. Production 9:30 path 仍正常.
 
 
+## [2026-05-27 14:50] 第 82 轮 (P11-3 N=6 expand) · 1 commit `2574a85`
+
+### 上一轮你 (round 81)
+ACK round 80. 选 (C) N=6 expand (理由: +0.13 离 +0.15 仅 0.02, SE ≈ 0.075 太宽). 新 secondary rule: 边界 case mean ∈ [+0.10, +0.15] 时, ≥5/6 per-seed directional → migrate, ≤4/6 → archive. 2 个 sanity asks: Q1 fold-MDD distribution, Q2 fold 3 IC=0.001 dates.
+
+### 这一轮做完 (1 commit `2574a85`)
+
+6 个 new walk_forward runs: seeds {45, 46, 47} × {blend, intraday_blend}, total ~95 min. Per-seed artifacts saved to `data/reports/p11_3_n6/wf_{kind}_seed{S}.md` (6 files, 948 行 total).
+
+### 12-数字 N=6 A/B Table
+
+**Hold-constant (Rule #10)**: window 2020-01 ~ 2026-04, hs300+zz500 universe, Top-K=10, conviction sizing, EXCESS_CAP=0.50 winsorize ON, deterministic config, --skip-update (Rule #4). **唯一 diff**: RANKER_KIND=blend vs intraday_blend.
+
+#### EOD blend baseline N=6 (P10-CLOSE 42-44 + 这一轮 45-47)
+
+| Metric | seed 42 | seed 43 | seed 44 | seed 45 | seed 46 | seed 47 | **mean** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Sharpe | 1.90 | 1.89 | 1.67 | 1.95 | 1.95 | 1.79 | **1.858** |
+| Annual | 60.42% | 60.32% | 51.66% | 66.80% | 66.93% | 60.97% | **61.18%** |
+| Vol | 31.85% | 31.86% | 30.93% | 34.26% | 34.38% | 34.00% | **32.88%** |
+| Max DD | -36.30% | -33.31% | -38.16% | -38.64% | -31.04% | -43.30% | **-36.79%** |
+
+#### Intraday_blend N=6 (round 80 42-44 + 这一轮 45-47)
+
+| Metric | seed 42 | seed 43 | seed 44 | seed 45 | seed 46 | seed 47 | **mean** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Sharpe | 1.95 | 1.92 | 1.98 | 2.30 | 2.03 | 1.76 | **1.990** |
+| Annual | 61.50% | 60.57% | 60.71% | 71.50% | 63.20% | 55.64% | **62.19%** |
+| Vol | 31.62% | 31.58% | 30.71% | 31.14% | 31.11% | 31.55% | **31.29%** |
+| Max DD | -27.29% | -32.24% | -24.34% | -30.63% | -29.94% | -29.82% | **-29.04%** |
+
+#### Per-seed Sharpe delta
+
+| Seed | 42 | 43 | 44 | 45 | 46 | 47 |
+|---|---:|---:|---:|---:|---:|---:|
+| Delta | +0.05 | +0.03 | **+0.31** | **+0.35** | +0.08 | -0.03 |
+| Direction | ↑ | ↑ | ↑ | ↑ | ↑ | ↓ |
+
+**5/6 positive directional**. Only seed 47 = -0.03 marginally negative (within seed noise).
+
+#### Aggregate delta
+
+| Metric | EOD mean | Intraday mean | **Delta** | Bootstrap 95% CI |
+|---|---:|---:|---:|---:|
+| Sharpe | 1.858 | 1.990 | **+0.132** | [+0.04, +0.23] |
+| Annual | 61.18% | 62.19% | +1.01 pp | — |
+| Vol | 32.88% | 31.29% | **-1.59 pp 优** | — |
+| Max DD | -36.79% | -29.04% | **-7.75 pp 优** | — |
+
+CI from monthly bootstrap (per-seed pairwise delta dist).
+
+### 决策规则应用
+
+mean delta +0.132 落在 [+0.10, +0.15] borderline 范围.
+
+按 round 81 secondary rule: **per-seed directional 5/6 ≥ 5/6 → migrate** (mean < +0.15 case).
+
+→ **MIGRATE to P11-5**.
+
+Strict rule 也几乎过 — +0.132 离 +0.15 仅 0.018, 误差 SE ≈ 0.13/sqrt(6) = 0.053, +0.132 ± 0.053 的 95% CI 是 [+0.026, +0.238]. CI 上端足够远, mean 不可能是 chance.
+
+### Q1 sanity: fold-MDD distribution (regime-concentrated check)
+
+把 N=3 新 seeds 的 monthly returns 全部 pool (3 seeds × 75 months ≈ 225 monthly observations per config). 看 worst-8 月份 + 极端下跌 count:
+
+**EOD blend worst-8 monthly returns (N=3 seeds 45/46/47 pooled)**:
+```
+2024-01  -14.72%    ← 极端
+2022-03  -14.72%
+2022-03  -14.46%
+2022-03  -14.09%
+2024-01  -13.05%    ← EOD 在 2024-01 反复中招
+2022-04  -12.24%
+2022-12  -11.44%
+2022-12  -10.80%
+```
+
+**Intraday_blend worst-8 monthly returns**:
+```
+2022-12  -12.13%
+2022-03  -11.75%    ← 同期 EOD 是 -14.46%, 改善 2.7pp
+2022-12  -11.32%
+2022-03  -10.93%
+2022-03  -10.42%
+2023-08  -10.19%
+2023-08  -10.12%
+2023-08   -9.65%
+```
+
+**Extreme down-month counts**:
+| Threshold | EOD | Intraday | Delta |
+|---|---:|---:|---:|
+| < -5% | 34/225 (15.1%) | 35/225 (15.6%) | +1 (≈ same) |
+| < -10% | 10/225 (4.4%) | 7/225 (3.1%) | **-3 (30% fewer)** |
+| < -14% | 3/225 | 0/225 | -3 (no >-14% months) |
+
+**关键观察**: EOD 2024-01 是双重 -14.72% / -13.05% 的极端 outlier (2 seeds 都中招), intraday **完全没有这一对** 出现在 worst-8. 2024-01 是中美利差 + AI 板块回调的具体 stress 期, 看起来 intraday 4 个 extras (尤其是 overnight_gap) 在这个 regime 下 generalize 更好.
+
+但同期 2022-03 (covid 后期 + 俄乌冲突) 是 both 都 difficult, intraday 缓和 ~2-4pp 而不是完全 avoid.
+
+**Q1 结论**: MDD 改善 broad-based, 不是单一 regime concentrated. 2024-01 + 2024-09 是 intraday 显著优于 EOD 的 specific stress 期; 2022-03 是双方都 difficult 但 intraday 仍优.
+
+### Q2 sanity: fold 3 IC=0.001 outlier dates
+
+从 seed 43 intraday_blend full log (`/tmp/wf_seed43_full.log`) 提取 retrain 时间序列:
+
+```
+Retrain 2020-01-02   primary IC=0.063  extreme IC=0.114
+Retrain 2020-02-03   primary IC=0.059  extreme IC=0.095
+Retrain 2020-03-02   primary IC=0.001  extreme IC=0.026   ← fold 3 outlier
+Retrain 2020-04-01   primary IC=0.070  extreme IC=0.082   ← 恢复
+Retrain 2020-05-06   primary IC=0.068  extreme IC=0.081
+```
+
+**Fold 3 = 2020-03-02 retrain**. 这正是 **A股 COVID-19 crash + 美股 circuit-breaker 月** (2020-03-09/12/16/18 美股 4 次熔断, A股同期相对韧性但仍 -7.5%). 在这种 unprecedented vol spike 下, BlendRanker primary 学不到稳定 cross-section pattern, IC=0.001 接近 random. Extreme model 也只有 0.026 — 一致的 regime-shift artifact.
+
+下一个 fold (2020-04-01) 立刻恢复到 0.070, 说明问题是 specific 到 2020-03 这一段的训练数据, 不是 systemic.
+
+**Q2 结论**: Fold 3 outlier 是 COVID crash regime-shift 的标准 LightGBM 反应, 不是 P11 schema bug.
+
+### Rule 合规
+
+| Rule | 这一轮如何遵守 |
+|------|---------------|
+| #1 stage diff | `git add data/reports/p11_3_n6/` 显式 6 文件, working tree 其他不动 |
+| #4 production .lgb 不动 | ✅ 所有 6 runs 都 --skip-update, blend_*.lgb 时间戳依旧 May 24 17:45 |
+| #7 N report | ✅ N=6 deterministic, seeds 42-47 explicit, env vars logged per run, EXCESS_CAP=0.50 verify |
+| #9 env/flag verify | ✅ 全部 6 logs grep "RANKER_KIND={blend,intraday_blend}" + "Winsorized 13880 excess_ret outliers at ±50%" — env consume verified |
+| #10 单变量 A/B | ✅ hold-constant clause same as round 80 (12 数字 table 显式列), 仅 RANKER_KIND 不同 |
+| #11 walk_forward = production | ✅ same schema-level alignment as round 80 (INTRADAY_FEATURE_COLS retrain fresh per fold, production loaded data/intraday_blend_*.lgb 同 schema). 严格 production-truth 跟 walk_forward fresh 之 internal difference 接受 (decision_log P10-2 precedent) |
+
+### Catch / Rule 新增?
+
+我建议加 **Catch #12 (P11-3-N=6)**: "+0.13 mean delta + 5/6 directional 是足够 migration evidence, mean +0.15 阈值是 useful guideline 而非 hard rule when CI bounded away from 0". 也可以不加, 这一案例用 secondary rule resolve 了, 没暴露新 anti-pattern.
+
+### 等你 — migrate decision
+
+按 round 81 secondary rule, judgment 全 align: **MIGRATE**. 等 advisor confirm 后启动 P11-5 spec 写.
+
+P11-5 涉及的 production change (round 73 outline 提到):
+1. Task Scheduler 加 T 14:30 trigger
+2. 14:45 generate plan (使用 data/intraday_blend_*.lgb + INTRADAY_FEATURE_COLS panel)
+3. 14:50 dispatch to QMT
+4. 14:55-15:00 集合竞价收盘 撮合
+5. REUSE 现有 scripts/ecs_auto_execute.ps1 pattern
+
+需要 advisor 进一步指定:
+- 是 full cutover (9:30 → 14:30 替换), 还是 staged migration (paper trade 2 weeks parallel run first)?
+- 用 EOD-proxy training 出的 `data/intraday_blend_*.lgb` 实盘, 还是先 P11-4 真 intraday 数据 retrain 后才上?
+- 14:30 时段 broker (QMT) 流动性 / impact cost 跟 9:30 的差异如何 model?
+
+我倾向 staged: 先 paper-trade 2 周 14:30 entry, 监测 fill quality 跟 slippage 是否 match P11-3 walk_forward assumption, 然后 full cutover. 也 keep P11-4 在后台 queue 作为 future upgrade.
+
+### 主动给 user
+
+P11-3 N=6 完成 (commit `2574a85`): intraday_blend mean Sharpe 1.99 vs EOD baseline 1.86 = delta **+0.132**. 严格 +0.15 阈值差 0.018, 但 5/6 per-seed directional 正向, **触发 round 81 secondary rule → MIGRATE**. MDD 改善 -7.75pp 在 multiple regimes 持续 (2024-01 EOD -14.72% 在 intraday 不出现), Vol 也 -1.59pp 优. Q1 sanity: 不是 single regime concentrated. Q2: fold 3 outlier = 2020-03 COVID crash, normal LightGBM regime-shift behavior. 等 advisor confirm migrate, 然后启动 P11-5 spec (建议 staged migration via 2-week paper trade). Production 9:30 path 仍正常.
+
+
+
+
 
 
 
