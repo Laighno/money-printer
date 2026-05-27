@@ -1,5 +1,12 @@
 """P11-4 Step 1: Fetch 9:30-14:30 1-minute OHLCV from xtdata for the
-hs300+zz500 universe over 2019-01-01 → 2026-04-30.
+hs300+zz500 universe.
+
+Round 89 update: xtquant 国金 QMT free-tier 1m history is limited to
+~9 months back from today. Default date range narrowed to 2025-09-01 →
+2026-04-30. Pre-2025-09 download requests return finished but
+get_market_data shape=(0,n) empty. The shorter coverage is what user
+selected (Option B hybrid training, real-where-available + EOD-proxy
+elsewhere).
 
 Output: monthly partitioned parquet files at ``data/intraday_1m/YYYYMM.parquet``
 with columns: ``code, datetime, open, high, low, close, volume``.
@@ -14,7 +21,7 @@ WORKFLOW
 ========
 On ECS Windows (PowerShell):
   cd C:\\money-printer
-  py -3 scripts/p11_4_fetch_intraday.py --start 20190101 --end 20260430
+  py -3 scripts/p11_4_fetch_intraday.py --start 20250901 --end 20260430
 
 The script will:
 1. Compute the hs300+zz500 universe via the existing fetcher (~800 stocks)
@@ -33,12 +40,11 @@ already exists.
 
 EXPECTED COSTS
 ==============
-~800 codes × 75 months × ~3000 bars/code-month ≈ 180M rows raw.
-Parquet zstd compression should produce ~600 MB - 1.2 GB total.
+~800 codes × 8 months × ~4800 bars/code-month ≈ 30M rows raw (post round 89).
+Parquet zstd compression should produce ~80-150 MB total (8 monthly files).
 
-xtdata.download_history_data is throttled by xtquant — expect 1-2 days
-wall clock for the initial cold fetch.  Subsequent re-runs from local
-cache are much faster (~30 min for full reread + parquet write).
+xtdata.download_history_data is throttled but the short 9-month window
+should complete in < 1 hour wall clock (per round 89 ECS spike).
 
 RUNBOOK (post-run on ECS → Mac sync)
 ====================================
@@ -161,9 +167,12 @@ def _fetch_one_month(
     logger.info("[{}] download completed in {:.1f}s", yyyymm, time.time() - t0)
 
     # Step b — read back from local cache.
+    # Round 89 fix: use get_market_data (returns dict[field → DataFrame[time × codes]])
+    # rather than get_local_data (returns dict[code → DataFrame[time × fields]]).
+    # The wide-by-field shape is what the pivot below expects.
     t0 = time.time()
     field_list = ["open", "high", "low", "close", "volume"]
-    raw = xtdata.get_local_data(
+    raw = xtdata.get_market_data(
         field_list=field_list,
         stock_list=xt_codes,
         period="1m",
@@ -173,12 +182,12 @@ def _fetch_one_month(
         dividend_type="none",
         fill_data=False,
     )
-    # raw is a dict {field → DataFrame[rows=times, cols=codes]}; melt to long form.
     if not raw or not all(isinstance(v, pd.DataFrame) for v in raw.values()):
-        logger.warning("[{}] xtdata.get_local_data returned unexpected shape, skipping", yyyymm)
+        logger.warning("[{}] xtdata.get_market_data returned unexpected shape, skipping", yyyymm)
         return None
 
-    # Pivot to (code, datetime, open, high, low, close, volume) long form.
+    # Pivot dict[field → DataFrame[time × codes]] → long form
+    # (code, datetime, open, high, low, close, volume).
     frames: List[pd.DataFrame] = []
     for field, df in raw.items():
         if df.empty:
@@ -224,7 +233,10 @@ def _fetch_one_month(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--start", default="20190101", help="YYYYMMDD start date (inclusive)")
+    # Round 89: xtquant 国金 QMT free-tier 1m history limited to ~9 months
+    # (back to 2025-08/09). Pre-2025-09 download requests return finished but
+    # get_market_data shape=(0,n) empty. Default start matches actual coverage.
+    ap.add_argument("--start", default="20250901", help="YYYYMMDD start date (inclusive)")
     ap.add_argument("--end", default="20260430", help="YYYYMMDD end date (inclusive)")
     ap.add_argument("--out-dir", default="data/intraday_1m",
                     help="Output parquet directory (default: data/intraday_1m)")
