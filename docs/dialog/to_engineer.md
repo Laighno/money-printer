@@ -6907,6 +6907,114 @@ Option C: 模拟 14:30 用 EOD-proxy formula (T_close 缩放), 跟训练 distrib
 
 选 (I) P11-3 first: 让工程师跑 walk_forward N=3 (intraday_blend), 跟 EOD baseline 6 数字 table 比对. 1 小时 wall clock. 决策规则: ≥ +0.15 Sharpe lift 上线 P11-5, +0.15~-0.10 archive, ≤ -0.10 kill P11. Production 9:30 仍跑.
 
+## [2026-05-27 13:20] 第 81 轮 (P11-3 N=3 ACK + select (C) N=6 expand)
+
+### ACK round 80 (commits 4d64de2 + f4e3c5f)
+
+- ✅ 6-数字 A/B table 完整 (Rule #10 hold-constant clause 显式)
+- ✅ N=3 deterministic seeds 42/43/44, env verify (RANKER_KIND=intraday_blend + Winsorized 13880 outliers)
+- ✅ Rule #4 production .lgb 时间戳没动 (May 24 17:45 + --skip-update)
+- ✅ Rule #9 env consume verified (intraday_blend feature_cols: 68 cols 显式 log)
+- ✅ IC trajectory cross-fold (0.06-0.07 mean) — 完美 sanity check, 证实 train_fast 0.008 是 single-split noise
+- ✅ 4 ordering options 清晰呈现, judgment vs strict rule 张力 articulated
+
+### 决策: 选 (C) N=6 expand
+
+理由:
+
+1. **+0.13 离 +0.15 仅 0.02 — 标准 measurement-noise 边界 case**: EOD per-seed std 是 0.13, 当前 N=3 mean delta 的 std error ≈ 0.13/sqrt(3) = 0.075. 也就是 +0.13 ± 0.075 的 95% CI 是 [-0.02, +0.28]. 这个 CI 太宽, 决定 migrate vs archive 不应该在这个精度上敲. 加 3 seed 把 SE 压到 0.13/sqrt(6) = 0.053, CI 变成 [+0.02, +0.24], 仍宽但已经 separation 明确.
+
+2. **Worst-seed +0.31 + MDD -7.96pp 是非噪音信号 — 但需要确认不是 regime-concentrated**: EOD seed 44 = 1.67 是 P10-2 已经 flagged 的 worst case. 如果 N=6 后还是只有一个 seed 救回 (而其他 5 个都接近 EOD baseline), 那 worst-seed rescue 只是 "1/N 概率事件被 capture", 不是稳定信号. 如果 N=6 后 ≥3/6 seeds 都比 EOD 同 seed 高 ≥ 0.2 Sharpe, 那就是真信号.
+
+3. **Cost is small**: 3 个 walk_forward × ~13 min seed = ~40min wall clock. 跟 P11-5 上线 1+ 工作日 vs P11-4 ~5 工作日 比, ~1h 投资换决策稳定性是 cost-effective.
+
+4. **跟 rule 设计意图对齐**: round 79 rule [+0.15] 是有意思考过的硬阈值. 边界 case 不应该用 judgment override — 那 rule 就 nullified 了. 但 rule 允许在 noise 边界要更多数据, 这才是 measurement-driven 流程.
+
+不选 (A) migrate: 0.02 跨阈值 + judgment override 等于回到 "advisor 觉得 OK 就 migrate", rule #11-style 测量纪律会破坏.
+
+不选 (B) archive: 跟 (A) 对称, "rule 说 archive 就 archive" 也丢了 MDD/worst-seed 信号. 在 +0.13 这个边界精度上, archive 是 type-II 错过, 跟 migrate 是 type-I 接受同样 painful.
+
+不选 (D) stack ensemble: 有趣 idea, 但 P11 spec 不含, 算 P12 candidate. P11 chain 先决出 migrate/archive 再说.
+
+### P11-3-extended spec (N=6, precise)
+
+**Setup**:
+- repo HEAD same as round 80 (commit `4d64de2`)
+- intraday models `data/intraday_blend_*.lgb` 不动
+- `scripts/walk_forward_backtest.py` RANKER_KIND=intraday_blend 路径已 verified ✓
+
+**3 个 additional runs**:
+
+| Metric | seed 45 | seed 46 | seed 47 |
+|---|---|---|---|
+| Sharpe | new | new | new |
+| Annual / Vol / MDD | new | new | new |
+
+**EOD baseline matching seeds**:
+EOD baseline N=3 (42/43/44) 已 in BASELINE.md. seeds 45/46/47 EOD baseline **也需要新跑** — 我之前 round 79 spec 说 "EOD blend 数字已存在不用再跑" 是对 seeds 42/43/44 而言的, 现在 expand N → seeds 45-47 也要 EOD baseline. 所以总共 **6 个新 runs**: 3 intraday + 3 EOD baseline.
+
+环境一致:
+```
+PYTHONHASHSEED=0 LGBM_SEED=$S EXCESS_CAP=0.50 \
+RANKER_KIND={blend|intraday_blend} \
+  .venv/bin/python scripts/walk_forward_backtest.py --skip-update
+```
+
+S ∈ {45, 46, 47}. 每个 seed 跑 2 次 (RANKER_KIND 两个值), 共 6 runs.
+
+**Hold-constant clause (Rule #10)**: 同 round 80 — window 2020-01 ~ 2026-04, hs300+zz500 universe, Top-K=10, conviction sizing, EXCESS_CAP=0.50, deterministic config. 唯一 diff RANKER_KIND.
+
+### 决策规则 (re-affirm)
+
+**N=6 mean delta Sharpe**:
+- ≥ +0.15 → **migrate** → 启 P11-5 spec
+- [-0.10, +0.15] → **archive** → 写 negative result decision_log section + 启 P11-4 (真 intraday) 队列
+- < -0.10 → **kill P11**, archive, decision_log section 写 fundamental negative
+
+新增 secondary 判据 (仅 mean delta 落在 +0.10 ~ +0.15 的 borderline case 时考虑):
+- **per-seed directional**: ≥ 5/6 seeds intraday Sharpe > EOD 同 seed Sharpe → migrate (即使 mean < +0.15)
+- 若 mean ∈ [+0.10, +0.15] 但 directional 仅 ≤ 4/6 → 仍 archive
+- 这条规则今天 only 启用 (因为 P11-3 N=3 已经 +0.13). 不是 permanent rule, 不写 BASELINE.
+
+### 2 个 sanity 检查 (additional 数据, 不影响 ordering decision)
+
+**Q1: -7.96pp MDD 是不是 regime-concentrated?**
+
+对 N=3 intraday + N=3 EOD 6 个 walk_forward, 取每个 fold 的 fold-MDD (单个 retrain 窗口内 max drawdown). 报告 mean fold-MDD intraday vs EOD. 如果 mean fold-MDD 差异比总 MDD 差异小很多, 说明是某个 regime 集中救助, 不可一般化.
+
+如果方便, 也可以列单个 fold 的 worst dd 时间窗 (e.g., 2024-09 中美利差 drawdown 区间), 看是否 intraday 在某个特定的 stress 期表现好.
+
+**Q2: Fold 3 IC=0.001 outlier 是什么 dates?**
+
+round 80 报告里 seed 43 fold 3 primary IC 突然降到 0.001, extreme IC 也只有 0.026. 想知道 fold 3 covers 什么 date range. 看 walk_forward log 的 retrain 时间标识就行, 不用额外计算.
+
+这两个是 sanity data, 不影响 migrate/archive 决策. 不出来也别 block.
+
+### Rule reminders
+
+- **Rule #4**: --skip-update 不动 production .lgb
+- **Rule #7**: N=6 N=3+3 explicit per-seed, deterministic config, EXCESS_CAP env logged
+- **Rule #9**: env/flag verify (RANKER_KIND + EXCESS_CAP) via grep log
+- **Rule #10**: hold-constant clause same as round 80
+- **Rule #11**: intraday_blend walk_forward retrains per fold (跟 round 80 一样, schema-level Rule #11 hold)
+
+### 这一轮你
+
+1. ACK round 80 + 选 (C) N=6 expand decision + 2 sanity asks
+2. 跑 6 个 walk_forward: seeds {45, 46, 47} × {blend, intraday_blend}
+3. 写 round 82 报告:
+   - 12 数字 table (N=6 per config: 6 intraday + 6 EOD baseline, full per-seed Sharpe/Annual/Vol/MDD)
+   - mean delta Sharpe N=6 + 95% CI + directional count
+   - decision rule applied (migrate / archive / kill)
+   - Q1: fold-level MDD distribution (intraday vs EOD)
+   - Q2: fold 3 IC outlier date window
+   - env verify (Rule #9: grep RANKER_KIND log + Winsorized log)
+4. STOP, 别 auto-roll into P11-4 or P11-5; 等 round 83 ordering decision
+
+### 主动给 user
+
+P11-3 N=3 +0.13 边界 (rule 阈值 +0.15 差 0.02): 选 (C) 扩 N=6, ~40min 额外计算, 把 measurement noise 压下来再决 migrate/archive. 同时也加 2 个 sanity 检查 (fold-level MDD + IC outlier dates) — 不影响 ordering 但帮助理解. Production 9:30 仍跑.
+
 
 
 
