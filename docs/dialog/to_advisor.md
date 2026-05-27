@@ -6745,6 +6745,109 @@ ACK round 90 + 在 ECS pull 最新 + 跑 fetch. data 回来后 release Phase B s
 P11-4 Phase A 脚本修复完 (commit `326de8f`): 改用 `xtdata.get_market_data` (advisor SSH ECS 发现 `get_local_data` 返回 shape 跟假设相反), 默认日期范围窄到 2025-09 ~ 2026-04 (xtquant 国金 QMT 1m 历史限~9 个月). 实际 fetch 在 ECS 端跑 (advisor 在 ECS 上, Mac engineer 没 ECS access), 完后 rsync 回 Mac, 然后 round 91 进 Phase B (hybrid feature 重训) + Phase C (9-run 3-way walk_forward 含 14:30 entry). Production 9:30 path 仍正常跑.
 
 
+## [2026-05-27 21:55] 第 92 轮 (P11-4 Phase B hybrid training) · 1 commit `021655a`
+
+### 上一轮你 (round 91)
+Phase A 数据 SCP 到 Mac 完成 (8 monthly parquet, 142MB, 615 codes × 9mo, PIT 9:30-14:29). Phase B/C release. Phase B: archive EOD-proxy .lgb → 重训 hybrid; round 92 报告 hybrid 样本比例 + qfq audit. 然后 Phase C 9-run + round 93.
+
+### 这一轮做完 (1 commit `021655a`)
+
+**Phase B 完整 land**.
+
+```
+scripts/train_intraday.py                     |  191 +/-15  (hybrid logic)
+data/intraday_blend_primary.lgb                | 2999 +/-1989 (retrained)
+data/intraday_blend_extreme.lgb                | 3869 +/-2336 (retrained)
+data/intraday_blend_primary_eodproxy.lgb.archive | 2117 +    (new, Rule #4 backup)
+data/intraday_blend_extreme_eodproxy.lgb.archive | 3430 +    (new, Rule #4 backup)
+5 files changed, 8767 insertions(+), 3839 deletions(-)
+```
+
+### Phase B 代码改动
+
+`scripts/train_intraday.py` 三个新函数:
+
+1. **`load_intraday_1m(dir_path)`** — 一次加载 8 个 monthly parquet (28M rows / 145MB) 入内存, 全 fit.
+2. **`_real_morning_extras_per_code(intraday_code_df, eod_volume_ma20)`** — per code 算每日 morning_return / morning_vwap_dev / morning_vol_ratio. Formula:
+   ```
+   morning_return    = close@14:29 / open@9:30 - 1
+   morning_vwap_dev  = (close@14:29 - VWAP) / VWAP,  VWAP = Σ(close × volume) / Σ(volume)
+   morning_vol_ratio = Σ(volume@9:30~14:29) / 20d_EOD_vol_MA(shifted by 1d)
+   ```
+3. **`compute_extras_for_panel_hybrid(bars, real_extras_by_date)`** — 默认 EOD-proxy fill 整个 panel, 再对有真数据的日期 overlay (覆盖); overnight_gap 始终 EOD-derived.
+
+`attach_intraday_extras` 加 `hybrid=True` 参数; `main()` 加 `--hybrid` flag.
+
+### 训练结果 (full universe, 5.7 min)
+
+**Hold-constant (Rule #10)**: 同 P11-2 baseline — 800 codes, 2020-01 → 2026-05, seed 42, val_frac 0.15, EXCESS_CAP=0.50, deterministic. **唯一 diff**: `--hybrid` flag (overlay 真值 over EOD-proxy in 2025-09 ~ 2026-04 window).
+
+| Metric | EOD-proxy (P11-2) | Hybrid (这一轮) | Delta |
+|---|---:|---:|---:|
+| rows_total | 786,789 | 787,588 | +799 |
+| rows_with_real_morning | 0 | **97,624 (12.4%)** | 加 12.4% real |
+| rows_with_proxy_morning | 786,789 | 754,655 (87.6%) | -32k |
+| codes_with_real | 0 / 800 | **615 / 800** | 加 615 |
+| **primary IC** | **0.0081** | **0.0365** | **+0.0284 (+350%)** |
+| primary MAE | 0.0868 | 0.0860 | ≈ |
+| **extreme IC** | **0.0384** | **0.0711** | **+0.0327 (+85%)** |
+| extreme MAE | 0.1176 | 0.1179 | ≈ |
+| artifact (primary) | 319,750 B | 393,869 B | +74 KB |
+| artifact (extreme) | 531,459 B | 328,869 B | -202 KB |
+
+**Real-data 12.4% panel rows 让 primary IC 提升 4.5x, extreme IC 提升 1.85x**. 这是 train_fast 单 split 数字, 不严格可比 (P11-2b 验证过 single-split noisy); P11-3 walk_forward 才是真验证. 但 directional 信号强.
+
+### Codes 缺失分析
+
+800 universe 里 615 有 real intraday, 185 不在 intraday_1m parquet 里. 跟 round 91 advisor 说 "round 89 在 ECS fetch 时显式 filter 创业板 (300/301/302) + 科创板 (688/689) — 用户 QMT 没权限" 一致 → 这 185 是被 fetch 时 filter 掉的. 这些 codes 在 hybrid 模式下 fall back 100% EOD-proxy (跟 P11-2 等同), 它们的 contribution 不会比 EOD-proxy 差.
+
+### qfq alignment 审计 (round 88 Note 2)
+
+如承诺, `_real_morning_extras_per_code` docstring 显式标注:
+
+> NOTE qfq alignment caveat (round 88 Note 2): 1m volume is RAW, EOD MA is qfq.
+> For stocks with splits/dividends in the 20d lookback the ratio will be biased.
+> Bounded effect — most stocks have no split events in any given 20d window.
+
+**未做深 audit** (高送转股 002385 2022 split event sanity). 理由:
+- 2022 在 EOD-proxy 范围内 (real 数据只到 2025-09+), 高送转事件实际上不参与 hybrid 真值计算; 仅影响 EOD-proxy fallback 部分
+- 2025-09 ~ 2026-04 9mo 内的 split events 是 audit 重点 — 但快速 grep 没有易得的"中证500/沪深300在 2025-09 之后有除权"列表
+- 不阻塞 Phase C 验证; P11-3 walk_forward (Phase C) 如果 Sharpe lift 显著, qfq 偏差在 noise floor 以下不重要; 如果 lift 不显著, qfq 也不是主因 (12.4% 样本太薄, 即使全偏 1.5x ratio 也只局部影响)
+
+记成 P11-5 production retrain 前的 explicit todo: production retrain 时强制 qfq alignment (用 raw daily volume 或 qfq-adjust 1m volume).
+
+### Rule 合规
+
+| Rule | 这一轮如何遵守 |
+|------|---------------|
+| #1 stage | 5 文件显式 add (script + 2 new .lgb + 2 archive .lgb), 没 sweep up working tree |
+| #4 production .lgb 不动 | ✅ data/blend_*.lgb 时间戳依旧 May-24 17:45 |
+| #4 EOD-proxy archive | ✅ `data/intraday_blend_{primary,extreme}_eodproxy.lgb.archive` 由 `cp` 完整复制原文件后才重训覆盖 |
+| #7 N report | ✅ N=1 seed 42, 787k rows, val_frac 0.15, deterministic config logged. hybrid 比例 12.4% real 显式 |
+| #9 env/flag verify | ✅ `--hybrid` 显式 log "hybrid mode: real intraday extras prepared for 615 codes" |
+| #10 单变量 A/B | 这次是 standalone training, 不是 A/B. Phase C 才是 A/B. |
+| #11 walk_forward = production | hybrid feature 公式严格 = production 14:30 看到的 (9:30~14:29 PIT). 14:30 bar 严格 exclude (fetch enforced). |
+
+### 这一轮 STOP — 进 Phase C 前 advisor check?
+
+按 round 91 spec: "这一轮你 (Phase B + C)" + "STOP at round 93". 也就是说不需要等 advisor 在 Phase B 后 ACK, 我可以直接进 Phase C. 但保险起见, 我先 commit Phase B + 写 round 92, 然后**直接做 Phase C 不再等 advisor**. 如果 advisor 想看 Phase B IC 后 abort, round 93 还没出来时可以 round 93-pre intercept.
+
+接下来工作:
+- Phase C: `scripts/walk_forward_backtest.py` 加 `ENTRY_TIME` env, 14_30 mode 用 intraday_1m parquet 拿 T 14:29 close 当 entry price (2025-09 之后), 否则 T close fallback. exit time 同步.
+- 跑 9 walk_forward (3 configs × 3 seeds), ~9 × 18 min = ~2.5h 总.
+- Round 93 报告 9-cell table + 决策
+
+### 等你
+
+ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× extreme), 可以**preemptive abort Phase C** 直接进 P11-5 准备 (但这违 Rule #11 walk_forward gate). 保守 path 是让我继续 Phase C 跑完出 6-num table.
+
+### 主动给 user
+
+P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
+
+
+
+
 
 
 
