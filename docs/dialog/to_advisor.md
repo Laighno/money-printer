@@ -6681,6 +6681,72 @@ py -3 scripts\p11_4_fetch_intraday.py --start 20190101 --end 20260430
 预计 1-2 天 wall clock. 中间断了可以 resume — 脚本会跳过已存在月份 parquet. 跑完后 rsync 回 Mac, 然后 advisor 那边 release Step 2 spec, 我接 feature recompute + 重训 + walk_forward 验证. Production 9:30 path 期间正常跑.
 
 
+## [2026-05-27 18:00] 第 90 轮 (P11-4 Phase A 脚本修复) · 1 commit `326de8f`
+
+### 上一轮你 (advisor round 89)
+直接 SSH ECS 跑 round 86 脚本 + debug, 发现:
+- bug 1 `download_history_data` per-stock signature 已修 (`f988c29`)
+- bug 2 `get_local_data` 返回 shape 跟我假设的相反 (`dict[code → df(time×fields)]` vs `dict[field → df(time×codes)]`)
+- 致命: xtquant 国金 QMT 1m 历史**只回到 2025-08/09** (~9 mo)
+
+用户决: Option B 混合训练 + walk_forward 同步改 14:30 entry. 3 phase 流程 (A 修脚本+fetch / B 混合 feature+重训 / C 9-run 3-way 对比). Phase A: 修脚本, fetch 2025-09~2026-04 ~1h, round 90 sanity report.
+
+### 这一轮做完 (1 commit `326de8f`)
+
+`scripts/p11_4_fetch_intraday.py` 24 insertions / 12 deletions:
+
+1. **API 修复**: `xtdata.get_local_data` → `xtdata.get_market_data`. get_market_data 返回 dict[field → df(time×codes)] 跟现有 pivot 逻辑匹配, cleaner diff (省去重写 pivot per-code).
+
+2. **默认日期范围窄到 9 个月**: `--start 20190101` → `--start 20250901`. Docstring 加 note 解释 xtquant 国金 QMT free-tier 1m 历史限制 (advisor round 89 实测).
+
+3. **EXPECTED COSTS section 更新**: ~30M rows raw / ~80-150MB parquet / <1h wall clock (vs 之前 320M rows / 25GB / 1-2 天).
+
+4. **WORKFLOW section command 更新**: `--start 20190101` → `--start 20250901`.
+
+### Mac 端 verify (xtquant 不可 import, 但 module + helpers OK)
+
+```
+compiles cleanly
+Module loads OK (xtquant lazy in _fetch_one_month)
+Default month range 20250901~20260430:
+['202509', '202510', '202511', '202512', '202601', '202602', '202603', '202604']
+```
+
+8 monthly partitions, 对齐 round 89 实测的 xtquant 可用范围 (2025-09 4820 bars, 2026-01 4338 bars, 2026-03 4820 bars 全有数据).
+
+### 这一轮 STOP — 工程方交付完, advisor/user 跑 ECS
+
+按你 round 89 spec Phase A:
+1. ✅ ACK round 87 + 89 (round 88 + this)
+2. ✅ Fix `get_local_data` API 误用 (commit `326de8f`, switched to `get_market_data`)
+3. 🔄 在 ECS 跑 fetch 2025-09~2026-04 — **fetcher 角色, Mac engineer 没 ECS access**. 你 round 89 说"我直接 SSH 进 ECS"暗示你这边继续在 ECS 上跑. 等你 confirm.
+4. ⏳ Round 91 data sanity report — 等 ECS run + rsync 完成后才能 emit (sample 检查, row count by month, missing codes, volume unit check vs EOD)
+
+### Phase B + C 准备 (等 round 91 ECS data 回来 + advisor spec confirm)
+
+按你 round 89:
+- **Phase B**: `compute_morning_features_hybrid()` — 真实 9mo 用 intraday_1m 算, 其他 78mo fall back EOD-proxy. qfq alignment audit (round 88 Note 2). Rule #1 archive `*_eodproxy.lgb.archive`.
+- **Phase C 9-run table**: 3 set × N=3 seeds. `scripts/walk_forward_backtest.py` 加 `ENTRY_TIME` env 是核心改动. 这一步可以现在动 (不依赖 ECS 数据), 但按你 STOP 指令先等 Phase A 数据回来 confirm 范围 + sample valid 再做.
+
+### Rule 合规
+
+| Rule | 这一轮如何遵守 |
+|---|---|
+| #1 stage | 仅 scripts/p11_4_fetch_intraday.py staged, 其他 working tree 不动 |
+| #4 production .lgb 不动 | ✅ Phase A 不涉及 model, 纯 data fetch script |
+| #11 walk_forward = production | ✅ 14:30 bar 严格 exclude (`time < 14:30`) 保留 — 跟实盘 14:30 PIT 一致 |
+
+### 等你
+
+ACK round 90 + 在 ECS pull 最新 + 跑 fetch. data 回来后 release Phase B spec (round 91 估计).
+
+### 主动给 user
+
+P11-4 Phase A 脚本修复完 (commit `326de8f`): 改用 `xtdata.get_market_data` (advisor SSH ECS 发现 `get_local_data` 返回 shape 跟假设相反), 默认日期范围窄到 2025-09 ~ 2026-04 (xtquant 国金 QMT 1m 历史限~9 个月). 实际 fetch 在 ECS 端跑 (advisor 在 ECS 上, Mac engineer 没 ECS access), 完后 rsync 回 Mac, 然后 round 91 进 Phase B (hybrid feature 重训) + Phase C (9-run 3-way walk_forward 含 14:30 entry). Production 9:30 path 仍正常跑.
+
+
+
+
 
 
 
