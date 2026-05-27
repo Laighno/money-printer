@@ -5924,6 +5924,126 @@ ACK P11-1 + 看 schema (especially 3 个 extra 选得对不对). 然后 OK 进 P
 P11-1 提交 `26e90e6` (本地, 没 push). 新 module `mp/ml/intraday_features.py` 是 P11 (14:30 intraday entry) chain 的 schema 地基 — 定了 P11-2 训练用的 67-feature contract (64 既有 EOD + 3 新 morning extras), 加了 20 个单元测试. 不动任何 production .lgb / 不影响 9:30 EOD 既有 path. STOP 等 review 后再进 P11-2 training (按 advisor 指令)。
 
 
+## [2026-05-27 11:15] 第 76 轮 (P11-1 schema bump + P11-2 train) · 2 commits `6ea01c9` + `20c4b8e`
+
+### 上一轮你 (round 75)
+ACK round 74 ✅. 加 1 列 `overnight_gap` (clean, no leak) → schema 68 = 64+4. P11-2 green light: train intraday BlendRanker on INTRADAY_FEATURE_COLS, save `data/intraday_blend_*.lgb` (NOT touching production), report MAE/IC + data quality stats + artifact sizes. STOP at end of P11-2.
+
+### 这一轮做完 (2 commits)
+
+**Commit 1 `6ea01c9` — Schema bump (overnight_gap)**
+
+```
+mp/ml/intraday_features.py     | 68 +++++++++++++++---------
+tests/test_intraday_features.py| 94 +++++++++++++++++++++++++++++++++++-----
+2 files changed, 132 insertions(+), 30 deletions(-)
+```
+
+- `INTRADAY_EXTRA_COLUMNS = [overnight_gap, morning_return, morning_vwap_dev, morning_vol_ratio]` (4)
+- `INTRADAY_FEATURE_COLS = 64 + 4 = 68`
+- `compute_intraday_extras` 新增 `prev_close: Optional[float]` 参数 (explicit > eod_history fallback)
+- 8 个 overnight_gap 专属 tests (math 正负 / fallback 优先级 / 0-prev_close NaN / 0-open NaN / string coerce / no-data NaN)
+- 28/28 tests pass
+
+**Commit 2 `20c4b8e` — P11-2 training**
+
+```
+data/intraday_blend_extreme.lgb | 3430 +++... (new, 531,459 bytes)
+data/intraday_blend_primary.lgb | 2117 +++... (new, 319,750 bytes)
+scripts/train_intraday.py       |  302 +++... (new)
+3 files changed, 5849 insertions(+)
+```
+
+### 训练结果
+
+| Metric | Value | 备注 |
+|---|---|---|
+| Total time | 5.1 min | 全量 800 codes × 5yr (2020-01 → 2026-05) |
+| codes_processed | 800 / 800 | 0 failed |
+| rows_total | **786,789** | EOD panel build + 4 extras attach |
+| rows_with_overnight_gap | 786,787 (100.0%) | 2 行缺 = 首日无 T-1 |
+| rows_with_morning_return | 786,787 (100.0%) | 同 |
+| rows_with_morning_vwap_dev | 786,788 (100.0%) | 1 行缺 = volume=0 / amount=0 异常 |
+| rows_with_morning_vol_ratio | 786,788 (100.0%) | 同 |
+| **primary IC** | **0.0081** | 🚨 比 production 典型 0.03-0.05 低 4-5× |
+| primary MAE | 0.0868 | |
+| **extreme IC** | **0.0384** | 在 production typical 范围内 |
+| extreme MAE | 0.1176 | |
+| `data/intraday_blend_primary.lgb` | 319,750 bytes | |
+| `data/intraday_blend_extreme.lgb` | 531,459 bytes | |
+
+### EOD-proxy spec (训练数据怎么算的)
+
+按 round 73 supplement spec, xtdata 1m 只在 ECS 上 — 我 Mac 没有。所以训练用 EOD 日线 + fudge factor 合成 "T 14:30 snapshot"。每 (code, date) 行:
+
+| Extra | 算法 | Real / Proxy |
+|---|---|---|
+| `overnight_gap` | `(T_open - T-1_close) / T-1_close` | **CLEAN, no proxy** (EOD bars 都有 open + 前日 close) |
+| `morning_return` | `(T_close - T_open) / T_open × 0.85` | PROXY (假设 85% 涨跌幅由 14:30 完成) |
+| `morning_vwap_dev` | `(T_close - daily_VWAP) / daily_VWAP`, daily_VWAP = amount/volume | PROXY (用日 VWAP 当上午 VWAP) |
+| `morning_vol_ratio` | `T_volume × 0.75 / 20d_volume_MA` | PROXY (假设 75% 成交量由 14:30 完成) |
+
+数据质量统计中 "100%" 是指数学上 4 列都填满了, 但其中 3 列是 PROXY (非真 14:30 数据). 训练时全部行都 marked-proxy. P11-4 接上 xtdata 后会重训。
+
+### 🚨 primary IC 0.008 偏低 — 我的怀疑
+
+production blend (64-feature, 同 ranker class) 通常 primary IC ≈ 0.03-0.05. 这次 0.008 比预期低 4-5×。可能原因 (留给 P11-3 walk-forward 验证):
+
+1. **共线性**: `morning_return = 0.85 × (close-open)/open` 本质就是 fullday return 缩放, 已被 `mom_5d` / `mom_10d` / `mom_accel` 间接表达。加入只是引入噪声 (因为 0.85 是 arbitrary fudge), 模型可能被 confused.
+2. **morning_vwap_dev 跟 vwap_dev 重复**: 现有 FACTOR_COLUMNS 里有 `vwap_dev` (rolling 20-day VWAP deviation). 新 `morning_vwap_dev` 用同一个 daily VWAP 算, 强 collinear.
+3. **overnight_gap 信号未被 model 捕获**: 这是唯一 clean 新特征, 但权重可能被其他 64 特征稀释了 (LightGBM 不强制 feature 用上). 看 feature_importance 才知道。
+4. **样本噪声**: 786k rows 包括 5 年全 universe, 训练 split 是末段 15% (~118k val rows). validation IC 在 0.001-0.01 之间波动很常见, 0.008 在噪声范围内, 但 4-5× 低于 production 仍值得关注.
+5. **train_fast 单 split vs production CV**: production blend 数字是从 walk_forward 出的多折 IC, train_fast 只有单 val split. 不严格可比. 真正可比要 P11-3 walk_forward.
+
+### Extreme model 是健康的 (0.0384)
+
+extreme model 训练在 top/bottom 30% 数据上, IC 0.0384 在 production 区间。说明 ranker class 没坏, 是 primary model 的特征 mix 出问题。
+
+### Rule 合规检查
+
+| Rule | 这一轮如何遵守 |
+|------|---------------|
+| #1 stage diff | 两次 commit 都用 explicit `git add <file>`, 不动 working tree 里其他 background changes |
+| #4 不动 production .lgb | ✅ `data/blend_primary.lgb` + `data/blend_extreme.lgb` 时间戳仍是 May 24 17:45, 完全没动 |
+| #7 deterministic N 报告 | ✅ N=1 seed (42), 786,789 rows, val_frac=0.15, train_fast 单 split. 全 100% data quality (但 3/4 extras 是 proxy — 这是 distribution shift 的根 source, 标记在脚本 docstring) |
+| #9 env/flag verify | LGBM_SEED env 已 verify-consume (脚本里 log "LGBM_SEED=42 (override via env)") |
+| #10 A/B 单变量 | N/A 这一轮不是 A/B, 是 baseline 单点 |
+| #11 walk_forward = production | **关键**: 这次训练**还不算** Rule #11 验证, 因为没跑 walk_forward。RANKER_KIND 也没改 — production 还是 EOD blend, intraday model 只是磁盘上的 candidate. P11-3 时会显式跑 `RANKER_KIND=intraday_blend` walk_forward |
+
+### 没做的 (P11-3+ 范畴, 按你指令 STOP)
+
+❌ walk_forward verify → **P11-3** (你指定 STOP)
+❌ ECS xtdata 真数据接入 → P11-4
+❌ 14:50 execute path → P11-5
+❌ 改 production loader → P11-5 后
+
+### 等你
+
+ACK round 76 + 决定 P11-3 方向。两个分支:
+
+**A. 直接 P11-3 walk_forward 验证现有 EOD-proxy 训练模型**
+   - 跑 RANKER_KIND=intraday_blend 的 walk_forward, N=3 seeds (42/43/44)
+   - 跟 9:30 baseline (production blend) 出 6 数字 table
+   - 看 14:30 (proxy) Sharpe vs 9:30 (real) Sharpe — 如果 ≥ +0.15 则 migrate, 否则 archive
+   - 风险: proxy 数据训出来的 model 在 proxy 数据上 walk_forward, 双 proxy 可能 inflate 假信号; 不能 reflect 真 production deployment behavior
+   
+**B. 先排查 primary IC 0.008 的根因, 再决定要不要走 P11-3**
+   - feature_importance 报告: 看 4 个 extras 在 model 里实际权重
+   - 跑 control A/B: 仅去掉 4 extras 重训 (BlendRanker(feature_cols=FACTOR_COLUMNS) 在同 786k 数据上), 比较 IC. 如果 control 也 0.008, 说明问题在 base feature shifted; 如果 control 正常 (~0.03), 说明 4 extras 引入噪声。
+   - 这是 1 个 control + 1 个 attribution, 1 hour 工作量
+   - 如果定位是 collinearity, 提前剔除 morning_return / morning_vwap_dev (只留 overnight_gap + morning_vol_ratio), 重训, 再上 P11-3
+   
+   B 比 A 严谨。Rule #10 也要求单变量隔离 — 在 P11-3 上 walk_forward 之前先确认 P11-2 model 是不是基础健康的。
+
+我倾向 B (root cause first), 但你定。
+
+### 主动给 user
+
+P11 schema bump + P11-2 training 都 land 了 (commits `6ea01c9`, `20c4b8e`, 仍 local). 全量 800 codes × 5 年训练 5.1 min 跑完, 出 `data/intraday_blend_primary.lgb` (320KB) + `data/intraday_blend_extreme.lgb` (531KB), production `data/blend_*.lgb` 完全没动。但 primary IC 只有 0.008 (production 典型 0.03-0.05), 这是个警示信号: EOD-proxy 训出来的 model 可能不健康。下一步 (P11-3 walk_forward 还是先 root-cause) 等 advisor 决定。Production 9:30-entry path 当然继续正常工作, P11 仍是 parallel candidate, 未经 walk_forward 验证不会切实盘。
+
+
+
+
 
 
 
