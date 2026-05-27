@@ -940,7 +940,43 @@ def recommend_stocks(ranker, n_recommend: int = 5, intraday_bars: dict | None = 
     # Sort full ranking, attach rank index, then take top N for display
     full_scored = result.sort_values("ml_score", ascending=False).reset_index(drop=True)
     full_scored["_rank"] = full_scored.index + 1
-    result = full_scored.head(n_recommend).reset_index(drop=True)
+    # Filter top-N to exclude codes the user can't trade:
+    #   - 科创板 (688/689): per 2026-05-19 — STAR market 20% daily limits +
+    #     thin liquidity + many pre-profit biotechs the model loves to "buy
+    #     the dip" on (e.g. 神州细胞 ROE -434%).
+    #   - 创业板 (300/301): per 2026-05-27 — user (国金 8886933837) has not
+    #     opened ChiNext trading permission. Without this filter the model
+    #     would route buys (e.g. 汤臣倍健 300146 / 康泰生物 300601) that
+    #     would simply fail at the broker.
+    # full_scored still contains them — model scoring + watchlist tracking
+    # unaffected — but display recommendations and order list skip them.
+    code_str = full_scored["code"].astype(str)
+    is_excluded = code_str.str.startswith(("688", "689", "300", "301"))
+    excluded_n = int(is_excluded.sum())
+    non_star = full_scored[~is_excluded].reset_index(drop=True)
+    if excluded_n:
+        logger.info("Filtered {} 科创板/创业板 names from top-N recommendations", excluded_n)
+
+    # Liquidity filter: drop top-N candidates whose 20d avg amount is below
+    # the hard threshold (¥1亿); flag those between hard and soft (¥3亿)
+    # threshold with _low_liquidity=True so the renderer shows 💧 marker.
+    # Computed on top 30 candidates to limit DB queries — anything ranked
+    # below 30 won't be displayed anyway.
+    candidates = non_star.head(30).copy()
+    avg_amounts = _recent_amount_avg(candidates["code"].tolist(), days=20)
+    candidates["_avg_amount_20d"] = candidates["code"].map(avg_amounts).fillna(0)
+    is_too_illiquid = candidates["_avg_amount_20d"] < LOW_LIQUIDITY_FILTER_AMOUNT
+    dropped = candidates[is_too_illiquid]
+    if not dropped.empty:
+        logger.info(
+            "Filtered {} low-liquidity names from top-N (amount < ¥{:.1f}亿): {}",
+            len(dropped), LOW_LIQUIDITY_FILTER_AMOUNT / 1e8,
+            list(dropped["code"]),
+        )
+    candidates = candidates[~is_too_illiquid].reset_index(drop=True)
+    candidates["_low_liquidity"] = candidates["_avg_amount_20d"] < LOW_LIQUIDITY_WARN_AMOUNT
+
+    result = candidates.head(n_recommend).reset_index(drop=True)
     rec_name_map = get_stock_names(result["code"].tolist())
     result["name"] = result["code"].map(rec_name_map)
 
@@ -1033,26 +1069,42 @@ def generate_order_list(
     account: dict | None,
     recommendations: pd.DataFrame,
     full_scored: pd.DataFrame | None,
-) -> list[dict]:
+) -> tuple[list[dict], list[str]]:
     """Generate next-day open order list.
 
-    Returns list of dicts: {code, name, action, shares, limit_price, cost, reason}.
-    Empty list if account snapshot or recommendations missing.
+    Returns (orders, alerts):
+      - orders: list of dicts {code, name, action, shares, limit_price, cost, reason}
+      - alerts: list of human-readable strings flagging actionable conditions
+        that the report should show even when no executable order was emitted
+        (e.g. "想加仓 X 但预算不够买 1 手").
+
+    Both empty if account snapshot or recommendations missing.
 
     Logic:
       Top-N (default 5) → conviction-weighted target value, delta vs current
       In-portfolio + rank > 100 → 清仓
       In-portfolio + 30 < rank ≤ 100 → 减仓 50%
       In-portfolio + rank ≤ 30 (but not top N) → silent hold
+      Held + in top-N with strong excess but no budget → ALERT
+      Top-N new code but cheapest 1 lot > buy_budget → ALERT
     """
     if account is None or recommendations is None or recommendations.empty:
-        return []
+        return [], []
     if "_degraded_reason" in recommendations.columns:
-        return []
+        return [], []
 
     cash_available = float(account.get("cash_available", 0))
-    # Buy budget: 95% of cash, leaving 5% for fees/slippage
-    buy_budget = cash_available * 0.95
+    total_assets = float(account.get("total_assets", 0))
+    # Target invested portion (rest stays as cash buffer)
+    target_pos_pct = float(account.get("target_position_pct", 0.70))
+    investable = total_assets * target_pos_pct
+    # Concentration cap — even if conviction weight is very high, don't put
+    # more than this fraction of total_assets in a single name.
+    hard_max = float(account.get("hard_single_weight", 0.40))
+    # Minimum delta (as fraction of total_assets) to bother emitting an
+    # order — avoid micro-rebalances on noise.
+    rebalance_tolerance = float(account.get("rebalance_tolerance", 0.02))
+    min_delta_value = total_assets * rebalance_tolerance
 
     # Filter out HS300 stocks: model is trained on ZZ500 only, predictions
     # on HS300 names are out-of-distribution extrapolations.  Surface them
@@ -1087,44 +1139,104 @@ def generate_order_list(
         universe_size = len(full_scored)
 
     orders: list[dict] = []
+    alerts: list[str] = []
     rec_set = set(rec_codes)
 
-    # Pass 1: NEW BUYS only — top-N codes not currently held, conviction-weighted
-    # over buy_budget (= cash × 95%).  Already-held top-N codes are signal
-    # confirmation: model still likes them, no fresh action needed.
-    new_buy_codes = [c for c in rec_codes if held_shares.get(c, 0) == 0]
-    if new_buy_codes:
-        epsilon = 0.5  # pp floor — weakest still gets a slice
-        adj = {c: max(excess_map.get(c, 0.0), 0.0) + epsilon for c in new_buy_codes}
-        s = sum(adj.values())
-        weights = ({c: adj[c] / s for c in new_buy_codes}
-                   if s > 0 else {c: 1.0 / len(new_buy_codes) for c in new_buy_codes})
+    # ──────────────────────────────────────────────────────────────
+    # Pass 1: TARGET-WEIGHT REBALANCING over top-N
+    # For each top-N code (held or not), compute target value =
+    # investable × conviction_weight, capped by hard_max × total_assets.
+    # Compare to current value, emit buy/sell to close the gap.
+    # ──────────────────────────────────────────────────────────────
+    epsilon = 0.5   # pp floor so weakest top-N still gets a slice
+    adj = {c: max(excess_map.get(c, 0.0), 0.0) + epsilon for c in rec_codes}
+    sum_adj = sum(adj.values()) or 1.0
+    conviction_w = {c: adj[c] / sum_adj for c in rec_codes}
 
-        for c in new_buy_codes:
-            close = closes.get(c)
-            if not close or close <= 0:
-                continue
+    # Current value per code (held or not) for ALL universe-relevant codes
+    current_value = {c: held_shares.get(c, 0) * closes.get(c, 0.0)
+                     for c in set(rec_codes) | set(held_shares.keys())}
+
+    hard_cap_value = total_assets * hard_max
+
+    # T+1 note: in A-shares the CASH from a same-day sell is immediately
+    # usable for buys on the same morning (only the shares are locked).
+    # So sells in this list release cash for the buys also in this list.
+    # We process sells first, then buys, to make the budget accounting
+    # correct in the reason text.
+    rebalance_orders: list[dict] = []   # collected here, reordered at end
+
+    for c in rec_codes:
+        close = closes.get(c)
+        if not close or close <= 0:
+            continue
+        # Target value: conviction × investable, but never exceed hard cap
+        target = min(investable * conviction_w[c], hard_cap_value)
+        cur = current_value.get(c, 0.0)
+        delta_value = target - cur
+
+        if abs(delta_value) < min_delta_value:
+            continue   # within tolerance, leave alone
+
+        rank = rank_map.get(c)
+        rank_str = f"#{rank}/{universe_size}" if rank else "—"
+        ex_pp = excess_map.get(c, 0.0)
+        w_pct = conviction_w[c] * 100
+        target_w_pct = target / total_assets * 100 if total_assets > 0 else 0
+        current_w_pct = cur / total_assets * 100 if total_assets > 0 else 0
+
+        if delta_value > 0:
+            # ADD: need to BUY (delta_value worth)
             limit = round(close * 1.01, 2)
-            slot_value = buy_budget * weights[c]
-            shares = int(slot_value / limit / 100) * 100
+            shares = int(delta_value / limit / 100) * 100
             if shares < 100:
+                # Not enough room for 1 lot — alert if model strongly wants it
+                if ex_pp >= 3.0:
+                    alerts.append(
+                        f"模型建议加仓 **{rec_name_map.get(c, c)} ({c})**"
+                        f"（{rank_str}, 超额 {ex_pp:+.2f}%, "
+                        f"目标 {target_w_pct:.1f}% → 当前 {current_w_pct:.1f}%）"
+                        f"但缺口 ¥{delta_value:,.0f} < 1 手 ¥{limit*100:,.0f}。"
+                    )
                 continue
             money = shares * limit
-            rank = rank_map.get(c)
-            ex_pp = excess_map.get(c, 0.0)
-            rank_str = f"#{rank}/{universe_size}" if rank else "—"
-            orders.append({
+            action = "加仓" if held_shares.get(c, 0) > 0 else "买入"
+            rebalance_orders.append({
                 "code": c,
                 "name": rec_name_map.get(c, c),
-                "action": "买入",
+                "action": action,
                 "shares": shares,
                 "limit_price": limit,
                 "cost": money,
-                "reason": f"模型 {rank_str}, 超额 {ex_pp:+.2f}%",
+                "reason": (f"模型 {rank_str}, 超额 {ex_pp:+.2f}%，"
+                           f"目标仓位 {target_w_pct:.1f}% (现 {current_w_pct:.1f}%)"),
+                "_priority": 1,   # buy after sells
             })
-
-    # Pass 1b: held codes that ARE in top-N → silent confirmation, no order
-    # (No rebalance toward "ideal weights" — avoids churn on noisy signals.)
+        else:
+            # TRIM: sell enough to reach target
+            cur_held = held_shares.get(c, 0)
+            if cur_held < 100:
+                continue
+            limit = round(close * 0.99, 2)
+            shares = min(cur_held, int(abs(delta_value) / limit / 100) * 100)
+            if shares < 100:
+                continue
+            proceeds = shares * limit
+            reason_suffix = (
+                f"目标仓位 {target_w_pct:.1f}% (现 {current_w_pct:.1f}%, 过重)"
+                if current_w_pct > target_w_pct * 1.3
+                else f"目标仓位 {target_w_pct:.1f}% (现 {current_w_pct:.1f}%)"
+            )
+            rebalance_orders.append({
+                "code": c,
+                "name": rec_name_map.get(c, c),
+                "action": "减仓",
+                "shares": shares,
+                "limit_price": limit,
+                "cost": -proceeds,
+                "reason": (f"模型 {rank_str}, 超额 {ex_pp:+.2f}%，{reason_suffix}"),
+                "_priority": 0,   # sells first
+            })
 
     # Pass 2: holdings NOT in top-N — possible reduce/clear
     for code, current in held_shares.items():
@@ -1147,11 +1259,11 @@ def generate_order_list(
             action = "减仓"
             reason = f"模型排名 #{rank}/{universe_size}（跌出 Top 30，减半仓）"
         else:
-            continue  # in top 30 — silent hold
+            continue  # in top 30 — silent hold (model still respects it)
 
         limit = round(close * 0.99, 2)
         proceeds = shares * limit
-        orders.append({
+        rebalance_orders.append({
             "code": code,
             "name": held_names.get(code, code),
             "action": action,
@@ -1159,14 +1271,54 @@ def generate_order_list(
             "limit_price": limit,
             "cost": -proceeds,
             "reason": reason,
+            "_priority": 0,   # sells first
         })
 
-    return orders
+    # ──────────────────────────────────────────────────────────────
+    # Budget reconciliation: ensure buys ≤ cash_after_sells.
+    # T+0 资金: A 股卖出当日资金可用，所以本批卖单产生的现金可用于本批买单。
+    # ──────────────────────────────────────────────────────────────
+    sells = [o for o in rebalance_orders if o["cost"] < 0]
+    buys = [o for o in rebalance_orders if o["cost"] > 0]
+    proceeds_total = sum(-o["cost"] for o in sells)
+    cash_after_sells = cash_available + proceeds_total
+    buy_cap = cash_after_sells * 0.95   # 5% fee buffer
+    buys_total = sum(o["cost"] for o in buys)
+    if buys_total > buy_cap and buys_total > 0:
+        # Scale down each buy proportionally, re-rounding to lots
+        scale = buy_cap / buys_total
+        scaled_buys: list[dict] = []
+        for o in buys:
+            limit = o["limit_price"]
+            new_shares = int(o["shares"] * scale / 100) * 100
+            if new_shares >= 100:
+                o = dict(o)
+                o["shares"] = new_shares
+                o["cost"] = new_shares * limit
+                scaled_buys.append(o)
+            else:
+                # Buy can't even afford 1 lot at scaled budget — alert
+                alerts.append(
+                    f"⚠️ {o['name']} ({o['code']}) 受预算约束，无法完成完整加仓。"
+                )
+        rebalance_orders = sells + scaled_buys
+    else:
+        rebalance_orders = sells + buys
+
+    # Strip the internal _priority field before returning
+    for o in rebalance_orders:
+        o.pop("_priority", None)
+    orders.extend(rebalance_orders)
+
+    return orders, alerts
 
 
-def format_order_list_section(orders: list[dict], account: dict | None) -> str:
-    """Render the order list section as markdown.  Empty string if no orders."""
-    if not orders:
+def format_order_list_section(orders: list[dict], account: dict | None,
+                              alerts: list[str] | None = None) -> str:
+    """Render the order list section as markdown.  Empty only when both
+    orders AND alerts are empty (no signal of any kind to surface)."""
+    alerts = alerts or []
+    if not orders and not alerts:
         return ""
     lines = ["", "## 📋 明日开盘订单清单", ""]
     if account and account.get("cash_available") is not None:
@@ -1176,25 +1328,38 @@ def format_order_list_section(orders: list[dict], account: dict | None) -> str:
         )
         lines.append("")
 
-    lines.append("| 股票 | 方向 | 股数 | 限价 | 资金 | 原因 |")
-    lines.append("|---|---|---:|---:|---:|---|")
-    for o in orders:
-        cost = o["cost"]
-        cost_str = (f"-¥{abs(cost):,.0f}" if cost < 0 else f"+¥{cost:,.0f}")
-        lines.append(
-            f"| {o['name']} ({o['code']}) | {o['action']} | "
-            f"{o['shares']:,} | ¥{o['limit_price']:.2f} | {cost_str} | {o['reason']} |"
-        )
-
-    net = sum(o["cost"] for o in orders)
-    if account and account.get("cash_available") is not None:
-        cash_after = float(account["cash_available"]) - net
-        sign = "占用" if net > 0 else "释放"
+    # Alerts first — these are "what the model wants but can't execute"
+    if alerts:
+        lines.append("### ⚠️ 信号提示")
+        for a in alerts:
+            lines.append(f"- {a}")
         lines.append("")
-        lines.append(
-            f"> 净资金{sign}：¥{abs(net):,.0f}"
-            f" | 执行后可用：¥{cash_after:,.0f}"
-        )
+
+    if orders:
+        lines.append("### 可执行订单")
+        lines.append("")
+        lines.append("| 股票 | 方向 | 股数 | 限价 | 资金 | 原因 |")
+        lines.append("|---|---|---:|---:|---:|---|")
+        for o in orders:
+            cost = o["cost"]
+            cost_str = (f"-¥{abs(cost):,.0f}" if cost < 0 else f"+¥{cost:,.0f}")
+            lines.append(
+                f"| {o['name']} ({o['code']}) | {o['action']} | "
+                f"{o['shares']:,} | ¥{o['limit_price']:.2f} | {cost_str} | {o['reason']} |"
+            )
+
+        net = sum(o["cost"] for o in orders)
+        if account and account.get("cash_available") is not None:
+            cash_after = float(account["cash_available"]) - net
+            sign = "占用" if net > 0 else "释放"
+            lines.append("")
+            lines.append(
+                f"> 净资金{sign}：¥{abs(net):,.0f}"
+                f" | 执行后可用：¥{cash_after:,.0f}"
+            )
+    else:
+        lines.append("*（本次没有可直接执行的订单 — 持仓全部在 Top 30 内，新推荐预算不足。"
+                     "请参考上方提示调整仓位后再执行。）*")
 
     lines.append("")
     lines.append(
@@ -1289,6 +1454,7 @@ def format_report(
     data_timestamps: dict | None = None,
     midday_watchlist_eval: list[dict] | None = None,
     order_list: list[dict] | None = None,
+    order_alerts: list[str] | None = None,
     account: dict | None = None,
     session_label: str = "midday",
 ) -> str:
@@ -1301,6 +1467,7 @@ def format_report(
         data_timestamps=data_timestamps,
         midday_watchlist_eval=midday_watchlist_eval,
         order_list=order_list,
+        order_alerts=order_alerts,
         account=account,
         session_label=session_label,
     )
@@ -1314,6 +1481,7 @@ def _format_markdown(
     data_timestamps: dict | None = None,
     midday_watchlist_eval: list[dict] | None = None,
     order_list: list[dict] | None = None,
+    order_alerts: list[str] | None = None,
     account: dict | None = None,
     session_label: str = "midday",
 ) -> str:
@@ -1450,6 +1618,16 @@ def _format_markdown(
     )
     if _has_hs300_in_recs:
         lines.append(_EXTRAPOLATION_FOOTNOTE)
+    _has_low_liq_in_recs = (
+        not recommendations.empty
+        and "_low_liquidity" in recommendations.columns
+        and bool(recommendations["_low_liquidity"].any())
+    )
+    if _has_low_liq_in_recs:
+        lines.append(
+            "> 💧 标记：该股 20 日均成交 < ¥3亿，**低流动性**，中午报告预测易偏离 EOD —— "
+            "以 4 点 EOD 报告为准，盘中信号仅供参考。"
+        )
     _rec_degraded = "_degraded_reason" in recommendations.columns if not recommendations.empty else False
     rec_is_rank = "rank_pct" in recommendations.columns if not recommendations.empty and not _rec_degraded else False
     if _rec_degraded:
@@ -1471,8 +1649,9 @@ def _format_markdown(
             else:
                 score_text = f"预测20日收益: **{row['predicted_return']:+.2f}%**"
             extra_mark = _EXTRAPOLATION_MARK if row["code"] in _hs300 else ""
+            liq_mark = _LOW_LIQUIDITY_MARK if row.get("_low_liquidity") else ""
             lines.append(
-                f"{i+1}. **{row['name']}**{extra_mark} ({row['code']})  "
+                f"{i+1}. **{row['name']}**{extra_mark}{liq_mark} ({row['code']})  "
                 f"{score_text}"
             )
             if row.get("top_factors"):
@@ -1531,8 +1710,8 @@ def _format_markdown(
         lines.append("")
 
     # --- Next-day open order list (afternoon report only) ---
-    if not midday and order_list:
-        lines.append(format_order_list_section(order_list, account))
+    if not midday and (order_list or order_alerts):
+        lines.append(format_order_list_section(order_list or [], account, alerts=order_alerts))
 
     lines.append("---")
     ts = data_timestamps or {}
@@ -1551,6 +1730,46 @@ _INTRADAY_TITLE = {"midday": "📊 午间快报", "2pm": "⏰ 盘中快报 14:00
 # only.  Predictions on HS300 names are out-of-distribution extrapolations
 # until Layer 2 (HS300 historical constituent backfill) + Layer 3 (retrain)
 # complete.  Mark them in reports and exclude from automated order lists.
+# Low-liquidity marker — shown next to recommendations whose 20-day average
+# daily turnover is below LOW_LIQUIDITY_WARN_AMOUNT.  Stocks below
+# LOW_LIQUIDITY_FILTER_AMOUNT are dropped from top-N entirely (see
+# recommend_stocks).  Reasoning: low-liquidity stocks suffer the largest
+# midday→EOD prediction swings (early-session volume × scale 2 over-estimates
+# the day's true volume — verified 神州细胞 −8.46pp, 中交设计 −2.14pp).
+_LOW_LIQUIDITY_MARK = " 💧"
+LOW_LIQUIDITY_FILTER_AMOUNT = 1.0e8    # ¥1亿 日均成交 → drop from recommendations
+LOW_LIQUIDITY_WARN_AMOUNT   = 3.0e8    # ¥3亿 日均成交 → show with 💧 marker
+
+
+def _recent_amount_avg(codes: list[str], days: int = 20) -> dict[str, float]:
+    """20-day average daily turnover (amount in 元) per code from DB.
+
+    Used by recommend_stocks to filter / flag low-liquidity names whose
+    midday signals are too noisy.  Single-query implementation for speed.
+    """
+    if not codes:
+        return {}
+    try:
+        from mp.data.store import DataStore, DEFAULT_DB_URL
+        from sqlalchemy import text, bindparam
+        store = DataStore(db_url=DEFAULT_DB_URL)
+        out: dict[str, float] = {}
+        with store.engine.connect() as conn:
+            for code in codes:
+                row = conn.execute(text(
+                    "SELECT AVG(amount) FROM ("
+                    "  SELECT amount FROM daily_bars WHERE code = :c "
+                    "  ORDER BY date DESC LIMIT :n"
+                    ")"
+                ), {"c": code, "n": days}).fetchone()
+                if row and row[0] is not None:
+                    out[code] = float(row[0])
+        return out
+    except Exception as e:
+        logger.warning("_recent_amount_avg failed: {}", e)
+        return {}
+
+
 _EXTRAPOLATION_MARK = " ⚠️*"
 _EXTRAPOLATION_FOOTNOTE = (
     "> ⚠️* 标记：该股属于 HS300 大盘股，模型当前训练池只覆盖 ZZ500，"
@@ -1593,6 +1812,7 @@ def format_feishu_card(
     data_timestamps: dict | None = None,
     midday_watchlist_eval: list[dict] | None = None,
     order_list: list[dict] | None = None,
+    order_alerts: list[str] | None = None,
     account: dict | None = None,
     session_label: str = "midday",
 ) -> dict:
@@ -1782,7 +2002,8 @@ def format_feishu_card(
 
             warn_mark = " [缺]" if row.get("_data_warnings", "") else ""
             extrap = _EXTRAPOLATION_MARK if row["code"] in _hs300 else ""
-            rec_rows.append(f"| {row['name']}{extrap} | {ret_str}{warn_mark} | {pred_60d} | {sig_str}{rating_str} |")
+            liq = _LOW_LIQUIDITY_MARK if row.get("_low_liquidity") else ""
+            rec_rows.append(f"| {row['name']}{extrap}{liq} | {ret_str}{warn_mark} | {pred_60d} | {sig_str}{rating_str} |")
 
         rec_header_score = "排名(预测)" if rec_is_rank else "预测20d"
         rec_table_md = (
@@ -1866,33 +2087,43 @@ def format_feishu_card(
         elements.append({"tag": "markdown", "content": wl_table})
 
     # --- Next-day open order list (afternoon report only) ---
-    if not midday and order_list:
+    if not midday and (order_list or order_alerts):
         elements.append({"tag": "hr"})
         elements.append({"tag": "markdown", "content": "**📋 明日开盘订单清单**"})
         if account and account.get("cash_available") is not None:
             cash = float(account['cash_available'])
             elements.append({"tag": "markdown", "content":
                 f"可用 ¥{cash:,.0f} · 买单预算 ¥{cash * 0.95:,.0f}"})
+        if order_alerts:
+            elements.append({"tag": "markdown", "content": "**⚠️ 信号提示**"})
+            for a in order_alerts:
+                elements.append({"tag": "markdown", "content": f"- {a}"})
         ol_rows = []
-        for o in order_list:
+        for o in (order_list or []):
             cost = o["cost"]
             cost_str = (f"-¥{abs(cost):,.0f}" if cost < 0 else f"+¥{cost:,.0f}")
             ol_rows.append(
                 f"| {o['name']} | {o['action']} | {o['shares']:,} | "
                 f"¥{o['limit_price']:.2f} | {cost_str} | {o['reason']} |"
             )
-        ol_table = (
-            "| 股票 | 方向 | 股数 | 限价 | 资金 | 原因 |\n"
-            "|---|---|---|---|---|---|\n"
-            + "\n".join(ol_rows)
-        )
-        elements.append({"tag": "markdown", "content": ol_table})
-        net = sum(o["cost"] for o in order_list)
-        if account and account.get("cash_available") is not None:
-            cash_after = float(account["cash_available"]) - net
-            sign = "占用" if net > 0 else "释放"
+        if ol_rows:
+            ol_table = (
+                "**可执行订单**\n"
+                "| 股票 | 方向 | 股数 | 限价 | 资金 | 原因 |\n"
+                "|---|---|---|---|---|---|\n"
+                + "\n".join(ol_rows)
+            )
+            elements.append({"tag": "markdown", "content": ol_table})
+        elif order_alerts:
             elements.append({"tag": "markdown", "content":
-                f"净资金{sign} ¥{abs(net):,.0f} · 执行后 ¥{cash_after:,.0f}"})
+                "*本次没有可直接执行的订单，请参考上方提示调整仓位。*"})
+        if order_list:
+            net = sum(o["cost"] for o in order_list)
+            if account and account.get("cash_available") is not None:
+                cash_after = float(account["cash_available"]) - net
+                sign = "占用" if net > 0 else "释放"
+                elements.append({"tag": "markdown", "content":
+                    f"净资金{sign} ¥{abs(net):,.0f} · 执行后 ¥{cash_after:,.0f}"})
         elements.append({"tag": "markdown", "content":
             "*买单 = 收盘×1.01，卖单 = 收盘×0.99；按 conviction 加权*"})
 
@@ -2278,16 +2509,22 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     label_zh = {"midday": "午间快报", "2pm": "盘中快报 14:00"}.get(session_label, session_label)
     logger.info("=== {} Report: {} ===", label_zh, date.today())
 
-    # 1. Load models (same as daily)
-    ranker = BlendRanker()
-    if ranker.load():
-        logger.info("Using BlendRanker (excess_ret + extreme30)")
+    # 1. Load models (ensemble preferred, single blend fallback)
+    from mp.ml.model import EnsembleBlendRanker
+    ensemble = EnsembleBlendRanker()
+    if ensemble.load():
+        ranker = ensemble
+        logger.info("Using EnsembleBlendRanker ({} members)", len(ensemble))
     else:
-        logger.info("Blend models not found, falling back to StockRanker")
-        ranker = StockRanker()
-        if not ranker.load():
-            logger.error("No ML model found. Run training first.")
-            return
+        ranker = BlendRanker()
+        if ranker.load():
+            logger.info("Using single BlendRanker (no ensemble found)")
+        else:
+            logger.info("Blend models not found, falling back to StockRanker")
+            ranker = StockRanker()
+            if not ranker.load():
+                logger.error("No ML model found. Run training first.")
+                return
 
     ranker_60d = StockRanker()
     has_60d_model = ranker_60d.load(path="data/model_60d.lgb")
@@ -2616,22 +2853,58 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
     # 2d. Generate next-day open order list (conviction-weighted, top-5)
     account = load_account()
     order_list: list[dict] = []
+    order_alerts: list[str] = []
     if account is None:
         logger.info("portfolio.yaml has no `account:` block — order list skipped")
     elif rec_degraded:
         logger.info("recommendations degraded — order list skipped")
     else:
         try:
-            order_list = generate_order_list(
+            order_list, order_alerts = generate_order_list(
                 holdings_full=holdings,
                 account=account,
                 recommendations=recommendations,
                 full_scored=full_scored,
             )
-            logger.info("Order list: {} orders", len(order_list))
+            logger.info("Order list: {} orders, {} alerts", len(order_list), len(order_alerts))
+            # Persist for scripts/execute_orders.py to pick up next day.
+            # Written as JSON so the executor doesn't have to re-run the
+            # full pipeline; it just sanity-checks current prices.
+            try:
+                import json
+                orders_dir = PROJECT_ROOT / "data" / "orders"
+                orders_dir.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "generated_at": datetime.now().isoformat(timespec="seconds"),
+                    "report_date": date.today().strftime("%Y-%m-%d"),
+                    "account_snapshot": {
+                        "total_assets": account.get("total_assets"),
+                        "cash_available": account.get("cash_available"),
+                        "market_value": account.get("market_value"),
+                    },
+                    "holdings_at_plan_time": [
+                        {"code": h["code"], "name": h["name"],
+                         "shares": int(h.get("shares") or 0),
+                         "avg_cost": float(h.get("avg_cost") or 0)}
+                        for h in holdings
+                    ],
+                    "orders": order_list,
+                    "alerts": order_alerts,
+                }
+                p = orders_dir / f"orders_{date.today().strftime('%Y%m%d')}.json"
+                p.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+                # Also write `latest.json` symlink-style for executor convenience
+                (orders_dir / "latest.json").write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+                logger.info("Order plan saved → {}", p)
+            except Exception as e:
+                logger.warning("Order plan JSON save failed (non-fatal): {}", e)
         except Exception as e:
             logger.warning("Order list generation failed (non-fatal): {}", e)
             order_list = []
+            order_alerts = []
 
     # 3. Format report
     data_timestamps = _make_data_timestamps()  # daily: both dates from DB
@@ -2648,6 +2921,7 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         data_timestamps=data_timestamps,
         midday_watchlist_eval=midday_watchlist_eval or None,
         order_list=order_list or None,
+        order_alerts=order_alerts or None,
         account=account,
     )
     logger.info("Report generated ({} chars)", len(report))
@@ -2673,6 +2947,7 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         data_timestamps=data_timestamps,
         midday_watchlist_eval=midday_watchlist_eval or None,
         order_list=order_list or None,
+        order_alerts=order_alerts or None,
         account=account,
     )
 
