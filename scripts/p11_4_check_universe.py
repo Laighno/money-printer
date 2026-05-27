@@ -6,4 +6,6 @@ xtc = [
     for c in codes
 ]
 print("size:", len(xtc))
-print("290-310:", xtc[290:310])
+print("chunk 300-400:")
+for i in range(300, min(400, len(xtc)), 10):
+    print(f"  {i}: {xtc[i:i+10]}")
