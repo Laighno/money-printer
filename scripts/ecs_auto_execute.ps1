@@ -4,7 +4,7 @@
 #
 # Flow:
 #   1. cd C:\money-printer && git pull origin <branch>
-#   2. Verify XtMiniQmt.exe is running (else abort — don't trade without it)
+#   2. Verify XtMiniQmt.exe is running (else abort -- don't trade without it)
 #   3. Verify config/portfolio.yaml is the QMT account (8886933837)
 #   4. Run scripts/execute_orders.py --mode auto against latest plan
 #   5. Log everything to C:\money-printer\data\orders\ecs_auto.log
@@ -60,7 +60,7 @@ Log "Step 1: HEAD = $head"
 Log "Step 2: verify XtMiniQmt running"
 $qmt = Get-Process -Name "XtMiniQmt" -ErrorAction SilentlyContinue
 if (-not $qmt) {
-    Abort "XtMiniQmt.exe not running — start it manually on ECS + login + retry"
+    Abort "XtMiniQmt.exe not running -- start it manually on ECS + login + retry"
 }
 Log "  XtMiniQmt pid $($qmt.Id) running"
 
@@ -68,7 +68,7 @@ Log "  XtMiniQmt pid $($qmt.Id) running"
 Log "Step 3: verify portfolio.yaml account = $EXPECTED_ACCOUNT"
 $portfolioContent = Get-Content "$REPO\config\portfolio.yaml" -Raw
 if ($portfolioContent -notmatch "$EXPECTED_ACCOUNT") {
-    Log "  portfolio.yaml does not reference $EXPECTED_ACCOUNT — non-critical, proceeding"
+    Log "  portfolio.yaml does not reference $EXPECTED_ACCOUNT -- non-critical, proceeding"
 }
 
 # Step 4: Verify plan freshness
@@ -76,7 +76,7 @@ $planPath = "$REPO\data\orders\latest.json"
 if (-not (Test-Path $planPath)) { Abort "plan json missing: $planPath" }
 $planAge = ((Get-Date) - (Get-Item $planPath).LastWriteTime).TotalHours
 Log "Step 4: plan age = $([math]::Round($planAge,1))h"
-if ($planAge -gt 30) { Abort "plan older than 30h — likely stale, aborting" }
+if ($planAge -gt 30) { Abort "plan older than 30h -- likely stale, aborting" }
 
 # Step 5: Execute orders
 Log "Step 5: execute_orders.py --mode auto"
