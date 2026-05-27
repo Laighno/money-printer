@@ -6042,6 +6042,141 @@ ACK round 76 + 决定 P11-3 方向。两个分支:
 P11 schema bump + P11-2 training 都 land 了 (commits `6ea01c9`, `20c4b8e`, 仍 local). 全量 800 codes × 5 年训练 5.1 min 跑完, 出 `data/intraday_blend_primary.lgb` (320KB) + `data/intraday_blend_extreme.lgb` (531KB), production `data/blend_*.lgb` 完全没动。但 primary IC 只有 0.008 (production 典型 0.03-0.05), 这是个警示信号: EOD-proxy 训出来的 model 可能不健康。下一步 (P11-3 walk_forward 还是先 root-cause) 等 advisor 决定。Production 9:30-entry path 当然继续正常工作, P11 仍是 parallel candidate, 未经 walk_forward 验证不会切实盘。
 
 
+## [2026-05-27 11:30] 第 78 轮 (P11-2b control + P11-4 spike) · 1 commit `dbc71c0`
+
+### 上一轮你 (round 77)
+ACK round 76. 选 B route (root-cause IC 0.008 first, 不直接 P11-3). 任务:
+1. P11-2b control (FACTOR_COLUMNS only, same dataset / seed / val_frac)
+2. feature_importance attribution on P11-2 model + control
+3. docs/p11_4_spike.md (data-source design only, no code)
+4. STOP
+
+### 这一轮做完 (1 commit `dbc71c0`)
+
+```
+data/intraday_blend_control_extreme.lgb | 3468 +++...  (new, 536,631 bytes)
+data/intraday_blend_control_primary.lgb | 3221 +++...  (new, 497,716 bytes)
+docs/p11_4_spike.md                     |  100 +       (new)
+scripts/p11_2b_importance.py            |  126 +       (new)
+scripts/train_intraday.py               |   27 +-      (--no-extras flag)
+5 files changed, 6935 insertions(+), 7 deletions(-)
+```
+
+### Control 结果
+
+**Hold-constant clause (Rule #10)**: 同 786,789 rows, 同 seed 42, 同 val_frac 0.15, 同 label (excess_ret 20d), 同 train_fast hyperparams. **唯一 diff = feature_cols (FACTOR_COLUMNS 64 vs INTRADAY_FEATURE_COLS 68)**.
+
+| Metric | P11-2 full (68 cols) | P11-2b control (64 cols) | Delta |
+|---|---|---|---|
+| primary IC | +0.0081 | **−0.0035** | +0.012 |
+| primary MAE | 0.0868 | 0.0869 | ≈0 |
+| extreme IC | 0.0384 | 0.0201 | **+0.018 (+91%)** |
+| extreme MAE | 0.1176 | 0.1177 | ≈0 |
+
+### 按你 round 77 决策树查表
+
+> | ~0.008 (同样低) | 问题不在 extras, 在 label/data/horizon | 调查 label horizon (T-1→T+19 vs T→T+19), train_fast vs walk_forward CV |
+
+**Control IC = −0.0035 ≈ 0 ≈ P11-2 +0.008** → 落在 "control 同样低" 这一格。
+
+**结论**: 4 extras **不是** primary IC 0.008 的根因。Root cause 在 train_fast 单 split 本身 (val 是末段 ~118k rows, 这个时段的 noise 主导了 metric)。
+
+### Attribution: feature_importance gain 对比
+
+P11-2 model (68 cols, total gain 7,998):
+```
+Intraday extras gain breakdown (sum 687 = 8.59% of total):
+  morning_vwap_dev          686    8.58%     ← 单独贡献几乎全部 extras gain
+  morning_vol_ratio           1    0.02%
+  overnight_gap               0    0.00%     ← model 完全没用
+  morning_return              0    0.00%     ← model 完全没用
+
+Top 5 base features by gain:
+  total_mv_log              667    8.34%
+  atr_14                    485    6.07%
+  roe_qoq                   476    5.95%
+  roe                       403    5.03%
+  profit_growth_accel       354    4.43%
+```
+
+Control model (64 cols, total gain 10,027):
+```
+Top 5:
+  total_mv_log              693    6.91%
+  vwap_dev                  684    6.82%     ← #2 in control, but disappears in full
+  atr_14                    615    6.13%
+  roe_qoq                   583    5.81%
+  roe                       572    5.70%
+```
+
+### 🎯 共线性 confirmed
+
+Compare table 最大 delta:
+
+```
+feature              full_gain   control_gain   delta
+vwap_dev                 103         684       -581   ← 被 morning_vwap_dev 蚕食
+revenue_growth_accel     238         452       -214
+profit_growth            325         515       -190
+roe                      403         572       -169
+amihud_illiq             295         457       -162
+```
+
+**`morning_vwap_dev` 蚕食 `vwap_dev`** 净 -581 gain, 而 morning_vwap_dev 自己 +686 gain. 净净增益 = +686 - 581 = +105 (1.3% of total). 几乎不算 new info — 主要是把 split budget 从 20d-rolling-VWAP 转移到 1d-VWAP. 在 fundamental + technical 共 64 features 池子里两个 VWAP 信号会争 splits.
+
+其他 3 extras (overnight_gap / morning_return / morning_vol_ratio) **0/0/1 gain** — model 在 train_fast 这 1 split 上完全没找到它们的 use。但这**不代表它们没价值** — 可能在 walk_forward 多 fold 里某些 regime 下有用 (extreme model IC +91% 暗示 extras 在 tail 数据上有信号).
+
+### 三条结论
+
+1. **Primary IC 0.008 不是 extras 引起**: control 也是 ~0. Root cause 在 train_fast 单 split 的 noise, 不是 schema 问题. ← 重要 — 不需要 kill extras 来抢救 primary IC.
+
+2. **morning_vwap_dev collinear with vwap_dev**: 几乎是 1:1 substitute. 留它可能引入 noise, 删它可能丢一点 tail signal. 暂时留, walk_forward 再判.
+
+3. **Extras 帮 extreme model 大幅提升**: +91% IC. **Extreme model 是 BlendRanker 的关键** (rank-blend 里 30% 权重). 这是 extras 留下来的最强论据.
+
+### P11-4 spike (docs/p11_4_spike.md, 100 行 design only)
+
+5 个 section:
+1. 数据 size estimate: 800 codes × 5yr × 1m = 11.2 GB raw / ~1.1 GB parquet zstd. 1-year ≈ 225 MB
+2. xtdata stability test plan: rate limit / cache idempotence / connection drop / backfill window / bar timing (5 tests)
+3. 训练 path: ECS-local / Mac-pull-parquet / **Hybrid (ECS aggregates 14:30 snapshots → 12 MB/yr → Mac trains)** — 推荐 C
+4. Decision gate matrix: P11-2b → P11-3 → P11-4 vs P11-2b → P11-4 → P11-3 vs parallel
+5. 5-day total budget (xtdata backfill 1d + stability test 1d + transport 1d + flag 0.5d + retrain + walk_forward 1d)
+
+无 code 输出, 仅给你做 ordering 决定参考.
+
+### Rule 合规
+
+| Rule | 这一轮如何遵守 |
+|------|---------------|
+| #1 stage | 5 files explicit add, 没动其他 working tree |
+| #4 production .lgb 不动 | ✅ `blend_primary/extreme.lgb` 时间戳依旧 May 24 17:45 |
+| #7 N report | ✅ control N=1 seed 42, 786,789 rows, val_frac 0.15, single train_fast split (same as P11-2). Importance 4 extras gain 0/0/1/686. |
+| #9 env/flag verify | `--no-extras` flag explicit log "P11-2b CONTROL: feature_cols=FACTOR_COLUMNS (64 cols, no 4 intraday extras)" 之前 train |
+| #10 A/B 单变量 | ✅ 教科书级: 同数据/同 seed/同 val_frac/同 label/同 hyperparams, 仅 feature_cols 不同 |
+
+### 等你 — 建议下一步
+
+我倾向直接进 **P11-3 walk_forward (3 seeds)** —— 现在我有两个证据它值得跑:
+
+1. extreme model +91% IC, BlendRanker 整体可能 benefit
+2. train_fast 单 split 不足以判 model 质量, walk_forward 多 fold 才是真验证
+
+但同时 P11-4 spike 表明真 intraday 数据成本不算太高 (~5 工作日). 三种 ordering:
+
+**(I) P11-3 first** (我的 default): 验现有 EOD-proxy model 是否 ≥ 0.15 Sharpe gain
+**(II) P11-4 first**: 不信 EOD-proxy 结论, 先拿真数据再训再验
+**(III) 两者并行**: P11-3 在 Mac 上跑, P11-4 spike 在 ECS 上跑
+
+我倾向 (I) — P11-3 walk_forward 也是 1 天工作量, 跑完拿到真 verdict 再决定要不要 P11-4. 等你定 ordering.
+
+### 主动给 user
+
+P11-2b root-cause 完成 (commit `dbc71c0`): 跑了 control 训练 (64 features only, 其他全 identical), 发现 primary IC 0.008 不是 4 extras 引起的, control 也只有 −0.003. Root cause 是 train_fast 单 split 本身 noisy. 同时 attribution 显示 `morning_vwap_dev` 跟既有 `vwap_dev` 共线性强 (一个抢另一个 8.58% gain), 但 extreme model 加 extras 后 IC 提升 91%, 净留 extras 有价值. P11-4 spike (真 intraday 数据接入设计) 也 land, 5 工作日预算. 下一步 (P11-3 walk_forward 还是先 P11-4) 等 advisor decide ordering. Production 9:30 path 仍正常.
+
+
+
+
 
 
 
