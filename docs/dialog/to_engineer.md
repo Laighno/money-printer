@@ -7383,6 +7383,94 @@ STOP at Phase A 完. Phase B + C 等 round 90 advisor confirm.
 
 用户决: Option B (hybrid training, 9mo real + 78mo proxy) + walk_forward 同步改 14:30 entry. 三套 head-to-head 对比 (EOD baseline / Hybrid+14:30 / EOD-proxy+14:30). Phase A 先修脚本 + fetch ~9mo 数据, ~1小时 wall clock. 我会让工程方先做 Phase A, 完了 confirm data ok 再上 Phase B (重训) + Phase C (3x N=3 walk_forward). Production 9:30 path 仍正常.
 
+## [2026-05-27 21:40] 第 91 轮 (Phase A 数据已到 Mac + Phase B/C release)
+
+### Phase A 完成 (advisor 直接在 ECS 上跑 + SCP 回 Mac)
+
+工程方 round 90 的脚本经历了几轮 bug-fix + 加固 (commit 串 `326de8f → 338e42c → d18c77c → 0c1ed30 → f460a30 → d98077e`):
+
+1. `get_local_data` API 误用 → 改成 `get_market_data` (round 89 已识别)
+2. shape 误判 — get_market_data 返回 `dict[field → df(code × time)]`, 不是 `dict[field → df(time × code)]`. 改用 `stack()` 走 MultiIndex
+3. `download_history_data` per-stock loop 在 800 codes 大概率 hang → 改 `download_history_data2` batch + 100-code chunk
+4. **800-code universe 包含 创业板 (300/301/302) + 科创板 (688/689), 用户没权限**, 跟 `scripts/daily_report.py:949` 生产 filter 对齐, exclude 这些 prefix. universe ~800 → 615.
+5. 即使 615 codes + chunk 100, xtquant 偶发 hang (随机, 进程级 reset 后可恢复). 最后加 **per-chunk 30s 超时 (daemon thread)**, chunk size 100 → 50. 完整跑通.
+
+### 数据 sanity (Mac 端验证)
+
+```
+8 个月份 parquet 全 OK, 总 145MB:
+202509: rows=2,841,300, codes=615, days=22, bars/code=4620 (uniform)
+202510: rows=2,195,550, codes=615, days=17, bars/code=3570 (uniform)
+202511: rows=2,583,000, codes=615, days=20, bars/code=4200 (uniform)
+202512: rows=2,970,450, codes=615, days=23, bars/code=4830 (uniform)
+202601: rows=2,583,000, codes=615, days=20, bars/code=4200 (uniform)
+202602: rows=1,808,100, codes=615, days=14, bars/code=2940 (uniform) ← 春节
+202603: rows=2,841,300, codes=615, days=22, bars/code=4620 (uniform)
+202604: rows=2,712,150, codes=615, days=21, bars/code=4410 (uniform)
+```
+
+**关键**: 即使有 chunks timeout, 每个 code 在每个月份的 bars 都是 uniform 的 (min=max=median). 说明:
+- timeout 的 chunks 其实数据也 cached 上了 (前一次 hang 部分完成)
+- 615 codes 全有数据 (universe 经 创业板/科创板 filter 之后 fully covered)
+- 时段 9:30:00 ~ 14:29:00 (210 个 minute bars/day, 跟 PIT spec 一致, Rule #11 ✓)
+
+Sample bar 检查 600000.SH 2026-04-01: open 10.20 → close 10.27, volume reasonable. 数据 valid.
+
+### Phase B + C spec 不变 (round 89 已 spec)
+
+数据 ok, 直接进 Phase B/C. 重申 spec:
+
+**Phase B**:
+1. Rule #1 archive: `cp data/intraday_blend_primary.lgb data/intraday_blend_primary_eodproxy.lgb.archive` (+ extreme)
+2. `mp/ml/intraday_features.py` 加 `compute_morning_features_hybrid(panel_eod, intraday_1m_dir)`:
+   - 真实 9 mo (2025-09 ~ 2026-04): 用 intraday_1m parquet 算 `morning_return = close_at_14:29 / open_at_9:30 - 1`, `morning_vwap_dev`, `morning_vol_ratio` (注意 round 88 Note 2: qfq alignment for volume)
+   - 其他 78 mo: fall back EOD-proxy 同 P11-2
+   - `overnight_gap` always real (EOD-derived)
+3. `scripts/train_intraday.py` 跑 hybrid panel, 输出新 `data/intraday_blend_*.lgb` (覆盖原 EOD-proxy 版)
+4. 训练 log 报告 hybrid 样本比例
+
+**Phase C**:
+1. `scripts/walk_forward_backtest.py` 加 `ENTRY_TIME` env (`t_plus_1_open` 默认, `14_30` 新 mode):
+   - `14_30` mode: entry price 用 T 14:30 close (从 intraday_1m 2025-09+ 找 14:30 那根 bar 的 close; 2025-09 之前 fall back T close)
+   - exit time matching: T+H 14:30 (或 T+H open if no 14:30 data)
+2. 跑 9 个 walk_forward:
+
+| ID | RANKER_KIND | .lgb | ENTRY_TIME | seed |
+|---|---|---|---|---:|
+| 1-3 | blend | data/blend_*.lgb | t_plus_1_open | 42/43/44 |
+| 4-6 | intraday_blend | hybrid 新 .lgb | 14_30 | 42/43/44 |
+| 7-9 | intraday_blend | `*_eodproxy.lgb.archive` | 14_30 | 42/43/44 |
+
+3. 报告 9-cell 3×3 table + 2 pairwise delta tables (hybrid vs EOD-proxy, hybrid vs EOD baseline)
+
+### 决策规则 (re-affirm)
+
+- Hybrid > EOD-proxy → hybrid .lgb 上 P11-5
+- EOD-proxy > Hybrid → EOD-proxy .lgb 上 P11-5
+- 两者都 < EOD baseline + 0.10 → abort migrate
+
+### Rule reminders
+
+- **Rule #1**: `*.parquet` 不入 git (`.gitignore` 已有 `data/intraday_1m/`)
+- **Rule #4**: 重训前 archive 现有 .lgb
+- **Rule #10**: 9-run hold-constant clause 严格 (only RANKER_KIND/.lgb/ENTRY_TIME 三 dim 不同)
+- **Rule #11**: hybrid feature 公式 = production 14:30 看到的真实 morning features; 14:30 bar 严格 exclude (already enforced in fetch)
+
+### 这一轮你 (Phase B + C)
+
+数据已在 Mac 端 `data/intraday_1m/202509.parquet ~ 202604.parquet`. 直接开干:
+
+1. ACK round 90 + round 91
+2. Phase B (feature recompute + retrain), 写 round 92 报告 hybrid 样本比例 + qfq audit
+3. Phase C (9 walk_forward), 写 round 93 报告 9-cell table + 决策
+4. STOP at round 93. 等 advisor + user confirm migrate/abort 再上 P11-5.
+
+数据 fetch 是 advisor 一手 (你 round 90 ACK 时说"等你 confirm"). 后面 phase B/C 是工程方 owned. 你接.
+
+### 主动给 user
+
+P11-4 Phase A 完成 (advisor 直接在 ECS 上跑了 19min, 多次 hang + 几次脚本 fix). 145MB 8 个月 1m 数据已 SCP 到 Mac, sanity 全 OK (615 codes × 8mo, uniform bar counts, PIT 9:30-14:29 时段一致). 工程方现在做 Phase B (混合 feature recompute + 重训 .lgb) 和 Phase C (9 个 walk_forward 三方对比). 完成后我会让工程方写报告, 然后你 confirm migrate/abort. Production 9:30 path 仍正常.
+
 
 
 
