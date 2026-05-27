@@ -63,7 +63,14 @@ from mp.execution.qmt_broker import (
 # ──────────────────────────────────────────────────────────────────
 
 def _fetch_current_price(code: str) -> Optional[float]:
-    """Get sina realtime price for a single code (cheap, no scaling)."""
+    """Get sina realtime price for a single code (cheap, no scaling).
+
+    Returns None if the price is unavailable OR clearly stale/missing:
+    sina returns field 3 = 0.00 before the market session has produced
+    its first trade of the day (pre-market, between 09:00 and ~09:30).
+    Treating 0.00 as a valid price falsely triggers SELL skip ("dump too
+    low") in preflight_price_drift; callers expect None to mean unknown.
+    """
     try:
         import httpx
         prefix = "sh" if code.startswith(("6", "68", "69")) else "sz"
@@ -75,7 +82,10 @@ def _fetch_current_price(code: str) -> Optional[float]:
             return None
         data = line.split("=", 1)[1].strip('";\r').split(",")
         if len(data) >= 4:
-            return float(data[3])   # field 3 = current price
+            price = float(data[3])   # field 3 = current price
+            if price <= 0.0:
+                return None          # no trade yet / market closed / bad data
+            return price
     except Exception as e:
         logger.warning("realtime price fetch failed for {}: {}", code, e)
     return None
