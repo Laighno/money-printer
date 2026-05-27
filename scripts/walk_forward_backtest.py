@@ -154,6 +154,24 @@ RANKER_KIND = os.environ.get("RANKER_KIND", "blend")  # P10-2: default to produc
 assert RANKER_KIND in ("stock", "blend", "intraday_blend"), \
     f"Unknown RANKER_KIND={RANKER_KIND}"
 
+# P11-4 Phase C (round 91): ENTRY_TIME selects execution price source.
+#   "t_plus_1_open" (default): use next-day open (matches production EOD blend
+#                              path; what P10-CLOSE baseline + P11-3 used)
+#   "14_30":                   use T 14:30 close from data/intraday_1m parquet
+#                              for dates ≥ 2025-09-01 where available, else T
+#                              close fallback. Models the 14:30 production
+#                              entry path; pair with RANKER_KIND=intraday_blend
+#                              for Rule #11 alignment.
+ENTRY_TIME = os.environ.get("ENTRY_TIME", "t_plus_1_open")
+assert ENTRY_TIME in ("t_plus_1_open", "14_30"), \
+    f"Unknown ENTRY_TIME={ENTRY_TIME}"
+
+# P11-4 Phase C (round 91): INTRADAY_HYBRID enables hybrid feature compute
+# when RANKER_KIND=intraday_blend. 1 → 2025-09+ dates use real intraday
+# from data/intraday_1m/*.parquet, else EOD-proxy (matches Phase B
+# training-time hybrid panel). 0 → 100% EOD-proxy (matches P11-3 / P11-2).
+INTRADAY_HYBRID = os.environ.get("INTRADAY_HYBRID", "0") == "1"
+
 # Position-sizing scheme for the Top-K selection.
 #   "equal"      : 1/N each (BASELINE-validated, default).
 #   "inverse_vol": weight ∝ 1 / volatility_20d, normalized.  Lower-vol stocks
@@ -487,6 +505,54 @@ def _build_price_adv_lookup(
     return close_lk, open_lk, adv_lk
 
 
+def _build_entry_lk_14_30(close_lk: Dict[tuple, float]) -> Dict[tuple, float]:
+    """P11-4 Phase C: per (code, date) lookup for T 14:30 entry price.
+
+    Strategy:
+      - For dates in data/intraday_1m/*.parquet (2025-09 ~ 2026-04 by
+        round-89 fetch scope): close of the 14:29:00 bar (last bar
+        before 14:30, per PIT exclude-14:30 rule).
+      - Otherwise: T close (close_lk fallback). This models "if we had
+        intraday data we'd use 14:29 price; absent it, use the EOD close
+        as best proxy for the price the model would see at decision time".
+
+    Returns a dict that overlays close_lk where intraday available, else
+    deferring to close_lk via .get fallback at call sites.
+
+    NOTE Rule #11: production 14:30 entry would use the LIVE 14:30 price
+    at decision time; this backtest approximates with the 14:29 bar's
+    close (1m precision; live snapshot precision is ~1s). This is the
+    same approximation P11-4 Step 1 fetch made.
+    """
+    out: Dict[tuple, float] = {}
+    intra_dir = Path("data/intraday_1m")
+    if not intra_dir.exists():
+        logger.warning("ENTRY_TIME=14_30 but data/intraday_1m missing — full fallback to T close")
+        return out
+    parts = sorted(intra_dir.glob("*.parquet"))
+    if not parts:
+        logger.warning("ENTRY_TIME=14_30 but data/intraday_1m empty — full fallback to T close")
+        return out
+    frames = [pd.read_parquet(p) for p in parts]
+    intra = pd.concat(frames, ignore_index=True)
+    intra["datetime"] = pd.to_datetime(intra["datetime"])
+    # The fetcher excluded 14:30 bar (PIT); the last bar each day is 14:29.
+    # Take last bar per (code, date) — its close is the 14:29 close.
+    intra["date"] = intra["datetime"].dt.normalize()
+    intra = intra.sort_values(["code", "datetime"])
+    last_bars = intra.groupby(["code", "date"]).tail(1)
+    skipped_nan = 0
+    for _, row in last_bars.iterrows():
+        v = row["close"]
+        if pd.isna(v):
+            skipped_nan += 1
+            continue
+        out[(str(row["code"]), pd.Timestamp(row["date"]))] = float(v)
+    logger.info("ENTRY_TIME=14_30: built entry_lk for {} (code, date) pairs from intraday_1m "
+                "({} bars skipped due to NaN close)", len(out), skipped_nan)
+    return out
+
+
 def run_walk_forward():
     """Main walk-forward backtest."""
     t0 = time.time()
@@ -573,12 +639,39 @@ def run_walk_forward():
     # path), per Option C — only the model variable differs vs RANKER_KIND=blend.
     if RANKER_KIND == "intraday_blend":
         from mp.ml.intraday_features import INTRADAY_FEATURE_COLS, INTRADAY_EXTRA_COLUMNS
-        from scripts.train_intraday import compute_extras_for_panel
-        logger.info("RANKER_KIND=intraday_blend — augmenting panel with {} EOD-proxy extras",
-                    len(INTRADAY_EXTRA_COLUMNS))
+        from scripts.train_intraday import (
+            compute_extras_for_panel,
+            compute_extras_for_panel_hybrid,
+            load_intraday_1m,
+            _real_morning_extras_per_code,
+        )
+
+        # P11-4 Phase C: INTRADAY_HYBRID=1 overlays real intraday extras where available.
+        real_extras_by_code: Dict[str, pd.DataFrame] = {}
+        if INTRADAY_HYBRID:
+            intra_long = load_intraday_1m()
+            if not intra_long.empty:
+                for code_xt, code_df in intra_long.groupby("code"):
+                    code = str(code_xt)
+                    bars = bars_map.get(code)
+                    if bars is None or bars.empty:
+                        continue
+                    eod = bars.sort_values("date").reset_index(drop=True)
+                    eod["date"] = pd.to_datetime(eod["date"]).dt.normalize()
+                    eod_vol_ma20 = eod.set_index("date")["volume"].rolling(window=20, min_periods=20).mean().shift(1)
+                    real_extras_by_code[code] = _real_morning_extras_per_code(code_df.assign(code=code), eod_vol_ma20)
+            logger.info("INTRADAY_HYBRID=1 — real intraday extras prepared for {} codes",
+                        len(real_extras_by_code))
+            logger.info("RANKER_KIND=intraday_blend — augmenting panel (hybrid: real where available, else EOD-proxy)")
+        else:
+            logger.info("RANKER_KIND=intraday_blend — augmenting panel with EOD-proxy extras")
+
         extras_frames: List[pd.DataFrame] = []
         for code, bars in bars_map.items():
-            extras = compute_extras_for_panel(bars)
+            if INTRADAY_HYBRID and code in real_extras_by_code:
+                extras = compute_extras_for_panel_hybrid(bars, real_extras_by_code[code])
+            else:
+                extras = compute_extras_for_panel(bars)
             extras["code"] = code
             extras_frames.append(extras[["code", "date"] + list(INTRADAY_EXTRA_COLUMNS)])
         extras_all = pd.concat(extras_frames, ignore_index=True)
@@ -596,6 +689,25 @@ def run_walk_forward():
                     len(feature_cols))
 
     close_lk, open_lk, adv_lk = _build_price_adv_lookup(bars_map)
+
+    # P11-4 Phase C (round 91): ENTRY_TIME=14_30 swaps the execution price
+    # source. Build entry_lk once: T 14:30 close (from intraday_1m for
+    # 2025-09+, T close fallback otherwise). When ENTRY_TIME=t_plus_1_open
+    # (default), entry_lk is empty and code paths read open_lk as before.
+    if ENTRY_TIME == "14_30":
+        entry_lk_14_30 = _build_entry_lk_14_30(close_lk)
+        # Build the effective entry lookup: 14:29 close where available,
+        # else T close (NOT T+1 open — this is the semantic shift for 14:30
+        # entry: decision & execution same day at 14:30 = ~ T close).
+        # Bind to a name so later code can use the same `entry_lk` variable.
+        def _entry_price(code, dt):
+            return entry_lk_14_30.get((code, dt), close_lk.get((code, dt)))
+    else:
+        def _entry_price(code, dt):
+            return open_lk.get((code, dt))
+    logger.info("ENTRY_TIME={} — entry price source: {}",
+                ENTRY_TIME,
+                "intraday_1m 14:29 close + T close fallback" if ENTRY_TIME == "14_30" else "T+1 open")
 
     # All trading dates in the BT window
     bt_start_ts = pd.Timestamp(BT_START)
@@ -792,7 +904,7 @@ def run_walk_forward():
                 # Compute current weights using today's open (execution price).
                 pos_values = {}
                 for c in held_codes:
-                    p = open_lk.get((c, dt), broker.positions[c].current_price)
+                    p = _entry_price(c, dt) or broker.positions[c].current_price
                     pos_values[c] = broker.positions[c].shares * p
                 total_equity = broker.cash + sum(pos_values.values())
                 target_w = 1.0 / TOP_K
@@ -813,8 +925,8 @@ def run_walk_forward():
                     total_value_now = broker.total_value
                     target_per_stock = total_value_now / TOP_K
                     for code in list(broker.positions.keys()):
-                        price_raw = open_lk.get((code, dt))
-                        if price_raw is None or price_raw <= 0:
+                        price_raw = _entry_price(code, dt)
+                        if price_raw is None or pd.isna(price_raw) or price_raw <= 0:
                             continue
                         current_value = broker.positions[code].shares * price_raw
                         excess = current_value - target_per_stock
@@ -828,7 +940,7 @@ def run_walk_forward():
                 # (b) Sell positions not in new selection at today's open
                 for code in list(broker.positions.keys()):
                     if code not in sel_codes:
-                        sell_price = open_lk.get((code, dt), broker.positions[code].current_price)
+                        sell_price = _entry_price(code, dt) or broker.positions[code].current_price
                         broker.sell(code, sell_price, date=dt_str,
                                     adv=adv_lk.get((code, dt)))
 
@@ -841,8 +953,8 @@ def run_walk_forward():
                     raw_scores=pending_raw_scores,
                 )
                 for code, score in pending_selection:
-                    price_raw = open_lk.get((code, dt))
-                    if price_raw is None or price_raw <= 0:
+                    price_raw = _entry_price(code, dt)
+                    if price_raw is None or pd.isna(price_raw) or price_raw <= 0:
                         continue
                     target_value = total_value_now * weights.get(code, 1.0 / TOP_K)
                     broker.buy(code, price_raw, target_value=target_value,
