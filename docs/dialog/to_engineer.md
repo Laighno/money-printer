@@ -6825,6 +6825,88 @@ Output as `docs/p11_4_spike.md` (NEW file), <100 行. 包括:
 
 P11-2 训练完成，但 primary IC 0.008 比 production 0.03-0.05 低 4-5×。怀疑 EOD-proxy 4 个新 features 跟现有 64 EOD features collinear (新 morning_return ≈ 现有 mom_5d 的子集). 走 root-cause B 路线: 1 小时跑 control A/B (64 features only, 无 4 extras) 看是不是 collinearity, 而不是直接走 P11-3 walk_forward (会浪费 1-2 天双 proxy 不可信)。同时启动 P11-4 数据接入 design spike (不写 code), 准备真 intraday 数据替代 EOD-proxy。Production 9:30 path 仍正常工作。
 
+## [2026-05-27 11:32] 第 79 轮 (P11-2b ACK + select (I) P11-3 first)
+
+### ACK round 78 (commits dbc71c0 + fb6c4c5)
+
+- ✅ control A/B 教科书级单变量 (Rule #10 ✓)
+- ✅ root cause clean: train_fast single split 是 0.008 主因, 不是 extras
+- ✅ attribution 表清晰: morning_vwap_dev 蚕食 vwap_dev (collinear), overnight_gap/morning_return/morning_vol_ratio 在 single split 上 0 gain
+- ✅ **extreme IC +91%** with extras — 这是留 extras 的关键论据
+- ✅ docs/p11_4_spike.md 100-line design only, hybrid path 提议清晰
+- ✅ Rule #4 ✓ production .lgb 时间戳没动
+
+### 选 (I) — P11-3 first
+
+理由 (跟你 round 78 推荐对齐):
+
+1. **Extreme +91% IC** 是有意义的信号 — single split 也许 noisy 但 91% lift 大概率不是噪音
+2. **train_fast 单 split 不可信** — walk_forward N=3 多 fold 才是真验证, 用单 split 决定 "EOD-proxy 是否值得做" 不严谨
+3. **如果 P11-3 显示 Sharpe lift ≥ +0.15** → P11 路线 valid, 可以直接 P11-5 上线, P11-4 不一定要做
+4. **如果 P11-3 lift 不显著** → 才是 P11-4 (真 intraday) 的明确动机, 避免提前做无效投资
+5. **1 天 vs 5 天**: P11-3 walk_forward N=3 × 2 configs (intraday vs baseline) = 6 runs × ~8 min ≈ 1 hour wall clock. 极便宜.
+
+### P11-3 spec (precise)
+
+**Setup**:
+- repo HEAD same as round 78 (intraday 模型 `data/intraday_blend_*.lgb` 已存在)
+- `scripts/walk_forward_backtest.py` 已支持 `RANKER_KIND=blend` (P10-2 default). 需要 extend to 也支持 `intraday_blend` 加载 `data/intraday_blend_*.lgb`
+
+**6-run A/B table**:
+
+|  | seed 42 | seed 43 | seed 44 |
+|---|---|---|---|
+| **EOD blend (production)** | (P10-CLOSE baseline) | (P10-CLOSE baseline) | (P10-CLOSE baseline) |
+| **Intraday blend (P11-2 candidate)** | new run | new run | new run |
+
+EOD blend 数字已存在于 P10-CLOSE decision_log 6 数字 table (mean 1.82). 不用再跑.
+只跑 3 个 intraday_blend runs.
+
+**Decision rule (per decision_log P11 entry)**:
+- mean intraday Sharpe ≥ mean EOD Sharpe + **0.15** → **migrate** → P11-5 上线
+- 在区间 [-0.10, +0.15] → archive intraday model, document negative result, **后续可启 P11-4 真 intraday 数据**
+- < -0.10 (intraday 显著差) → **kill P11**, archive, document. EOD-proxy 路线 fundamentally 不 work.
+
+**Hold-constant clause (Rule #10)**:
+- Same: walk_forward window (2020-01 ~ 2025-12), feature universe (hs300+zz500), EXCESS_CAP=0.50, deterministic=True, PYTHONHASHSEED=0, num_threads=1, seeds {42, 43, 44}
+- Different ONLY: RANKER_KIND=blend (baseline) vs RANKER_KIND=intraday_blend (candidate). 即用哪个 .lgb 文件 + 哪个 feature schema.
+
+### Rule reminders
+
+- **Rule #4**: walk_forward 全程 `--skip-update` 不动 production .lgb
+- **Rule #7**: 6 数字报告含 N=3 per config, fixed seeds, deterministic config, EXCESS_CAP env honored
+- **Rule #9**: env/flag verify (RANKER_KIND, EXCESS_CAP) via grep log
+- **Rule #10**: hold-constant clause 显式列出
+- **Rule #11**: walk_forward measurement = production loaded model. **关键**: P11 上线 = production 加载 `data/intraday_blend_*.lgb` 在 14:30 入场. Walk_forward 必须用同样 model + 同样 entry time (14:30 in walk_forward simulation, or accept EOD-proxy assumption)
+
+### Open question for P11-3
+
+Walk_forward 内部 entry time 怎么模拟 14:30 入场?
+
+Option A: 不改 walk_forward 入场逻辑, 仍用 T 收盘价做 entry (跟 baseline EOD blend 同 setup). 这等于把 intraday model 当 EOD candidate 测. **不严格 reflect 14:30 production behavior** 但 verify "intraday-features model 跟 EOD-features model 在同 EOD entry 下哪个更准".
+
+Option B: 改 walk_forward 用 T 14:30 收盘价做 entry. 需要真 intraday 数据 (xtdata) — 但 P11-2 训练用 EOD-proxy, 模拟用真 14:30 会 schema-mismatch.
+
+Option C: 模拟 14:30 用 EOD-proxy formula (T_close 缩放), 跟训练 distribution 一致. **推荐**, 简单, 跟训练假设对齐.
+
+请用 Option C: P11-3 walk_forward 入场价 = T_close × scaling (跟训练 EOD-proxy 同公式). 报告显式说明.
+
+### 这一轮你
+
+1. ACK round 79 + Option C
+2. Extend `scripts/walk_forward_backtest.py` 支持 RANKER_KIND=intraday_blend (加载 `data/intraday_blend_*.lgb` + 用 INTRADAY_FEATURE_COLS 68 features)
+3. 跑 3 个 walk_forward (seeds 42/43/44, RANKER_KIND=intraday_blend, EXCESS_CAP=0.50, --skip-update)
+4. 写 round 80 报告:
+   - 6 数字 table (EOD baseline N=3 from P10-CLOSE + intraday N=3 new)
+   - mean delta Sharpe with decision rule applied (≥+0.15? archive? kill?)
+   - feature_importance over walk_forward folds (是不是 extras 在某些 folds 有 use)
+   - env verify (grep RANKER_KIND log + Winsorized log per Rule #9)
+5. STOP, 别 auto-roll into P11-4 or P11-5
+
+### 主动给 user
+
+选 (I) P11-3 first: 让工程师跑 walk_forward N=3 (intraday_blend), 跟 EOD baseline 6 数字 table 比对. 1 小时 wall clock. 决策规则: ≥ +0.15 Sharpe lift 上线 P11-5, +0.15~-0.10 archive, ≤ -0.10 kill P11. Production 9:30 仍跑.
+
 
 
 
