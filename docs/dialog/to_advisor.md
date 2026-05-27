@@ -6509,6 +6509,123 @@ P11-3 chain 正式 freeze 在 audit trail (commits `d9e91e3` + `b9bd340`). decis
 Production 9:30 path 今天仍正常跑 (账户 8886933837, 7/7 fills 已实战验证).
 
 
+## [2026-05-27 15:25] 第 86 轮 (P11-4 Step 1 fetch script) · 1 commit `e69eafc`
+
+### 上一轮你 (advisor round 84)
+user 决策落地: (1) 14:30 实时入场 (不 14:50 集合竞价), (2) 直接 cutover + 9:30 fallback, (3) **strict path: 先 P11-4 真值重训再上**. P11-4 spec precise: ECS xtdata 拉 hs300+zz500 × 2019-01 ~ 2026-04 1m bars, parquet monthly partitions, rsync 回 Mac. STOP at data fetch 完成, 等 round 85 confirm 后再 Step 2/3/4.
+
+### 这一轮做完 (1 commit `e69eafc`)
+
+新建 `scripts/p11_4_fetch_intraday.py` (278 行) + `.gitignore` 加 `data/intraday_1m/` (大文件不入 git, rsync 走 SCP).
+
+### 脚本核心逻辑
+
+```
+1. universe = hs300+zz500 via get_recommendation_universe (~800 codes)
+2. _code_to_xtquant():  000001 → 000001.SZ,  600000 → 600000.SH,  688000 → 688000.SH
+3. for yyyymm in [201901, 201902, ..., 202604] (76 months):
+   a. xtdata.download_history_data(batch=50 codes, period='1m', month_start..month_end_excl)
+   b. xtdata.get_local_data(field_list=OHLCV, stock_list, period='1m', ...)
+   c. pivot wide → long, filter 09:30 ≤ time < 14:30  ← PIT critical
+   d. save data/intraday_1m/YYYYMM.parquet (zstd compression)
+4. resume-safe: 跳过已存在的 monthly parquet (除非 --force)
+```
+
+**Schema (per-month parquet)**: `code (6-digit no suffix) | datetime | open | high | low | close | volume (int64)`.
+
+### 关键设计决定
+
+| 决策 | 选择 | 理由 |
+|---|---|---|
+| 14:30 bar 是否 include | **不 include** (`time < 14:30`) | 这是 prediction-anchor; include = 信号泄露; 跟 production 14:30 时只能看到 9:30~14:29 一致 (Rule #11) |
+| 单文件大小控制 | monthly partition | 800 codes × ~22 trading days × 240 minutes ≈ 4M rows/month; ~30MB parquet, manageable |
+| Batch size for download_history_data | 50 codes/batch | xtdata throttle 经验值, 太大会 timeout, 太小 RPC overhead |
+| 是否 fill_data | `False` | 不需要 forward-fill, 缺失就 NaN, Mac 端 feature compute 决定 imputation |
+| dividend_type | `"none"` | 真值原始价格; qfq 调整在 Mac 端 feature pipeline 做, 跟 EOD bars 同 source-of-truth |
+| 6-digit code (no .SH/.SZ) | output 保留 6 位 | 跟 mp/data/* 全部 6-digit convention 对齐 |
+
+### Runbook (ECS Windows 执行)
+
+```powershell
+# Full run (1-2 days wall clock first cold fetch)
+cd C:\money-printer
+py -3 scripts\p11_4_fetch_intraday.py --start 20190101 --end 20260430
+
+# Smoke run (3 codes × 1 month, < 5min, verify pipeline)
+py -3 scripts\p11_4_fetch_intraday.py --start 20240101 --end 20240131 --limit-codes 3
+
+# Resume after crash (defaults skip existing months)
+py -3 scripts\p11_4_fetch_intraday.py --start 20190101 --end 20260430
+
+# Force re-fetch (rare, e.g. if found data quality issue in one month)
+py -3 scripts\p11_4_fetch_intraday.py --start 20240901 --end 20240930 --force
+```
+
+### Rsync 回 Mac (after ECS done)
+
+```bash
+# Mac 端
+rsync -av \
+  $ECS_USER@$ECS_HOST:/c/money-printer/data/intraday_1m/ \
+  /Users/laighno/laighno/money-printer/data/intraday_1m/
+
+# Sanity check
+ls -la data/intraday_1m/ | head
+.venv/bin/python -c "
+import pandas as pd
+df = pd.read_parquet('data/intraday_1m/202404.parquet')
+print(df.shape, df.columns.tolist())
+print(df.head())
+print('codes:', df.code.nunique(), 'date range:', df.datetime.min(), '~', df.datetime.max())
+"
+```
+
+### Rule 合规
+
+| Rule | 这一轮如何遵守 |
+|------|---------------|
+| #1 stage diff | scripts + .gitignore 显式 add |
+| #4 production .lgb 不动 | ✅ 这一步只是 data fetch, 不动 model |
+| #7 N report | 暂时 N/A — 跑完 ECS 后才有 row count, 留 round 87 (data sample report) |
+| #9 env/flag verify | argparse 显式 --start/--end/--limit-codes/--force, runbook 已 quote |
+| #11 walk_forward = production | ✅ **关键**: 14:30 bar 严格 EXCLUDE (`time < 14:30`), 跟实盘 14:30 时只能看到 9:30~14:29 完全一致. 训练数据不会比实盘看得多 |
+
+### Mac 端 syntax/sanity 验证
+
+Mac 没 xtquant, 但 module-level 加载 + helper functions 已验证:
+```
+p11_4_fetch_intraday.py compiles cleanly
+Module-level loads OK (xtquant lazy-imported inside _fetch_one_month)
+Code conversion: 000001 -> 000001.SZ
+Code conversion: 600000 -> 600000.SH
+Code conversion: 688000 -> 688000.SH
+Month range 20190101 ~ 20190401: ['201901', '201902', '201903', '201904']
+```
+
+xtquant 实际调用要在 ECS 上跑.
+
+### 这一轮 STOP (按你 round 84 第 4 点)
+
+按 advisor 指令 STOP at data fetch 完成. 这次 commit 只是把脚本交付了 — 实际 ECS execute 是 **user 操作**, 需要 user 在 Windows 上跑. **暂时无 row count / data sample 可报**, 那部分等 ECS 跑完 + rsync 回来后 round 87 报.
+
+### 等你 (advisor)
+
+ACK round 86 + script delivery. 然后等 **user** 在 ECS 跑 fetch + rsync 回 Mac, 我再做 P11-4 Step 2 (feature recompute) + Step 3 (重训 .lgb) + Step 4 (walk_forward N=3 验证 ≥ +0.10).
+
+### 主动给 user
+
+P11-4 Step 1 fetch script 已 land (commit `e69eafc`, 278 行). 下一步 **请你在 ECS Windows 上执行**:
+
+```powershell
+cd C:\money-printer
+py -3 scripts\p11_4_fetch_intraday.py --start 20190101 --end 20260430
+```
+
+预计 1-2 天 wall clock (xtdata throttle). 跑完后 rsync 回 Mac (runbook 在 round 86 报告里). 然后 advisor 那边 confirm 数据 ok 我就上 Step 2 (Mac 端 feature recompute + 重训). 期间 production 9:30 path 仍正常跑. 如果 ECS execute 遇到 throttle / xtdata API 报错, 可以先用 `--limit-codes 3 --start 20240101 --end 20240131` smoke 一下 verify 脚本能跑通。
+
+
+
+
 
 
 
