@@ -6483,6 +6483,133 @@ P10-2 bundle 全 land (commit 94e63f4). 整条 P9-P10-P10-2 chain (3 sub-chain, 
 
 谢谢这个 sub-chain (P10-2) 的精准执行 — 5 项 1 commit + verify run 全自洽. 整条 chain 收尾干净.
 
+## [2026-05-27 10:30] 第 73 轮 (P11-START) · intraday re-prediction at 14:30
+
+### Trigger
+
+User activated P11 candidate (queued 2026-05-27 09:00, see decision_log)
+right after first successful live execute at 9:30 today (account 8886933837,
+7/7 orders filled, total ¥104,798 → ¥104,154 with ¥841 actual slippage
+savings vs feared 1% buffer cost).
+
+User's goal: capture additional alpha by re-predicting at T 14:30 with
+intraday features and executing via 集合竞价收盘 14:55-15:00.
+
+Hypothesis (per decision_log P11 entry): 14:30 re-scoring reduces 20d→19d
+prediction noise AND removes 1% limit buffer cost. Net Sharpe improvement
+unknown, requires walk-forward verification.
+
+### Why this needs a real chain
+
+Current BlendRanker is OOD at 14:30 entry. Three things differ from
+training distribution:
+1. Feature timing: T-1 close → T 14:30 intraday
+2. Label horizon: 20d → ~19d (T 14:30 → T+19 close)
+3. Feature vector: includes intraday OHLCV which doesn't exist in EOD-only
+   training data
+
+This is a new model + new walk_forward + new execution path. Not a config
+flag flip. Expected timeline 2-4 weeks per decision_log.
+
+### Phase breakdown (you scope, I review each)
+
+**P11-1** (~2-3 days): intraday feature pipeline
+  - new module mp/ml/intraday_features.py
+  - inputs: yesterday EOD bars + today 9:30-14:30 OHLCV (minute bars or
+    aggregated VWAP)
+  - outputs: feature vector compatible with BlendRanker FEATURE_COLS shape
+    (so the trained model can ingest it) OR a new FEATURE_COLS_INTRADAY
+    schema if features genuinely differ
+  - design decision: reuse current 64 features as much as possible (replace
+    EOD close with 14:30 close), add 1-3 intraday-specific (morning return,
+    morning VWAP/close ratio, morning volume vs avg). Keep schema small.
+
+**P11-2** (~3-5 days): train BlendRanker on intraday features
+  - new training entry point: mp/ml/train_intraday.py
+  - label: 14:30 → T+19 close excess_ret
+  - dataset construction: backfill 14:30 snapshots for 2020-01 ~ 2025-12
+    (this is the hard part — historical intraday data availability)
+  - alternative if intraday history unavailable: synthesize from minute bars
+    if we have them, OR start with shorter backtest (2024-2025) and accept
+    smaller N
+  - Save model artifacts to data/intraday_blend_*.lgb (parallel to current
+    data/blend_*.lgb — DO NOT overwrite production)
+
+**P11-3** (~2-3 days): walk_forward verify
+  - new variant: scripts/walk_forward_backtest.py --intraday-entry
+    or env RANKER_KIND=intraday_blend
+  - simulate executing at T 14:30 (use 14:30 actual close for both label
+    construction and entry price)
+  - run N=3 deterministic (seeds 42/43/44) for both 9:30 baseline and
+    14:30 variant. Output 6-number table same format as P10-1.
+  - decision rule (decision_log already specified):
+    - 14:30 Sharpe ≥ 9:30 Sharpe + 0.15 → migrate
+    - else → archive negative result + decision_log
+
+**P11-4** (~3-5 days): ECS intraday data reliability
+  - Aliyun/火山云 IP currently rate-limited by Sina/EM. Fix options:
+    (a) proxy via 阿里云 国内 IP that is NOT 火山云 — separate small ECS
+        only for data
+    (b) tushare paid API (~¥500/mo, no rate limit if subscribed)
+    (c) akshare with local cache primed by Mac, refreshed during 9:30-14:30
+        — Mac stays on for this window, ECS pulls from cache
+    (d) THS subscription + xtdata real-time push (already available via
+        XtMiniQmt — investigate if xtdata can serve intraday minute bars)
+  - recommend (d) first if xtdata supports — keeps stack uniform.
+
+**P11-5** (~1-2 days): execute path at 14:50
+  - new Task Scheduler entry: T 14:30 trigger
+  - flow: 14:30 score → 14:45 generate plan → 14:50 dispatch → 14:55-15:00
+    集合竞价收盘 撮合
+  - REUSE existing scripts/ecs_auto_execute.ps1 pattern (parametrize the
+    trigger time + plan source)
+
+**P11-close** (2 weeks parallel run):
+  - run both 9:30 entry (current) + 14:30 entry on paper / dryrun for 2 wk
+  - compare actual fills + actual P/L
+  - if 14:30 wins consistently → cut over real money
+  - if 9:30 wins or noisy → archive 14:30, document
+
+### Rule reminders
+
+- **Rule #1**: dataset / model / training scripts staged → diff before commit
+- **Rule #4**: production data/blend_*.lgb DO NOT touch. New models go to
+  data/intraday_blend_*.lgb
+- **Rule #7**: training claims include N (seeds, walk-forward folds, splits)
+- **Rule #9**: any env / flag override (e.g. --intraday-entry) must
+  verify-consume via grep behavior log
+- **Rule #10**: A/B 14:30 vs 9:30 keep all other vars constant (same seeds,
+  same feature preset, same EXCESS_CAP, same universe). Cross only on entry
+  time.
+- **Rule #11**: walk_forward measurement ranker must match production
+  loaded ranker — for P11 this means walk_forward INTRADAY entry must
+  test the model that will actually load in production at 14:30.
+
+### Out-of-scope for P11
+
+- Don't try to also switch ranker type. Keep BlendRanker, just shift entry.
+- Don't try to also widen universe (科创板/创业板 still filtered).
+- Don't try to change daily_report rebalance logic. P11 is "earlier entry"
+  not "more frequent rebalance".
+
+### 这一轮你
+
+1. ACK P11-START (1 line)
+2. Start P11-1 (intraday feature pipeline). When done, write round 74
+   report with diff stat + feature column schema.
+3. STOP at end of P11-1. Don't auto-roll into P11-2 — I want to review
+   the feature design before training.
+
+### 主动给 user
+
+P11 chain started 2026-05-27 10:30 right after live execute success. Will
+be 2-4 weeks of staged work. P11-1 (feature pipeline) is the foundation —
+will commit + report when done.
+
+Production 9:30-entry path (current) keeps running unchanged. P11 is a
+parallel candidate, gated on positive walk_forward Sharpe diff before
+any real-money cutover.
+
 
 
 
