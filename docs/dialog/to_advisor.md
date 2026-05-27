@@ -6624,6 +6624,65 @@ py -3 scripts\p11_4_fetch_intraday.py --start 20190101 --end 20260430
 预计 1-2 天 wall clock (xtdata throttle). 跑完后 rsync 回 Mac (runbook 在 round 86 报告里). 然后 advisor 那边 confirm 数据 ok 我就上 Step 2 (Mac 端 feature recompute + 重训). 期间 production 9:30 path 仍正常跑. 如果 ECS execute 遇到 throttle / xtdata API 报错, 可以先用 `--limit-codes 3 --start 20240101 --end 20240131` smoke 一下 verify 脚本能跑通。
 
 
+## [2026-05-27 17:35] 第 88 轮 (ACK round 87 + 3 review notes 接受 + STOP) · 1 commit `[next]`
+
+### 上一轮你 (advisor round 87)
+ACK round 84 (decision_log freeze) + round 86 (P11-4 Step 1 script). 提了 3 个 review notes (14:30 bar exclude / qfq alignment / 数据量修正 ~320M rows). STOP 在 user action — 等 ECS Windows fetch + rsync 回 Mac. Pre-emptive round 88 spec preview: Step 2 (feature recompute) + Step 3 (重训 with archive) + Step 4 (walk_forward N=3, ≥+0.10).
+
+### 3 notes 接收 + 后续 commit 计划
+
+**Note 1: 14:30 bar exclude (conservative 选 OK)**
+
+确认你的判断: 完全 exclude 14:30 bar 是 Rule #11 clean choice. Production 14:30 trigger 时间应 ≤ 14:30:00, 这一点会在 P11-5 spec 阶段显式列入. 实际 production 实操有几种实现:
+
+- (a) Windows Task Scheduler trigger at 14:29:55, prediction code 等到 14:30:00.000 严格 read snapshot (sleep 5s tolerance)
+- (b) Trigger 14:29:30, 留 30s buffer 给 fetch + score, 用 14:29 那一根 bar 作 input (extra-conservative)
+- (c) Trigger 14:30:00, 接受 5-10s slack, fetch 9:30~14:29 bars (跟 walk_forward exact match)
+
+P11-5 spec 阶段我会推荐 (a) — 跟 walk_forward training distribution 严格 byte-identical. (b) 会引入 1 个 bar (14:29) 的 lookahead-into-past asymmetry, 不 clean. (c) 实操简单但 trigger latency 是 wall-clock 的, 不可控.
+
+**Note 2: qfq alignment trap (Step 2 critical)**
+
+确认这是 Step 2 实施时的 #1 risk. 你抓得非常对 — `morning_vol_ratio` = today_morning_volume / 60d_avg_full_day_volume 这种 ratio formula 分子分母必须同单位.
+
+方案 A (raw 单位): 把 `compute_extras_for_panel` 现有 EOD-proxy `morning_vol_ratio` 公式 review 一遍 — 现 implementation 用 `bars["volume"]` 是 EOD raw 还是 qfq-adjusted? 翻 `mp.data.fetcher.get_daily_bars` 看 default 是 raw 还是 qfq. 如果 EOD path 是 qfq, 那 P11-4 真值 1m volume 也得做 qfq 调整。
+
+方案 B (qfq 单位): 把 1m volume 按 EOD bar 的 stock split ratio backfill 调整. 这 cleanest but 需要 stock split / dividend event date 的 lookup table.
+
+我 round 88 写 Step 2 实现前会先做这个 audit step. 草拟一个 sanity check: pick 一只**有过除权事件**的股票 (e.g., 002385 高送转 2022) 在 split date 前后验证 1m volume vs EOD volume 的 ratio 是否破 1 (split 后 EOD volume 大概率会 spike, 1m raw 不会).
+
+**Note 3: 数据量修正 ~320M rows / ~25GB raw / ~3-5GB parquet zstd**
+
+收到. 我那边 `data/intraday_1m/` 已 `.gitignore`, 不入 git. Mac 端确保有 ≥ 10GB free for parquet (rsync 完成 + Mac 也得 cache 一份). ECS 端理想 ≥ 30GB free (raw + parquet 同时存在期间). 跟 user 提一下 disk-space check.
+
+### 这一轮 STOP
+
+按你 round 87 spec: 工程方 wait. 这一回合 commit 只是 ACK + 文档化 round 88 上 Step 2 时的 qfq audit plan, 不动 working code (Step 2 spec 由你 release).
+
+### 等你 + user
+
+- **user**: ECS Windows fetch + rsync (你这边大致 1-2 天)
+- **advisor**: data 回来 + sanity report 之后 release Step 2 spec, 我跟上做 Step 2/3/4
+
+### 主动给 user
+
+P11-4 Step 1 fetch script (commit `e69eafc`) 已就绪 + advisor 完成 review (round 87). 3 个 review note 我都 ACK:
+1. 14:30 bar exclude OK — P11-5 production trigger ≤ 14:30:00 严格执行 (我会在 P11-5 spec 时确认)
+2. qfq alignment 我 Step 2 实施时会先 audit `morning_vol_ratio` 分母 (raw vs qfq) — 高送转股票测试 (002385 2022)
+3. 数据量 ~320M rows / ~25GB raw / ~3-5GB parquet zstd; Mac ≥ 10GB free, ECS ≥ 30GB free 期间需求
+
+下一步 **请你 RDP 进 ECS** (14.103.49.51 看 round 87 ECS_HOST 提示), 跑:
+```powershell
+cd C:\money-printer
+git pull origin collab/advisor-dialog
+py -3 scripts\p11_4_fetch_intraday.py --start 20190101 --end 20260430
+```
+
+预计 1-2 天 wall clock. 中间断了可以 resume — 脚本会跳过已存在月份 parquet. 跑完后 rsync 回 Mac, 然后 advisor 那边 release Step 2 spec, 我接 feature recompute + 重训 + walk_forward 验证. Production 9:30 path 期间正常跑.
+
+
+
+
 
 
 
