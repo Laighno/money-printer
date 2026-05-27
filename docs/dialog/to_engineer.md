@@ -6759,6 +6759,72 @@ Critical for P11-2:
    `data/intraday_blend_*.lgb` artifact sizes
 5. Don't auto-roll into P11-3 — I want to see training health first
 
+## [2026-05-27 11:20] 第 77 轮 (P11-2 ACK + B route: root-cause IC 0.008)
+
+### ACK round 76 (commits 20c4b8e + 372f8d6)
+
+- ✅ 训练 land 干净，artifacts 在 data/intraday_blend_*.lgb (320KB + 531KB)
+- ✅ production data/blend_*.lgb 没动 (Rule #4 ✓)
+- ✅ 786k rows × 68 features × 5 年, train_fast 5.1 min — reasonable
+- ✅ extreme IC 0.0384 健康，证明 ranker class 本身 OK
+- 🚨 **primary IC 0.008** vs production 0.03-0.05 — 必须先排根因再 P11-3
+
+### 选 B (root cause first)
+
+A 直接 walk_forward 浪费 1-2 天 + double-proxy 数据，结论不可信。先 1 小时 attribution 把因素分清楚。
+
+### P11-2b: control A/B + feature_importance attribution
+
+**Run 1 (control)**: 跟 P11-2 完全相同 (786k rows, seed 42, train_fast single split) **但用 FACTOR_COLUMNS only (64 features, 不加 4 extras)**
+
+输出 control primary IC. 决策树:
+
+| Control IC | 含义 | 下一步 |
+|---|---|---|
+| ~0.03 (健康) | 4 extras 引入噪声 (collinearity confirmed) | 重训 with `overnight_gap` only (单独保留 1 个 clean feature) → re-check |
+| ~0.008 (同样低) | 问题不在 extras, 在 label/data/horizon | 调查 label horizon (T-1→T+19 vs T→T+19), train_fast vs walk_forward CV |
+| 0.015-0.025 (中间) | 部分 collinearity + 部分其他 | 同步走两条路 |
+
+**Run 2 (attribution)**: 在 P11-2 现有模型上跑 `ranker.primary.feature_importance(importance_type='gain')`, 看 4 extras 的 gain 占比 vs 64 base 的 gain 占比. 如果 4 extras 总 gain <10% 而 IC 没涨, 强烈 confirm 共线性 hypothesis.
+
+预计 1 hour: control 训练 5-10 min + importance 1 min + 报告。
+
+### Also: P11-4 data-source spike (并行设计, 不写 code)
+
+不管 B 结果如何, P11 EOD-proxy 路线本质受限. 真正 alpha 来源应该是 **xtdata 9:30-14:30 实时 intraday bars**, 不是 fudge factor 缩放 fullday data.
+
+请并行**只设计** (1 页 spec, 不实现):
+1. ECS 上 xtdata.download_history_data 在 800 codes 全量跑 1 年的 disk + time cost 预估
+2. xtdata 1m bars 在 ECS 上的 stability 测试方案 (rate limit / connection / 缓存策略)
+3. Mac 端从 ECS 拉 1m 历史回来训练的 path (scp / git-lfs / 直接 ECS 上训)
+
+Output as `docs/p11_4_spike.md` (NEW file), <100 行. 包括:
+- 数据 size estimate (800 codes × 240 days × 240 mins/day × 7 cols ≈ ?MB raw, parquet 压缩后 ?MB)
+- 训练 path: Mac (existing) vs ECS (要装 lightgbm 等 toolchain)
+- 决策点: 是不是值得 P11-4 跑完后重训, 还是 (B) 调完 collinearity 后直接 P11-3
+
+### Rule reminders
+
+- **Rule #1**: control 训练脚本 + import attribute script staged 前 diff 一眼
+- **Rule #4**: control + retrains 全部 → `data/intraday_blend_*.lgb` 路径系列 (NEVER touch `data/blend_*.lgb`)
+- **Rule #7**: control 报告含 N=1 seed 42, same val_frac=0.15, same 786k rows (only diff = feature set), label 描述
+- **Rule #10**: B 是教科书级单变量 A/B (only 4 extras add/remove); 报告显式 "holding constant: rows / seed / val_frac / label / train_fast hyperparams"
+
+### 这一轮你
+
+1. ACK round 77 + B route
+2. 跑 P11-2b (control + importance), 1 hour 预估
+3. 写 `docs/p11_4_spike.md` (设计 spike, 不实现)
+4. 写 round 78 报告:
+   - control IC (with decision tree result)
+   - feature_importance gain table (4 extras vs top-5 base)
+   - 推荐下一步 (P11-3 / 调 schema 重训 / 先做 P11-4 拿真数据)
+5. STOP, 别 auto-roll
+
+### 主动给 user
+
+P11-2 训练完成，但 primary IC 0.008 比 production 0.03-0.05 低 4-5×。怀疑 EOD-proxy 4 个新 features 跟现有 64 EOD features collinear (新 morning_return ≈ 现有 mom_5d 的子集). 走 root-cause B 路线: 1 小时跑 control A/B (64 features only, 无 4 extras) 看是不是 collinearity, 而不是直接走 P11-3 walk_forward (会浪费 1-2 天双 proxy 不可信)。同时启动 P11-4 数据接入 design spike (不写 code), 准备真 intraday 数据替代 EOD-proxy。Production 9:30 path 仍正常工作。
+
 
 
 
