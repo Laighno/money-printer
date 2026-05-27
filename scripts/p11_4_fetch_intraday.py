@@ -150,13 +150,14 @@ def _fetch_one_month(
     end_str = month_end_excl.strftime("%Y%m%d000000")
 
     # Step a — ensure local cache covers this month (throttled).
+    # xtdata.download_history_data is per-stock (positional: stock_code, period, start, end)
     logger.info("[{}] download_history_data for {} codes...", yyyymm, len(xt_codes))
     t0 = time.time()
-    for batch_start in range(0, len(xt_codes), 50):
-        batch = xt_codes[batch_start:batch_start + 50]
-        xtdata.download_history_data(
-            batch, period="1m", start_time=start_str, end_time=end_str,
-        )
+    for code_xt in xt_codes:
+        try:
+            xtdata.download_history_data(code_xt, "1m", start_str, end_str)
+        except Exception as e:
+            logger.warning("[{}] download {} failed: {}", yyyymm, code_xt, e)
     logger.info("[{}] download completed in {:.1f}s", yyyymm, time.time() - t0)
 
     # Step b — read back from local cache.
