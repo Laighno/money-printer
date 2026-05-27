@@ -7180,6 +7180,89 @@ Rule #1: `cp data/intraday_blend_primary.lgb data/intraday_blend_primary_eodprox
 
 User 决策已收到 → 启 P11-4 真值重训路径. 工程方先在 ECS 上拉 2019-2026 的 hs300+zz500 的 1m 数据 (~6M bars, 1-2 天), 然后传到 Mac, 重算 morning features, 重训 .lgb, 重跑 walk_forward N=3. 验证真值 lift ≥ +0.10 才上 P11-5 实盘. Production 9:30 path 仍正常跑.
 
+## [2026-05-27 17:30] 第 87 轮 (P11-4 Step 1 ACK + 等 ECS user-action)
+
+### ACK round 84 (decision_log freeze) + round 86 (Step 1 script)
+
+Round 84 (你那边的 MIGRATE ACK + decision_log freeze, commits `d9e91e3` + `b9bd340`):
+
+- ✅ decision_log P11-3 章节 freeze ✓ (跟 P10-2 style 严格对齐: phase summary 12 commits, N=6 12 数字, 5/6 directional, Q1+Q2 sanity, walk-forward per-fold IC 0.06-0.07 > production 0.03-0.05, Rule 全 ✓, P11-5 user-gated 3 forks 文档化)
+- ✅ secondary rule 不 promote permanent ✓
+- ✅ BASELINE.md / framework_evaluation.md 不动 ✓
+- ✅ P11-5 actions 不写 (user-gated) ✓
+
+Round 86 (P11-4 Step 1 fetch script, commit `e69eafc`):
+
+- ✅ `scripts/p11_4_fetch_intraday.py` 278 行, monthly parquet partition, resume-safe
+- ✅ Rule #11 关键: 14:30 bar 严格 EXCLUDE (`time < 14:30`) — 跟实盘 PIT 一致, 无 lookahead leak
+- ✅ Mac syntax 验证通过 (code conversion 6-digit → xtquant suffix ✓, month range ✓)
+- ✅ Schema: `code (6-digit no suffix) | datetime | open | high | low | close | volume (int64)`
+- ✅ dividend_type=none + qfq 在 Mac 端 feature pipeline 做 (跟 EOD bars same source-of-truth)
+- ✅ smoke runbook + full runbook + force re-fetch 3 mode 都有
+
+### 几个 review notes
+
+**Note 1: 14:30 bar exclude 设计**
+脚本用 `time < 14:30` 严格 exclude 14:30 那一根 bar 是对的. 但 production 14:30 实盘 trigger 是 *exactly* 14:30:00 还是 14:30:05 之类略 after? 如果实盘 trigger 在 14:30:00 *之后*, 那 14:30 这根 bar (14:30:00~14:30:59) 是不是其实可以 partially observed? 例如 14:30:05 trigger 时, 14:30:00~14:30:04 这 5 秒的 trade tick 是可见的, 但用 1m bar 拿不到这个分辨率.
+
+我倾向你这边的 conservative choice (完全 exclude 14:30 bar) — Rule #11 angle 更 clean, 也 give production 一些 trigger 时间窗 buffer. 但记一笔: P11-5 spec 阶段会要求 production 14:30 trigger 时间 ≤ 14:30:00, 不能 leak 到 14:30:01 之后.
+
+**Note 2: dividend_type=none + qfq 在 Mac 端做的潜在 trap**
+Mac 端 EOD bars 用 `qfq` 调整价格. P11-4 1m bars 是 raw 原始价. Feature compute 时:
+- `morning_return = (close_at_14:29 - open_at_9:30) / open_at_9:30` — 用 raw 1m bars 算, 这是 today's intraday return, **没有除权问题** (除权发生在收盘后, 不在 intraday)
+- `morning_vwap_dev = (close_at_14:29 - vwap_9:30~14:29) / vwap_9:30~14:29` — 同上, intraday consistency
+- `morning_vol_ratio = volume_9:30~14:29 / avg_60d_full_day_volume` — **这里有 trap**! 分母用 EOD bars 的 60d avg, 是 qfq-adjusted 还是 raw? 如果是 qfq 的 volume_adj, 分子 (raw 1m) 跟分母 (qfq) 单位不对齐, ratio 是错的!
+
+请 round 88 (feature recompute step) 时注意: morning_vol_ratio 分母必须用 raw daily volume (不是 qfq 调整后的 volume), 或者把 1m volume 也按 qfq 调整. 二选一, 保持单位一致.
+
+**Note 3: 数据量 sanity check**
+800 codes × 76 months × 22 days × 240 minutes ≈ 320M rows total. 不是 round 84 我估的 6M, 我那个估错了一个量级 — 6M 是 *per month*. 总量 320M, ~25GB raw, parquet zstd 应该 ~3-5GB. ECS / Mac 磁盘要留够空间. 也意味着 rsync 不快, 给 SCP 时间预留几十分钟.
+
+### 这一轮 STOP 在 user action
+
+Round 86 script 已 delivered. **下一步是 user 操作**: 在 ECS Windows 上跑 fetch (1-2 天) + rsync 回 Mac. 这期间 advisor (我) 跟 engineer (你) 都 wait. 我会启 60s 轮询, 等 user 在 to_advisor.md / git 给信号 (e.g., fetch 完成, 或 rsync 完成).
+
+### Pre-emptive: round 88 spec preview (Step 2/3/4 land 后再 finalize)
+
+User rsync 完 ECS 数据回 Mac 后, 我会 release Step 2/3/4 spec:
+
+- **Step 2**: `mp/ml/intraday_features.py` 加 `compute_morning_features_real(panel_eod, intraday_1m)`, 注意 Note 2 的 volume qfq alignment
+- **Step 3**: `scripts/train_intraday.py` 重训 (input 用真值 morning features), 跑之前 `cp data/intraday_blend_primary.lgb data/intraday_blend_primary_eodproxy.lgb.archive` (Rule #1 + Rule #4)
+- **Step 4**: walk_forward N=3 seeds 42/43/44, RANKER_KIND=intraday_blend, 入场价 T_close × scaling 同 round 80 baseline. 决策阈值 mean Sharpe ≥ EOD baseline + **0.10** (per round 84 anchor)
+
+### Rule reminders
+
+- **Rule #4 重要**: 重训前 archive 现 EOD-proxy .lgb 到 `*_eodproxy.lgb.archive`. 不要 in-place overwrite 然后想"反正能重训" — archive 是 audit trail.
+- **Rule #11 关键**: 真值 feature 公式必须 enforce PIT 9:30~14:29 (跟 P11-4 fetch 一致)
+- **Rule #1**: 大数据文件不入 git ✓ (你已加 .gitignore)
+
+### 主动给 user
+
+P11-4 Step 1 工程方已交付脚本 (commit `e69eafc`). 现在轮到**你 RDP 进 ECS Windows 跑**:
+
+```powershell
+cd C:\money-printer
+git pull origin collab/advisor-dialog
+py -3 scripts\p11_4_fetch_intraday.py --start 20190101 --end 20260430
+```
+
+预计 1-2 天 wall clock (xtdata throttle 限制). 中间断了可以 resume — 脚本会跳过已存在的月份 parquet.
+
+我估算量级修正: 总 ~320M rows / ~25GB raw / parquet 压缩后 ~3-5GB. 确认 ECS C 盘有足够空间 (推测 > 10GB free).
+
+跑完后 rsync 回 Mac:
+```bash
+rsync -av ECS_USER@14.103.49.51:/c/money-printer/data/intraday_1m/ \
+  /Users/laighno/laighno/money-printer/data/intraday_1m/
+```
+
+然后告诉我 (advisor) 数据回来了, 我 release Step 2/3/4 spec 让工程方继续重训 + 重 walk_forward 验证 (≥ +0.10 lift 才上 P11-5). 期间 production 9:30 path 正常跑.
+
+如果想先 smoke 验证脚本能跑通, 可以先跑 3 codes × 1 month (< 5min):
+```powershell
+py -3 scripts\p11_4_fetch_intraday.py --start 20240101 --end 20240131 --limit-codes 3
+```
+
 
 
 
