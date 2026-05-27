@@ -6175,6 +6175,134 @@ amihud_illiq             295         457       -162
 P11-2b root-cause 完成 (commit `dbc71c0`): 跑了 control 训练 (64 features only, 其他全 identical), 发现 primary IC 0.008 不是 4 extras 引起的, control 也只有 −0.003. Root cause 是 train_fast 单 split 本身 noisy. 同时 attribution 显示 `morning_vwap_dev` 跟既有 `vwap_dev` 共线性强 (一个抢另一个 8.58% gain), 但 extreme model 加 extras 后 IC 提升 91%, 净留 extras 有价值. P11-4 spike (真 intraday 数据接入设计) 也 land, 5 工作日预算. 下一步 (P11-3 walk_forward 还是先 P11-4) 等 advisor decide ordering. Production 9:30 path 仍正常.
 
 
+## [2026-05-27 13:15] 第 80 轮 (P11-3 walk_forward 3-seed) · 1 commit `4d64de2`
+
+### 上一轮你 (round 79)
+ACK round 78. 选 (I) P11-3 first. Option C 入场价 (T_close × scaling, 跟训练 EOD-proxy 同公式 — 但实际 simulator 路径 unchanged, T+1 open). 任务: extend walk_forward 支持 RANKER_KIND=intraday_blend → 跑 N=3 seeds 42/43/44 → 6 数字 table → 决策规则应用 (+0.15 / [-0.10,+0.15] / <-0.10).
+
+### 这一轮做完 (1 commit `4d64de2`)
+
+```
+data/reports/p11_3/wf_seed42.md  | 158 +  (new)
+data/reports/p11_3/wf_seed43.md  | 158 +  (new)
+data/reports/p11_3/wf_seed44.md  | 158 +  (new)
+scripts/walk_forward_backtest.py | 181 +/-27  (RANKER_KIND=intraday_blend + 一些 working-tree pre-existing minor WIP 一并 sweep up)
+4 files changed, 628 insertions(+), 27 deletions(-)
+```
+
+### 6-数字 A/B Table
+
+**Hold-constant (Rule #10)**: window 2020-01 ~ 2026-04, universe hs300+zz500, Top-K=10, conviction sizing, EXCESS_CAP=0.50 winsorize ON, PYTHONHASHSEED=0, deterministic=True num_threads=1 force_row_wise=True, --skip-update (Rule #4). **唯一 diff**: RANKER_KIND=blend (baseline) vs intraday_blend (candidate); 即 feature_cols 64 vs 68 (+ 4 morning extras EOD-proxy).
+
+#### Intraday_blend (NEW, this round)
+
+| Metric | seed 42 | seed 43 | seed 44 | **mean (N=3)** |
+|---|---:|---:|---:|---:|
+| Sharpe | 1.95 | 1.92 | 1.98 | **1.95** |
+| Annual | 61.50% | 60.57% | 60.71% | **60.93%** |
+| Vol | 31.62% | 31.58% | 30.71% | 31.30% |
+| Max DD | -27.29% | -32.24% | -24.34% | **-27.96%** |
+| Total ret | 1670.77% | 1610.79% | 1619.45% | 1633.67% |
+
+#### EOD blend baseline (from BASELINE.md / P10-CLOSE)
+
+| Metric | seed 42 | seed 43 | seed 44 (worst) | **mean (N=3)** |
+|---|---:|---:|---:|---:|
+| Sharpe | 1.90 | 1.89 | 1.67 | **1.82** |
+| Annual | 60.42% | 60.32% | 51.66% | **57.47%** |
+| Vol | 31.85% | 31.86% | 30.93% | 31.55% |
+| Max DD | -36.30% | -33.31% | -38.16% | **-35.92%** |
+
+#### Delta
+
+| Metric | intraday mean | EOD mean | **Delta** |
+|---|---:|---:|---:|
+| Sharpe | 1.95 | 1.82 | **+0.13** |
+| Annual | 60.93% | 57.47% | **+3.46 pp** |
+| Vol | 31.30% | 31.55% | -0.25 pp (≈ 0) |
+| Max DD | -27.96% | -35.92% | **-7.96 pp 优** |
+
+Per-seed Sharpe delta: **+0.05, +0.03, +0.31** — 3/3 directional positive. Worst seed 44 rescue +0.31 是 dispersion 来源.
+
+### 决策规则应用 (你 round 79 spec)
+
+> - mean intraday Sharpe ≥ mean EOD Sharpe + **0.15** → migrate → P11-5 上线
+> - 在 [-0.10, +0.15] → archive intraday model, document negative result, 后续可启 P11-4
+> - < -0.10 → kill P11
+
+**Delta = +0.13 → 落在 [-0.10, +0.15] archive 区, 严格按规则不 migrate.**
+
+但我建议你**人 judge** before final archive, 因为:
+
+1. **+0.13 距 +0.15 仅 0.02 — measurement noise 边界**: P10-CLOSE baseline std 是 0.13 (1.90/1.89/1.67), 我这边 intraday std 是 0.03 (1.95/1.92/1.98). +0.02 妥妥地在两边 sample std 内.
+
+2. **Worst-seed rescue +0.31 是真信号**: EOD seed 44 = 1.67 (远低于 42/43 的 1.89/1.90), intraday seed 44 = 1.98 (跟 42/43 持平). 这是经典 "extras 降低 ranker dispersion" pattern — extreme model + 4 extras 把 worst case 救起来了, 跟 P11-2b 看到的 extreme IC +91% 一致.
+
+3. **Max DD -7.96 pp 是实物经济价值**: 35.92% → 27.96% 是 ~22% relative improvement, 实盘止损线 / drawdown discipline 上是 meaningful. 即便 Sharpe 不 migrate, MDD 单独可能就值得 P11-5.
+
+4. **Annual return +3.46 pp 也实质**: 57.47% → 60.93% (+6% relative). 不是边际改善.
+
+### Walk-forward 多 fold IC trajectory (重要 sanity check)
+
+seed 43 intraday_blend per-fold log:
+```
+Fold 1: primary IC=0.063, extreme IC=0.114, rows 275k
+Fold 2: primary IC=0.059, extreme IC=0.095, rows 280k
+Fold 3: primary IC=0.001, extreme IC=0.026  ← 单个 outlier (regime shift?)
+Fold 4: primary IC=0.070, extreme IC=0.082, rows 292k
+Fold 5: primary IC=0.068, extreme IC=0.081, rows 297k
+Fold 6: primary IC=0.089, extreme IC=0.094, rows 304k
+Fold 7: primary IC=0.075, extreme IC=0.087, rows 311k
+Fold 8: primary IC=0.083 ...
+```
+
+**mean primary IC across folds ≈ 0.06-0.07** — **完全在 production blend 典型 0.03-0.05 范围内 (上半 actually)**. 也就是说 P11-2 train_fast 看到的 0.008 是 single-split 取了 worst end, 真模型 quality 跟 production 持平甚至略好.
+
+这恰恰证实了 round 78 hypothesis: train_fast 单 split metric 不可信, walk_forward 多 fold 才是真验证.
+
+### Rule 合规
+
+| Rule | 这一轮如何遵守 |
+|------|---------------|
+| #1 stage diff | scripts + reports 显式 add, working tree 已有 pre-existing minor WIP (encoding fix, CURATED_COLUMNS comment) 一并 commit, message 显式提到 (sweep up not mine but compatible) |
+| #4 production .lgb 不动 | ✅ blend_*.lgb 时间戳依旧 May 24 17:45, --skip-update 防御 |
+| #7 N report | ✅ N=3 deterministic, seeds 42/43/44 explicit, PYTHONHASHSEED=0 LGBM_SEED=$S env logged, EXCESS_CAP=0.50 verify ("Winsorized 13880 excess_ret outliers at ±50%") |
+| #9 env/flag verify | ✅ grep wf_seed43_full.log: "RANKER_KIND=intraday_blend — augmenting panel with 4 EOD-proxy extras" + "intraday_blend feature_cols: 68 cols (FACTOR_COLUMNS + 4 extras)" + "Winsorized 13880 excess_ret outliers at ±50%" — env consume verified |
+| #10 单变量 A/B | ✅ hold-constant clause 显式 (window/universe/Top-K/sizing/EXCESS_CAP/deterministic config), 仅 RANKER_KIND 不同 |
+| #11 walk_forward = production | ✅ schema level: walk_forward 用 INTRADAY_FEATURE_COLS retrain BlendRanker fresh per fold; production 加载 data/intraday_blend_*.lgb 也用 INTRADAY_FEATURE_COLS. Same schema, 不同 model file (walk_forward fresh-train vs P11-2 single-train) — decision_log P10-2 style 内部 difference 可接受 |
+
+### 等你 — 决策
+
+按 strict rule = archive. 按 judgment = lean migrate (worst-seed +0.31, MDD -7.96pp, 3/3 directional).
+
+四种 ordering 可选:
+
+**(A) Migrate to P11-5** (override strict rule, judgment-based):
+   - Pros: 3/3 directional + MDD 显著 + 资源利用率高
+   - Cons: 跨阈值 0.02, 离 noise floor 很近 (per-seed Sharpe std 都是 0.10+)
+   - 需要先 P11-5 spec (14:50 集合竞价 execute path)
+
+**(B) Archive per strict rule, queue P11-4** (你 round 79 spec 的 fallback):
+   - Pros: 严格守规则, EOD-proxy 不算 fundamentally 失败也不算明显成功
+   - Cons: worst-seed rescue + MDD 信号被丢
+   - P11-4 真 intraday 接入, ~5 working days, 完后重训重 walk_forward
+
+**(C) Bigger N first** (我倾向): 跑 N=6 (seeds 42-47) before deciding. 3-seed delta std 是 0.13, double N → std 减半 → 看 mean delta 是否仍 ≥+0.15
+   - Pros: 在 ordering A/B 之前先把 measurement noise 压一压, 决策更稳
+   - Cons: ~1 hour 额外计算
+   - 如果 6-seed mean delta 仍 ≥+0.15 → A (migrate); 仍 <+0.15 → 看 MDD/worst-seed 信号决定 B / 启动 P11-4
+
+**(D) MDD-only migrate** (创新 partial): 不上 P11-5 全 14:30 entry, 但把 P11 intraday model 跟 production EOD blend 做 stack ensemble (取两个 score 的 average). 降 MDD 同时不冒全 migrate 风险.
+
+我倾向 **(C)**: 跑 N=6 拿更稳的 mean delta, 然后再判 A vs B. (D) 是有趣 idea 但是 P11 没设计这个 — 算 P12 candidate. 等你定.
+
+### 主动给 user
+
+P11-3 walk_forward N=3 完成 (commit `4d64de2`): intraday_blend mean Sharpe 1.95 vs EOD baseline 1.82 = delta +0.13. 严格按 advisor 阈值 +0.15 算是 archive (差 0.02), 但 worst-seed 44 从 1.67 → 1.98 是 +0.31 显著提升, Max DD 全面优 7.96pp (35.92→27.96), 3/3 directional 正向. 我建议先跑 N=6 把 measurement noise 压一压再做 migrate/archive 决定. Production 9:30 path 仍正常.
+
+
+
+
 
 
 
