@@ -6678,6 +6678,87 @@ under the proxy), consider adding:
 4. STOP at end of P11-1 with round 74 report: feature column schema +
    data availability stats + leak/approximation caveats.
 
+## [2026-05-27 11:00] 第 75 轮 (P11-1 ACK + P11-2 green light + add overnight_gap)
+
+### ACK round 74
+
+- ✅ commit `26e90e6` 干净 (mp/ml/intraday_features.py 207 + tests 228, 20 passing)
+- ✅ schema 67 = 64 + 3, contract 明确
+- ✅ 复用 `_process_single_stock` intraday_bar hook 是好选择, 避免重写
+- ✅ Rule #1/#4 合规, stage 干净
+- ✅ 选 3 个 (不是 7 个) 起步合理 — 先训 baseline, 之后增量加
+
+### One small extension before P11-2: add `overnight_gap`
+
+加 1 列 (改成 68 features = 64 + 4):
+
+```python
+INTRADAY_EXTRA_COLUMNS = [
+    "overnight_gap",      # NEW — (T_open - T-1_close) / T-1_close
+    "morning_return",
+    "morning_vwap_dev",
+    "morning_vol_ratio",
+]
+```
+
+**Why this one and not the other 4 I suggested**:
+
+- **overnight_gap is CLEAN** (open price known at 9:30 sharp, no leak even
+  with synthetic proxies). Among 7 candidates this is the only one with
+  zero leak risk.
+- **A股 overnight gap 信号很强**: limit-up gap, news-driven gap, 大盘 sentiment 都在
+  open vs prev close 里. Existing 64 features 里没有这个具体表达 (有
+  rsi/vol/mom 但没明确的 "overnight" 时段切分)
+- Cost is minimal: 1 line in feature computation, 1 entry in schema, 2
+  tests to lock + verify math.
+
+The other 4 candidates I had (morning_HL_range, sector_relative_14:30,
+index_14:30, morning_volume vs morning vol MA): defer. Wait for P11-3
+baseline Sharpe, then 增量 add only if Sharpe gain insufficient.
+
+### P11-2 green light
+
+P11-2 spec recap (per round 73): train intraday BlendRanker on
+INTRADAY_FEATURE_COLS (now 68), label = T 14:30 → T+19 close excess_ret,
+save to `data/intraday_blend_*.lgb` (NEW path, NOT touching production
+`data/blend_*.lgb`).
+
+Critical for P11-2:
+- Build training dataset by orchestrating `build_intraday_panel` over
+  walk-forward range. xtdata已 verify 1m history 1+ year deep on ECS
+  (see round 73 supplement); test full universe (~800 codes × 1 year)
+  coverage early.
+- For dates/codes where intraday data missing: use EOD-proxy approach
+  (round 73 supplement spec). Label any synthetically-proxied features
+  with a `data_quality` column or warning log per date.
+- Save model artifacts to `data/intraday_blend_primary.lgb` + 
+  `data/intraday_blend_extreme.lgb` (parallel naming, not over-writing
+  production).
+- Walk-forward verify: keep this in P11-3, not in P11-2. P11-2 just trains
+  + reports MAE/IC.
+
+### Rule reminders for P11-2
+
+- **Rule #4**: ABSOLUTE DO NOT touch production `data/blend_*.lgb`.
+  Any path containing `blend_primary` or `blend_extreme` WITHOUT
+  `intraday_` prefix is production sacrosanct.
+- **Rule #7**: training metric report must include N=K folds, seeds,
+  dataset row count, intraday-vs-proxy split.
+- **Rule #11**: 训练用的 RANKER_KIND label / model artifact name 必须跟
+  production loading path 对齐 (we'll wire production loader for
+  intraday in P11-5).
+
+### 这一轮你
+
+1. ACK extension (add overnight_gap → 68 features)
+2. Bump `mp/ml/intraday_features.py` schema + 加 1-2 new tests for
+   overnight_gap math
+3. Then proceed P11-2 (training)
+4. STOP at end of P11-2 with round 76 report: training metrics + 
+   data quality stats (% intraday-real vs EOD-proxy) + 
+   `data/intraday_blend_*.lgb` artifact sizes
+5. Don't auto-roll into P11-3 — I want to see training health first
+
 
 
 
