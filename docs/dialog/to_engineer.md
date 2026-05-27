@@ -7073,6 +7073,113 @@ P11-3 完成: N=6 mean Δ Sharpe = +0.132 (5/6 directional, bootstrap CI [+0.04,
 
 Production 9:30 path 今天仍正常跑.
 
+## [2026-05-27 15:15] 第 84 轮 (user 决策 + P11-4 spec + 入场价改 14:30 实时)
+
+### User 决策已落地
+
+User 看完 round 82 N=6 MIGRATE 后做了 3 个决策:
+
+1. **入场价方式改了**: walk_forward 用 T_close × scaling (拟集合竞价收盘 撮合), user 觉得 14:50 dispatch → 14:57 集合竞价撮合的 10min 窗口"等报告跑完可能已经收盘，来不及成交"。**改 14:30 立即实时成交 (continuous auction)**。
+   - 这一改 introduce 一个 walk_forward 没 cover 的 gap: 14:30 实时价 ≠ T 15:00 收盘价 (≈30min drift)
+   - User 接受这个 gap: "回测没什么问题，14:30"
+
+2. **Cutover 方式**: **直接 cutover, 不 paper trade**。失败时 fallback 到 **次日开盘** (9:30 path 重新接管). 这等于 14:30 是首选, 9:30 是 safety net.
+
+3. **模型版本**: **先 P11-4 真值重训再上 (~5 天延迟)**。User 在我解释完 EOD-proxy distribution mismatch 后选了 strict path. 不直接用现有 EOD-proxy .lgb 实盘.
+
+### 任务顺序
+
+```
+P11-4 (this round)  →  P11-4-verify (walk_forward with real data)
+                          ↓
+                  P11-5 (cutover spec + fallback wiring)
+                          ↓
+                       Live
+```
+
+不要并行做 P11-5 spec, P11-5 spec 等 P11-4-verify 结果出来后, round 86 才写.
+
+### P11-4 spec (precise)
+
+**目标**: 用真 14:30 intraday 数据替换 EOD-proxy, 重新训练 `data/intraday_blend_*.lgb`, 再 walk_forward 验证 lift 是否 persist.
+
+**数据需求**:
+- Universe: hs300 + zz500 (跟 walk_forward 一致)
+- Date range: 2019-01-01 ~ 2026-04 (walk_forward window 全覆盖 + 训练 lookback buffer)
+- 每日 9:30-14:30 分钟 OHLCV (5 个字段)
+- 数据源: ECS xtquant `xtdata.get_local_data` 1m (memory: ECS 已有 ~1 year, 老历史可能需 backfill via `xtdata.download_history_data`)
+
+**Step 1: 数据 fetch on ECS**
+
+写 `scripts/p11_4_fetch_intraday.py`:
+- 输入: universe codes + date range
+- 输出: parquet 分片 `data/intraday_1m/{YYYYMM}.parquet` (按月 partition 控制单文件大小)
+- 字段: code, datetime, open, high, low, close, volume
+- 注意 ECS xtdata `download_history_data` 是 throttle 的, expect 多天 wall clock. 可以分多次跑.
+
+成功后 push 到 git (大文件 LFS or skip — 倾向不上 git, 用 SCP/rsync from ECS → Mac).
+
+**Step 2: Feature recompute on Mac**
+
+修改 `mp/ml/intraday_features.py` 加 `compute_morning_features_real()`:
+
+```python
+def compute_morning_features_real(panel_eod, intraday_1m):
+    """
+    用真值替换 EOD-proxy.
+
+    morning_return       = (price_at_14:30 - open) / open
+    morning_vwap_dev     = (price_at_14:30 - vwap_9:30~14:30) / vwap_9:30~14:30
+    morning_vol_ratio    = volume_9:30~14:30 / avg_full_day_volume_60d_lookback
+
+    overnight_gap stays as panel_eod-derived (already real).
+    """
+```
+
+**关键**: feature 公式必须跟实盘 14:30 production 完全一致 (Rule #11 schema match). production 14:30 时也只有 9:30-14:30 数据可用, 不能往前看. Walk_forward 也必须 enforce 这个 PIT constraint.
+
+**Step 3: 重训 .lgb**
+
+跑 `scripts/train_intraday.py` (P11-2 already exists), 但 input 用真值 morning features. 输出新 `data/intraday_blend_primary.lgb` + `data/intraday_blend_extreme.lgb` (覆盖原文件 — 原 EOD-proxy 版本 archive 到 `data/intraday_blend_*_eodproxy.lgb.archive`).
+
+Rule #1: `cp data/intraday_blend_primary.lgb data/intraday_blend_primary_eodproxy.lgb.archive` 在重训前.
+
+**Step 4: 验证 walk_forward N=3**
+
+重跑 walk_forward seeds 42/43/44 with new .lgb + 真值 morning features:
+- 入场价同 round 80 (T_close × scaling, P11-3 baseline) — 跟 EOD-proxy walk_forward 直接对照
+- 报告 6 数字 EOD baseline (1.82) + intraday EOD-proxy (1.95 mean N=3) + intraday real-data N=3 (new)
+
+**决策规则 (re-anchor)**:
+- 真值 walk_forward mean Sharpe ≥ EOD baseline + **0.10** → proceed P11-5
+- 真值 walk_forward mean Sharpe < EOD baseline + 0.10 → 说明 EOD-proxy artificially inflated lift, **abort migrate**, P11 chain 总结 negative result. 不上 live.
+
+这个阈值比 round 79 +0.15 低 0.05 是有理由的: P11-3 EOD-proxy 已验证 +0.13, 真值版只要保留 80% 的 lift 就足以 confirm 信号. 完全保留太严苛, 完全消失才说明 proxy fake. 中间 +0.10 是合理 cutoff.
+
+### 这一轮你
+
+1. ACK round 83 + 接 round 84 spec
+2. **P11-4 Step 1 (data fetch on ECS) first**:
+   - 写 `scripts/p11_4_fetch_intraday.py`
+   - 在 ECS 上跑, 分批 download (universe 大约 800 stocks × 6 年 ≈ 6M 1m bars). Expect 1-2 天 wall clock 完成
+   - parquet 文件存 `C:\money-printer\data\intraday_1m\` 或 ECS local
+   - rsync/SCP 同步到 Mac `data/intraday_1m/` (不入 git, 大文件)
+3. 写 round 85 report (data fetch 完成后):
+   - row count by month + missing 月份
+   - sample 一两天数据 (e.g., 002385 in 2024-09-13) 验证字段对齐
+   - Rule #9 verify (universe count, date coverage)
+4. **STOP** at data fetch 完成. 等 round 85 advisor confirm 后再做 Step 2/3/4.
+
+### Rule reminders
+
+- **Rule #4**: 原 `data/intraday_blend_*.lgb` 重训前 cp 备份到 `*_eodproxy.lgb.archive`
+- **Rule #11**: 真值 morning features 公式必须跟实盘 14:30 production 完全一致 (PIT 9:30-14:30 only)
+- **Rule #1**: 大数据文件不入 git, sync 走 SCP/rsync. parquet 路径在 .gitignore 里 verify
+
+### 主动给 user
+
+User 决策已收到 → 启 P11-4 真值重训路径. 工程方先在 ECS 上拉 2019-2026 的 hs300+zz500 的 1m 数据 (~6M bars, 1-2 天), 然后传到 Mac, 重算 morning features, 重训 .lgb, 重跑 walk_forward N=3. 验证真值 lift ≥ +0.10 才上 P11-5 实盘. Production 9:30 path 仍正常跑.
+
 
 
 
