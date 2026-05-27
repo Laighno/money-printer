@@ -263,3 +263,73 @@ NEW config cross-seed σ (0.130) is roughly 3× OLD's (0.047). Seed 44 outlier b
 | Round | Trigger | Engineer action |
 |---|---|---|
 | 70 | Advisor 5-item bundle spec (P10-2/3) | (A) 1-line default fix + verify byte-identical, (B) BASELINE.md 3rd rewrite, (C) threshold_alert re-anchor + test update, (D) framework_evaluation retraction marker, (E) this decision_log section |
+
+## P11 candidate · intraday re-prediction at 14:30 (queued, 2026-05-27)
+
+### Trigger
+
+User noted (2026-05-27 08:5x, pre-9:25 first-live-execute) that executing at
+T 09:30 captures the full ~1% buy-side limit buffer cost (limit = close × 1.01)
+while a 14:30 intraday re-prediction would in principle improve accuracy: by
+then ~90% of T's price action has happened, so the residual 19-day prediction
+is presumably cleaner than the 20-day prediction made T-1 17:30.
+
+### Hypothesis
+
+If we re-score the universe at T 14:30 using intraday features (9:30→14:30
+OHLCV in addition to T-1 close), and execute via 集合竞价收盘 (14:55-15:00)
+撮合 at close, three things happen:
+
+1. **Eliminate 1% limit buffer cost** — 集合竞价 撮合 fills at actual close
+   price regardless of submitted limit (per A股 rules).
+2. **Reduce prediction noise** — model conditions on more recent data.
+3. **Sacrifice T-day drift** — top-N picks have empirical T-day positive drift
+   (~+0.3-0.5%); executing at close means we miss this.
+
+Net Sharpe impact: unknown without walk_forward verification.
+
+### Why not just flip a flag
+
+Current BlendRanker trained on T-1 close features predicting "T-1 close →
+T+19 close" returns. Using it on T 14:30 features is OOD; both the feature
+distribution (intraday VWAP vs EOD close) and the prediction target horizon
+(20d → ~19.0625d) differ from training distribution.
+
+This is a *new model*, not a different execution time on the same model.
+
+### Required work (~2-4 weeks)
+
+1. Build intraday feature pipeline (mp/ml/intraday_features.py): compute
+   features from 9:30-14:30 OHLCV per stock per day, ~800 stocks.
+2. Train BlendRanker variant on "T 14:30 features → T 14:30 → T+19 close"
+   labels. Walk-forward 2020-01 ~ 2025-12.
+3. Compare 9:30-entry walk_forward Sharpe (P10-CLOSE baseline 1.82) vs
+   14:30-entry walk_forward Sharpe. Decision rule:
+   - If 14:30 Sharpe > 9:30 Sharpe by ≥ +0.15 → migrate to 14:30 execution.
+   - Else → archive this branch, document negative result.
+4. ECS data freshness: 9:30-14:30 intraday OHLCV must be retrievable on ECS.
+   Sina/EM rate-limiting on Aliyun/火山云 IP is currently brittle; will need
+   either proxy / multi-source / pre-fetch cache.
+5. New ECS Windows Task Scheduler entry: T 14:30 trigger → score + plan →
+   14:50 dispatch → 14:55 集合竞价 撮合.
+
+### Open questions
+
+- Does T-day drift dominate the limit-buffer saving? Empirically unknown.
+- 集合竞价收盘 depth: large-cap stocks have decent depth at close, but
+  small caps may have thin 撮合; 4000+ share orders may only partial-fill.
+- Walk_forward Sharpe of 19d-horizon prediction vs 20d? Probably similar
+  but verify.
+
+### Status
+
+**Queued. Not started.** Activated by explicit advisor green light AFTER:
+- 1+ week of stable 9:30-entry live execution (β-3 N=1 already passed)
+- BlendRanker 9:30 baseline confirmed in production (not just walk_forward)
+
+### Cross-references
+
+- Limit buffer slippage discussion: docs/dialog/ (around 2026-05-27 09:00)
+- Live execute baseline: `scripts/ecs_auto_execute.ps1` (commit 9b3c275)
+- B' ×1.03 hybrid as short-term alternative (not yet implemented as of
+  2026-05-27 09:00)
