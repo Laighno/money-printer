@@ -186,17 +186,16 @@ def _fetch_one_month(
         logger.warning("[{}] xtdata.get_market_data returned unexpected shape, skipping", yyyymm)
         return None
 
-    # Pivot dict[field → DataFrame[time × codes]] → long form
-    # (code, datetime, open, high, low, close, volume).
+    # get_market_data returns dict[field → DataFrame[code × time]]; stack
+    # to MultiIndex(code, datetime) then concat columns for fields.
     frames: List[pd.DataFrame] = []
     for field, df in raw.items():
         if df.empty:
             continue
-        long_df = df.reset_index().melt(id_vars=df.index.name or "time",
-                                         var_name="code_xt", value_name=field)
-        time_col = df.index.name or "time"
-        long_df = long_df.rename(columns={time_col: "datetime"})
-        frames.append(long_df.set_index(["code_xt", "datetime"]))
+        s = df.stack()
+        s.name = field
+        s.index.names = ["code_xt", "datetime"]
+        frames.append(s.to_frame())
     if not frames:
         logger.warning("[{}] no rows pivoted, skipping", yyyymm)
         return None
