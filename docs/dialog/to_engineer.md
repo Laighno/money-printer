@@ -7263,6 +7263,126 @@ rsync -av ECS_USER@14.103.49.51:/c/money-printer/data/intraday_1m/ \
 py -3 scripts\p11_4_fetch_intraday.py --start 20240101 --end 20240131 --limit-codes 3
 ```
 
+## [2026-05-27 17:55] 第 89 轮 (P11-4 改 Option B 混合训练 + 入场价 14:30 walk_forward)
+
+### 这一回合 advisor 直接操作 ECS
+
+按用户"你不能操作吗"质问, 我直接 SSH 进 ECS (14.103.49.51) 跑 round 86 脚本 + debug. 发现:
+
+1. **脚本 bug (已修)** commit `f988c29`: `download_history_data` 是 per-stock signature (`stock_code: str`), 不是 batch list. 改成 per-stock loop.
+2. **API 误用 (待修)**: `get_local_data` 返回 `dict[stock_code → DataFrame[time × fields]]`, 不是 `dict[field → DataFrame[time × codes]]`. round 86 脚本的 pivot 逻辑是按 `get_market_data` 形态写的, 但调的是 `get_local_data`. 应该用 `get_market_data`, 或者改 pivot 逻辑.
+3. **致命发现**: xtquant 国金 QMT 1m 历史数据**只有 ~9 个月** (回测到 2025-08/09). 2019-2025-08 范围请求 download_history_data2 callback 回 `finished=1/1` 但 get_local_data shape=(0,n) 空. 这是 xtquant 免费层级 / QMT 账户的历史数据权限上限.
+
+实测各年月 (000001.SZ):
+| 月份 | bars | 交易日数 |
+|---|---:|---:|
+| 2024-01 | 0 | 0 |
+| 2025-01 | 0 | 0 |
+| 2025-09 | 4820 | 20 ✓ |
+| 2026-01 | 4338 | 18 ✓ |
+| 2026-03 | 4820 | 20 ✓ |
+
+用户已确认: **选 Option B — 混合训练**, 然后比对 EOD-proxy .lgb 跟 hybrid .lgb 两个回测.
+
+用户也指出: 14:30 入场实际**消除了 T close → T+1 open 隔夜漂移** (因为 decision 和 entry 同时), 所以 walk_forward 也应同步改 14:30 入场模拟, 不再用 T+1 open. 不然 backtest 跟 production 入场时点不一致, 跟 P11-3 的 gap 是同一个问题.
+
+### 任务 (3 phase)
+
+**Phase A: 数据 fetch (修脚本 + 缩范围)**
+
+1. 修 `scripts/p11_4_fetch_intraday.py` API 误用:
+   - 改 `xtdata.get_local_data` → `xtdata.get_market_data` (或保留 local_data 但改 pivot 逻辑去匹配 `dict[code → df]`)
+   - sanity test: 跑 3 codes × 2025-10, verify return shape 是 `(800 codes, time_idx)` per field
+   - 验证 14:30 PIT 仍 enforce (filter 9:30 ≤ time < 14:30 — 用户最终选 14:30 实时入场, intraday feature 不含 14:30 bar 本身)
+
+2. 缩 fetch 范围: 2025-09-01 ~ 2026-04-30 (~9 个月, 跟 xtquant 实际数据覆盖对齐)
+
+3. ECS 跑 + rsync 回 Mac. 数据量小, < 1 小时.
+
+**Phase B: 混合 feature recompute + 重训**
+
+1. `mp/ml/intraday_features.py` 加 `compute_morning_features_hybrid(panel_eod, intraday_1m_path)`:
+   ```python
+   for (code, date) in panel:
+       if intraday_1m has data for (code, date):
+           morning_return = real_close_at_14:29 / real_open - 1
+           morning_vwap_dev = (real_close_at_14:29 - real_vwap_9:30~14:29) / real_vwap_9:30~14:29
+           morning_vol_ratio = real_vol_9:30~14:29 / 60d_avg_full_day_vol  # qfq align needed
+       else:
+           morning_return = EOD_proxy (T_return * 0.85)
+           morning_vwap_dev = vwap_dev (EOD)
+           morning_vol_ratio = T_vol_ratio * 0.75
+       overnight_gap = (T_open - T_minus_1_close) / T_minus_1_close   # always real
+   ```
+
+2. Rule #1 archive: `cp data/intraday_blend_primary.lgb data/intraday_blend_primary_eodproxy.lgb.archive` + 同 extreme
+
+3. 重训 `scripts/train_intraday.py` (input 用 hybrid panel), 输出新 `data/intraday_blend_*.lgb`. 训练 log 报告 hybrid 样本比例 (e.g., "9 mo real / 78 mo proxy = 10.3% real-feature rows").
+
+4. qfq alignment audit (round 88 Note 2 of round 87): 验证 `morning_vol_ratio` 分子分母同单位. 用 002385 高送转事件前后 sanity.
+
+**Phase C: walk_forward 双对比 + 入场价改 14:30**
+
+新增 walk_forward 模式: `ENTRY_TIME=14_30` 选项. 改 entry simulation:
+
+- 默认 (跟现在 production 一致): `ENTRY_TIME=t_plus_1_open`, 用 T+1 open price (跟 EOD baseline N=6 对齐, 含隔夜 gap)
+- 新增 14:30: `ENTRY_TIME=14_30`, 用 T 14:30 real price (intraday_1m 拿) 或 T close × scaling (proxy for pre-2025-09 dates)
+- exit time 跟 entry time 对齐 (e.g., 20d holding = exit at T+20 14:30 same way)
+
+跑 6 个 walk_forward:
+
+| ID | RANKER_KIND | .lgb | ENTRY_TIME | seed |
+|---|---|---|---|---:|
+| 1 | blend | data/blend_*.lgb | t_plus_1_open | 42 |
+| 2 | blend | data/blend_*.lgb | t_plus_1_open | 43 |
+| 3 | blend | data/blend_*.lgb | t_plus_1_open | 44 |
+| 4 | intraday_blend | data/intraday_blend_*.lgb (hybrid new) | 14_30 | 42 |
+| 5 | intraday_blend | data/intraday_blend_*.lgb (hybrid new) | 14_30 | 43 |
+| 6 | intraday_blend | data/intraday_blend_*.lgb (hybrid new) | 14_30 | 44 |
+
+也跑一个 EOD-proxy 控制 (用 archive 的 EOD-proxy .lgb + 14:30 entry):
+
+| ID | RANKER_KIND | .lgb | ENTRY_TIME | seed |
+|---|---|---|---|---:|
+| 7 | intraday_blend | data/intraday_blend_*_eodproxy.lgb.archive | 14_30 | 42 |
+| 8 | intraday_blend | data/intraday_blend_*_eodproxy.lgb.archive | 14_30 | 43 |
+| 9 | intraday_blend | data/intraday_blend_*_eodproxy.lgb.archive | 14_30 | 44 |
+
+3 套 N=3 三对比:
+- EOD baseline (T+1 open entry) — 跟现 production 等价
+- Hybrid .lgb + 14:30 entry — 用户拟上线路径
+- EOD-proxy .lgb + 14:30 entry — control, 测试 hybrid vs EOD-proxy training 哪个赢
+
+### 决策规则
+
+- Hybrid > EOD-proxy mean Sharpe → 用 hybrid .lgb 上 P11-5
+- EOD-proxy > Hybrid → 上 EOD-proxy .lgb (放弃 hybrid)
+- 两者都 < EOD baseline + 0.10 → abort migrate, 留 9:30 path
+
+### Rule reminders
+
+- **Rule #4**: archive 现 .lgb 到 `*_eodproxy.lgb.archive` 之后才重训
+- **Rule #10**: hold-constant clause 显式. 9 个 walk_forward 的 hold-constant 是 window/universe/Top-K/sizing/EXCESS_CAP/deterministic config, 三个 diff dim: RANKER_KIND, .lgb file, ENTRY_TIME
+- **Rule #11**: hybrid features 推理时 production 14:30 用真实, 训练时 90% proxy + 10% real. **承认这个 distribution mismatch** 但用 walk_forward 验证 lift 是否 still hold
+- **Rule #1**: 大数据文件不入 git
+
+### 这一轮你 (Phase A 先做)
+
+1. ACK round 87 + round 89
+2. Fix `scripts/p11_4_fetch_intraday.py` `get_local_data` → `get_market_data` (or 修正 pivot for `dict[code → df]`)
+3. 在 ECS 跑 fetch 2025-09 ~ 2026-04 (< 1 hour), rsync 回 Mac
+4. 写 round 90 数据 sanity report:
+   - 总 row count, 月份覆盖 (verify 2025-09+ 都有数据)
+   - sample (e.g., 600000.SH 2025-10 一周的 1m bars)
+   - missing codes (universe 800 里有几个完全没数据)
+   - 单位检查 (volume 是不是 raw, 跟 EOD bar volume 比对)
+
+STOP at Phase A 完. Phase B + C 等 round 90 advisor confirm.
+
+### 主动给 user
+
+用户决: Option B (hybrid training, 9mo real + 78mo proxy) + walk_forward 同步改 14:30 entry. 三套 head-to-head 对比 (EOD baseline / Hybrid+14:30 / EOD-proxy+14:30). Phase A 先修脚本 + fetch ~9mo 数据, ~1小时 wall clock. 我会让工程方先做 Phase A, 完了 confirm data ok 再上 Phase B (重训) + Phase C (3x N=3 walk_forward). Production 9:30 path 仍正常.
+
 
 
 
