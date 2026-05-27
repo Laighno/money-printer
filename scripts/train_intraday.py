@@ -87,6 +87,141 @@ MORNING_RETURN_SCALE = 0.85
 # Assume ~75% of volume by 14:30 (240 trading min total, 180 min by 14:30 = 75%).
 MORNING_VOLUME_SCALE = 0.75
 
+# ─────────────────────────────────────────────────────────────────────
+# P11-4 round 91: hybrid training — real intraday 9 months + EOD-proxy for older history
+# ─────────────────────────────────────────────────────────────────────
+INTRADAY_1M_DIR = Path("data/intraday_1m")
+INTRADAY_REAL_START = pd.Timestamp("2025-09-01")  # xtquant QMT 1m history floor (round 89)
+
+
+def load_intraday_1m(dir_path: Path = INTRADAY_1M_DIR) -> pd.DataFrame:
+    """Load all available 1m parquet files into a single DataFrame.
+
+    Returns long-form DataFrame with columns ``code, datetime, open, high, low, close, volume``.
+    Empty DataFrame if directory missing or empty.
+
+    P11-4 round 91: ~30M rows / ~145MB across 8 monthly partitions
+    (2025-09 → 2026-04). Fully fits in memory.
+    """
+    if not dir_path.exists():
+        logger.warning("intraday_1m directory not found: {}", dir_path)
+        return pd.DataFrame()
+    parts = sorted(dir_path.glob("*.parquet"))
+    if not parts:
+        logger.warning("intraday_1m directory empty: {}", dir_path)
+        return pd.DataFrame()
+    frames = [pd.read_parquet(p) for p in parts]
+    df = pd.concat(frames, ignore_index=True)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["date"] = df["datetime"].dt.normalize()
+    df = df.sort_values(["code", "datetime"]).reset_index(drop=True)
+    logger.info("Loaded intraday_1m: {} rows, {} codes, {} dates from {} files",
+                len(df), df["code"].nunique(), df["date"].nunique(), len(parts))
+    return df
+
+
+def _real_morning_extras_per_code(
+    intraday_code_df: pd.DataFrame,
+    eod_volume_ma20: pd.Series,
+) -> pd.DataFrame:
+    """Compute real morning_return / morning_vwap_dev / morning_vol_ratio per date
+    for one stock, from its 1m intraday data.
+
+    Parameters
+    ----------
+    intraday_code_df : DataFrame for ONE code, columns code, datetime, date, OHLCV
+        Must already be filtered to 9:30 ≤ time < 14:30 (matches fetch script PIT).
+    eod_volume_ma20 : Series indexed by date — 20-day MA of EOD daily volume (qfq).
+
+    Returns
+    -------
+    DataFrame indexed by date with columns ``morning_return, morning_vwap_dev, morning_vol_ratio``.
+    """
+    grouped = intraday_code_df.groupby("date")
+    # Per-day aggregates
+    agg = grouped.agg(
+        open_at_930=("open", "first"),
+        close_at_1429=("close", "last"),
+        sum_pv=("volume", lambda s: (s * intraday_code_df.loc[s.index, "close"]).sum()),
+        sum_v=("volume", "sum"),
+    )
+    # morning_return = (close@14:29 / open@9:30) - 1
+    agg["morning_return"] = agg["close_at_1429"] / agg["open_at_930"] - 1.0
+    # morning_vwap = sum(close × volume) / sum(volume)
+    morning_vwap = agg["sum_pv"] / agg["sum_v"].replace(0, np.nan)
+    agg["morning_vwap_dev"] = (agg["close_at_1429"] - morning_vwap) / morning_vwap
+    # morning_vol_ratio = morning_volume / 20d EOD volume MA
+    # NOTE qfq alignment caveat (round 88 Note 2): 1m volume is RAW, EOD MA is qfq.
+    # For stocks with splits/dividends in the 20d lookback the ratio will be biased.
+    # Bounded effect — most stocks have no split events in any given 20d window.
+    eod_aligned = eod_volume_ma20.reindex(agg.index)
+    agg["morning_vol_ratio"] = agg["sum_v"] / eod_aligned.replace(0, np.nan)
+    return agg[["morning_return", "morning_vwap_dev", "morning_vol_ratio"]]
+
+
+def compute_extras_for_panel_hybrid(
+    bars: pd.DataFrame,
+    real_extras_by_date: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Hybrid version of compute_extras_for_panel.
+
+    For dates ≥ INTRADAY_REAL_START where ``real_extras_by_date`` provides values,
+    use real intraday morning features.  Otherwise fall back to EOD-proxy.
+    ``overnight_gap`` is always EOD-derived (no proxy needed).
+    """
+    n = len(bars)
+    open_arr = bars["open"].to_numpy(dtype=float)
+    close_arr = bars["close"].to_numpy(dtype=float)
+    volume_arr = bars["volume"].to_numpy(dtype=float)
+    amount_arr = bars["amount"].to_numpy(dtype=float) if "amount" in bars.columns else volume_arr * close_arr
+    dates_arr = pd.to_datetime(bars["date"]).dt.normalize().to_numpy()
+
+    # overnight_gap — CLEAN, no proxy (same as compute_extras_for_panel)
+    overnight = np.full(n, np.nan)
+    for i in range(1, n):
+        prev_close = close_arr[i - 1]
+        if prev_close > 0 and open_arr[i] > 0:
+            overnight[i] = (open_arr[i] - prev_close) / prev_close
+
+    # Start with EOD-proxy values for all rows
+    morning_ret = np.full(n, np.nan)
+    valid = (open_arr > 0) & (close_arr > 0)
+    morning_ret[valid] = MORNING_RETURN_SCALE * (close_arr[valid] - open_arr[valid]) / open_arr[valid]
+
+    vwap_dev = np.full(n, np.nan)
+    safe = (volume_arr > 0) & (amount_arr > 0) & (close_arr > 0)
+    vwap_proxy = np.where(safe, amount_arr / volume_arr, np.nan)
+    safe_vwap = safe & (vwap_proxy > 0)
+    vwap_dev[safe_vwap] = (close_arr[safe_vwap] - vwap_proxy[safe_vwap]) / vwap_proxy[safe_vwap]
+
+    vol_ratio = np.full(n, np.nan)
+    if n >= 20:
+        rolling = pd.Series(volume_arr).rolling(window=20, min_periods=20).mean().shift(1).to_numpy()
+        valid_vr = (rolling > 0) & (volume_arr > 0)
+        vol_ratio[valid_vr] = MORNING_VOLUME_SCALE * volume_arr[valid_vr] / rolling[valid_vr]
+
+    # Overlay real values where available
+    if real_extras_by_date is not None and not real_extras_by_date.empty:
+        date_to_idx: Dict[pd.Timestamp, int] = {pd.Timestamp(d): i for i, d in enumerate(dates_arr)}
+        for date, row in real_extras_by_date.iterrows():
+            idx = date_to_idx.get(pd.Timestamp(date))
+            if idx is None:
+                continue
+            for col, arr in [("morning_return", morning_ret),
+                              ("morning_vwap_dev", vwap_dev),
+                              ("morning_vol_ratio", vol_ratio)]:
+                v = row.get(col)
+                if v is not None and not pd.isna(v):
+                    arr[idx] = float(v)
+
+    return pd.DataFrame({
+        "date": bars["date"].values,
+        "overnight_gap": overnight,
+        "morning_return": morning_ret,
+        "morning_vwap_dev": vwap_dev,
+        "morning_vol_ratio": vol_ratio,
+    })
+
 
 def compute_extras_for_panel(
     bars: pd.DataFrame,
@@ -152,21 +287,50 @@ def attach_intraday_extras(
     codes: List[str],
     start: str,
     end: Optional[str] = None,
+    hybrid: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """Attach 4 intraday extras to an EOD panel by re-fetching OHLCV per code.
+
+    Parameters
+    ----------
+    hybrid : bool, default False
+        P11-4 round 91: when True, overlay real intraday features for dates
+        ≥ INTRADAY_REAL_START where ``data/intraday_1m/*.parquet`` provides
+        them.  Other dates still use EOD-proxy.  ``overnight_gap`` always
+        from EOD (no proxy needed).
 
     Returns
     -------
     (panel_with_extras, stats)
-        stats keys: ``rows_total``, ``rows_with_overnight``, ``rows_with_morning``,
-                    ``rows_with_vol_ratio``, ``codes_processed``, ``codes_failed``.
     """
     panel = panel.copy()
     panel["date"] = pd.to_datetime(panel["date"])
 
+    # Hybrid path: pre-load all 1m parquet and group by code → date → 9 morning extras
+    real_extras_by_code: Dict[str, pd.DataFrame] = {}
+    if hybrid:
+        intra_long = load_intraday_1m()
+        if not intra_long.empty:
+            for code, code_df in intra_long.groupby("code"):
+                # 20d EOD volume MA per code — needed for morning_vol_ratio denominator
+                try:
+                    eod = get_daily_bars(code, start, end)
+                    if eod is None or eod.empty:
+                        continue
+                    eod = eod.sort_values("date").reset_index(drop=True)
+                    eod["date"] = pd.to_datetime(eod["date"]).dt.normalize()
+                    eod_vol_ma20 = eod.set_index("date")["volume"].rolling(window=20, min_periods=20).mean().shift(1)
+                except Exception:
+                    continue
+                code_df_typed = code_df.assign(code=code).copy()
+                real_extras_by_code[code] = _real_morning_extras_per_code(code_df_typed, eod_vol_ma20)
+            logger.info("hybrid mode: real intraday extras prepared for {} codes",
+                        len(real_extras_by_code))
+
     extras_frames: List[pd.DataFrame] = []
     n_codes = len(codes)
-    stats = {"codes_processed": 0, "codes_failed": 0}
+    stats = {"codes_processed": 0, "codes_failed": 0, "codes_with_real": 0,
+             "rows_real_morning": 0, "rows_proxy_morning": 0}
 
     for i, code in enumerate(codes):
         try:
@@ -183,7 +347,20 @@ def attach_intraday_extras(
         bars = bars.sort_values("date").reset_index(drop=True)
         bars["date"] = pd.to_datetime(bars["date"])
 
-        extras = compute_extras_for_panel(bars)
+        if hybrid and code in real_extras_by_code:
+            extras = compute_extras_for_panel_hybrid(bars, real_extras_by_code[code])
+            stats["codes_with_real"] += 1
+            # Count how many rows actually had real data
+            real_dates = set(real_extras_by_code[code].index)
+            for d in bars["date"]:
+                if pd.Timestamp(d).normalize() in real_dates:
+                    stats["rows_real_morning"] += 1
+                else:
+                    stats["rows_proxy_morning"] += 1
+        else:
+            extras = compute_extras_for_panel(bars)
+            stats["rows_proxy_morning"] += len(bars)
+
         extras["code"] = code
         extras_frames.append(extras[["code", "date"] + INTRADAY_EXTRA_COLUMNS])
         stats["codes_processed"] += 1
@@ -225,6 +402,10 @@ def main() -> int:
                     help="P11-2b control: train BlendRanker(feature_cols=FACTOR_COLUMNS) only (64 cols, no 4 intraday extras). "
                          "Same dataset / seed / val_frac / label as the full P11-2 run — clean A/B per Rule #10. "
                          "Output prefix gains '_control' suffix.")
+    ap.add_argument("--hybrid", action="store_true",
+                    help="P11-4 Phase B: overlay real intraday features for dates ≥ 2025-09-01 "
+                         "from data/intraday_1m/*.parquet; fall back to EOD-proxy elsewhere. "
+                         "overnight_gap always EOD-derived.")
     args = ap.parse_args()
 
     # Rule #4 guardrail: refuse to overwrite production blend
@@ -259,7 +440,7 @@ def main() -> int:
 
     # 2. Attach 4 intraday extras (EOD-proxy)
     t0 = time.time()
-    panel, dq_stats = attach_intraday_extras(eod_panel, codes, start, args.end)
+    panel, dq_stats = attach_intraday_extras(eod_panel, codes, start, args.end, hybrid=args.hybrid)
     logger.info("Intraday extras attached in {:.0f}s. Data quality:", time.time() - t0)
     for k, v in dq_stats.items():
         if k.startswith("rows_with_"):
