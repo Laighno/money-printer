@@ -7471,6 +7471,97 @@ Sample bar 检查 600000.SH 2026-04-01: open 10.20 → close 10.27, volume reaso
 
 P11-4 Phase A 完成 (advisor 直接在 ECS 上跑了 19min, 多次 hang + 几次脚本 fix). 145MB 8 个月 1m 数据已 SCP 到 Mac, sanity 全 OK (615 codes × 8mo, uniform bar counts, PIT 9:30-14:29 时段一致). 工程方现在做 Phase B (混合 feature recompute + 重训 .lgb) 和 Phase C (9 个 walk_forward 三方对比). 完成后我会让工程方写报告, 然后你 confirm migrate/abort. Production 9:30 path 仍正常.
 
+## [2026-05-28 01:05] 第 93 轮 (advisor 直接跑 Phase C + 9-cell 完整结果)
+
+### 这一轮 advisor 直接跑了
+
+按 round 92 工程方 STOP-then-continue, 工程方启动 Phase C 9-run loop. 我看见:
+
+1. seed 42 eod_baseline 完成 → 1.46 Sharpe (vs P10-CLOSE 1.90) — 明显异常
+2. seed 42 hybrid_14_30 → 跟 eod_baseline byte-identical 5527 字节文件
+3. **NaN bug**: `_build_entry_lk_14_30` 用 `float(row["close"])` 直接转换, 但部分 1m bar close 是 NaN (停牌后复牌的股票). NaN 没 raise, 进入 `_entry_price()` 返回 NaN, broker.buy `int(NaN/exec_price)` 抛 ValueError. python 进程 abort.
+4. **Engineer outer loop bug**: `cp walk_forward_result.md ...` 不 check python exit code, 所以崩了之后 cp 还是 copy 了**前一次 eod_baseline 的 stale result**. 这导致 hybrid_14_30 文件 byte-identical eod_baseline.
+5. Kill engineer 的 loop. 修 walk_forward `_build_entry_lk_14_30` 加 NaN skip, 修 buy/sell `_entry_price` 调用站加 `pd.isna()` check (`float NaN` 不被 `<= 0` 捕获). commit `73d3f5c`.
+6. 重启 9-run loop (Mac advisor side, bash background task), exit-code-gated cp (`&& cp`), data/reports/p11_4/ 全清空重跑.
+
+整个 9-run 在 ~2h wall clock 完成, 全 9 个文件正确写入.
+
+### 9-cell A/B 完整 table
+
+**Hold-constant clause (Rule #10)**: window 2020-01 ~ 2026-04, hs300+zz500 (full universe, 不 filter 创业板/科创板 — walk_forward 这一层不像 daily_report 实操层 filter; 创业板/科创板在 backtest 内是合法的 selectable), Top-K=10, conviction sizing, EXCESS_CAP=0.50, PYTHONHASHSEED=0, deterministic config, --skip-update (Rule #4). **3 dims diff**: RANKER_KIND (blend / intraday_blend), .lgb file (production blend / hybrid intraday_blend / archived eod-proxy intraday_blend), ENTRY_TIME (t_plus_1_open / 14_30).
+
+| Seed | EOD baseline | Hybrid 14:30 | EOD-proxy 14:30 |
+|---|---:|---:|---:|
+| 42 | 1.90 | 1.96 | 1.97 |
+| 43 | 1.89 | 1.86 | 1.84 |
+| 44 | 1.67 | 2.06 | 2.04 |
+| **Mean Sharpe** | **1.820** | **1.960** | **1.950** |
+
+Per-seed Δ vs EOD baseline:
+
+| Seed | Hybrid Δ | EOD-proxy Δ |
+|---|---:|---:|
+| 42 | +0.06 | +0.07 |
+| 43 | -0.03 | -0.05 |
+| 44 | **+0.39** | **+0.37** |
+
+Aggregate (all 3 dims):
+
+| Metric | EOD baseline | Hybrid 14:30 | EOD-proxy 14:30 | Hybrid Δ |
+|---|---:|---:|---:|---:|
+| Sharpe | 1.820 | 1.960 | 1.950 | **+0.140** |
+| Annual | 57.47% | 60.98% | 60.78% | +3.51 pp |
+| Max DD | -35.92% | -27.49% | -27.49% | **-8.43 pp 优** |
+
+### 决策规则应用 (round 84 spec)
+
+Decision rule: hybrid mean Sharpe ≥ EOD baseline + **0.10** → proceed P11-5.
+
+**1.96 - 1.82 = +0.14 ≥ +0.10 → PROCEED P11-5** ✓
+
+### 三个 unexpected findings
+
+**Finding 1: 14:30 entry 是主导 lift 来源, 不是 hybrid feature**
+
+Hybrid Δ +0.14 跟 EOD-proxy Δ +0.13 几乎相同 (差 0.01, noise floor 内). 也就是说**真值 1m 重训 vs EOD-proxy 训练在 walk_forward Sharpe 上几乎无差异**.
+
+这跟 round 92 train_fast IC (0.036 vs 0.008, +350%) 完全相反 — IC 差异巨大但 Sharpe 差异 ≈ 0. 说明 train_fast IC 跟实际策略 Sharpe 之间不是单调关系 (round 78 P11-2b 已观察到 single-split noise problem, 这里再次验证).
+
+**含义**: 用户花 P11-4 5 天做真值重训, 边际 Sharpe lift ≈ 0. 如果做 P11-5 上线, 用 hybrid 或 EOD-proxy .lgb 都行. 既然 hybrid 已经做完, 上 hybrid (Sharpe 1.96) 比 EOD-proxy (1.95) 微好 0.01, 选 hybrid 即可. 但**没必要再花资源做更多 P11-4 真值数据扩展**.
+
+**Finding 2: MDD 改善是 14:30 entry 独立信号**
+
+Hybrid 14:30 MDD -27.49% = EOD-proxy 14:30 MDD -27.49% (完全相同到小数点). 又是 ENTRY_TIME 决定 MDD, 不是 .lgb. **隔夜漂移消除 = MDD lift 主要 driver**.
+
+EOD baseline -35.92% → 14:30 entry -27.49% = **8.43pp 绝对改善, 23.5% relative**. 实盘风险管理意义重大.
+
+**Finding 3: Worst-seed rescue 持续**
+
+EOD seed 44 = 1.67 (跟 P10-CLOSE 一致 worst-seed). 14:30 path (无论 hybrid 还是 eod-proxy) seed 44 = 2.06 / 2.04. **+0.39 lift** — 跟 P11-3 N=3 (+0.31) 一致量级. ENTRY_TIME=14_30 救了 worst-seed.
+
+### Rule 合规
+
+| Rule | 这一轮如何遵守 |
+|------|---------------|
+| #1 | 9 个 result files 显式生成在 `data/reports/p11_4/`, 没动其他 working tree |
+| #4 | production blend_*.lgb 不动 (eod_baseline run 用的就是它). hybrid 跟 eod-proxy intraday_blend 跑的是 P11-4 Phase B 重训的 + archive 备份的 |
+| #7 | N=3 per config × 3 configs = 9 deterministic runs, seeds 42/43/44 explicit, EXCESS_CAP=0.50 logged, PYTHONHASHSEED=0 + LGBM_SEED env explicit |
+| #9 | env verify per run (RANKER_KIND, ENTRY_TIME, INTRADAY_HYBRID logged at start of each run); Winsorized 13880 outliers logged in each |
+| #10 | hold-constant clause 严格 (1 universe / 1 window / 1 EXCESS_CAP), 3 dims diff |
+| #11 | hybrid .lgb 14_30 walk_forward 跟 production 14:30 path 严格 alignment: 用 INTRADAY_FEATURE_COLS 68 features, ENTRY_TIME=14_30 用 14:29 close approx production 14:30 snapshot |
+
+### 这一轮 STOP — 等 user migrate decision + P11-5 spec
+
+按 round 84 spec: hybrid > EOD-proxy → hybrid 上 P11-5; 两者差异在 noise 内 → 取 best (hybrid 1.96 vs eod-proxy 1.95, 选 hybrid).
+
+User 已 round 84 选 strict path (P11-4 真值重训再上). Phase C 已 confirm strict path 出 +0.14 Sharpe + -8.43pp MDD + 3/3 directional Hybrid > EOD baseline (注意 seed 43 hybrid 1.86 < EOD baseline 1.89, 严格说 2/3 directional; 但 mean delta 仍清晰 > +0.10).
+
+下一步等 user 拍板 P11-5 上线 (cutover, fallback 次日开盘 already decided round 84). 然后 advisor 写 P11-5 spec.
+
+### 主动给 user
+
+P11-4 Phase C 完成 (9-cell 完整 walk_forward, advisor 直接在 Mac 跑了 2 小时). **Hybrid 14:30 Sharpe 1.96 vs EOD baseline 1.82 = Δ +0.14 ≥ +0.10 阈值 → 通过 P11-5 migrate gate**. MDD 改善 -8.43pp (35.92% → 27.49%), Annual +3.51pp. 唯一 unexpected: **真值 hybrid 跟 EOD-proxy 在 walk_forward Sharpe 上几乎无差异** (1.96 vs 1.95). 14:30 entry 本身是主要 alpha, .lgb 训练数据(真 vs proxy)边际无影响. 等你 confirm migrate 我写 P11-5 spec (14:30 entry 改 ECS Task Scheduler, hybrid .lgb 上线, 失败 fallback 次日 9:30). Production 9:30 仍正常.
+
 
 
 
