@@ -1,0 +1,95 @@
+{
+  "generated_at": "2026-05-26T22:43:05",
+  "report_date": "2026-05-26",
+  "account_snapshot": {
+    "total_assets": 104798.0,
+    "cash_available": 41087.0,
+    "market_value": 63711.0
+  },
+  "holdings_at_plan_time": [
+    {
+      "code": "002385",
+      "name": "大北农",
+      "shares": 7700,
+      "avg_cost": 3.461
+    },
+    {
+      "code": "002439",
+      "name": "启明星辰",
+      "shares": 800,
+      "avg_cost": 15.176
+    },
+    {
+      "code": "002984",
+      "name": "森麒麟",
+      "shares": 1600,
+      "avg_cost": 15.703
+    }
+  ],
+  "orders": [
+    {
+      "code": "002385",
+      "name": "大北农",
+      "action": "减仓",
+      "shares": 3800,
+      "limit_price": 3.36,
+      "cost": -12768.0,
+      "reason": "模型排名 #81/800（跌出 Top 30，减半仓）"
+    },
+    {
+      "code": "002984",
+      "name": "森麒麟",
+      "action": "清仓",
+      "shares": 1600,
+      "limit_price": 15.73,
+      "cost": -25168.0,
+      "reason": "模型排名 #122/800（已不在 Top 100）"
+    },
+    {
+      "code": "300146",
+      "name": "汤臣倍健",
+      "action": "买入",
+      "shares": 1500,
+      "limit_price": 9.87,
+      "cost": 14804.999999999998,
+      "reason": "模型 #1/800, 超额 +1.84%，目标仓位 14.8% (现 0.0%)"
+    },
+    {
+      "code": "002439",
+      "name": "启明星辰",
+      "action": "加仓",
+      "shares": 100,
+      "limit_price": 15.38,
+      "cost": 1538.0,
+      "reason": "模型 #2/800, 超额 +1.74%，目标仓位 14.2% (现 11.6%)"
+    },
+    {
+      "code": "300601",
+      "name": "康泰生物",
+      "action": "买入",
+      "shares": 1100,
+      "limit_price": 13.32,
+      "cost": 14652.0,
+      "reason": "模型 #3/800, 超额 +1.73%，目标仓位 14.1% (现 0.0%)"
+    },
+    {
+      "code": "002773",
+      "name": "康弘药业",
+      "action": "买入",
+      "shares": 600,
+      "limit_price": 21.48,
+      "cost": 12888.0,
+      "reason": "模型 #4/800, 超额 +1.65%，目标仓位 13.6% (现 0.0%)"
+    },
+    {
+      "code": "600511",
+      "name": "国药股份",
+      "action": "买入",
+      "shares": 500,
+      "limit_price": 27.16,
+      "cost": 13580.0,
+      "reason": "模型 #6/800, 超额 +1.59%，目标仓位 13.2% (现 0.0%)"
+    }
+  ],
+  "alerts": []
+}
