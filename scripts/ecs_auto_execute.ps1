@@ -20,7 +20,7 @@
 #   - If portfolio.yaml account mismatch -> abort
 #   - If plan json older than 24h -> abort (likely stale)
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $LogPath = "C:\money-printer\data\orders\ecs_auto.log"
 $REPO = "C:\money-printer"
 $EXPECTED_ACCOUNT = "8886933837"
