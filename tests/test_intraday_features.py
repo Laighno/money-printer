@@ -36,10 +36,10 @@ from mp.ml.intraday_features import (
 # ─────────────────────────────────────────────────────────────────────
 
 
-def test_intraday_extra_columns_are_exactly_three():
-    """Advisor (round 73) asked for 1-3 intraday-specific features. Lock at 3."""
-    assert len(INTRADAY_EXTRA_COLUMNS) == 3, (
-        f"INTRADAY_EXTRA_COLUMNS should be 3, got {len(INTRADAY_EXTRA_COLUMNS)}: "
+def test_intraday_extra_columns_are_exactly_four():
+    """Round 75 advisor extension: 4 extras (overnight_gap + 3 morning_*)."""
+    assert len(INTRADAY_EXTRA_COLUMNS) == 4, (
+        f"INTRADAY_EXTRA_COLUMNS should be 4, got {len(INTRADAY_EXTRA_COLUMNS)}: "
         f"{INTRADAY_EXTRA_COLUMNS}"
     )
 
@@ -47,6 +47,7 @@ def test_intraday_extra_columns_are_exactly_three():
 def test_intraday_extra_columns_names():
     """Lock the exact names — model artifacts (P11-2) will refer to these by name."""
     assert INTRADAY_EXTRA_COLUMNS == [
+        "overnight_gap",
         "morning_return",
         "morning_vwap_dev",
         "morning_vol_ratio",
@@ -63,8 +64,8 @@ def test_intraday_feature_cols_extends_factor_columns():
 
 
 def test_intraday_feature_cols_length():
-    """Length = base FACTOR_COLUMNS + 3 extras."""
-    assert len(INTRADAY_FEATURE_COLS) == len(FACTOR_COLUMNS) + 3
+    """Length = base FACTOR_COLUMNS + 4 extras (round 75 extension)."""
+    assert len(INTRADAY_FEATURE_COLS) == len(FACTOR_COLUMNS) + 4
 
 
 def test_intraday_feature_cols_unique():
@@ -135,8 +136,78 @@ def test_morning_vol_ratio_uses_only_tail_20():
 # ─────────────────────────────────────────────────────────────────────
 
 
-def test_empty_bar_returns_nan_triple():
-    """Empty dict → all three extras NaN, no raise."""
+# ─────────────────────────────────────────────────────────────────────
+# overnight_gap (round 75 — leak-free, no proxy needed)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_overnight_gap_positive_with_explicit_prev_close():
+    """T-1 close 10.0, T_open 10.5 → +5.0% gap (explicit prev_close arg)."""
+    bar = {"open": 10.5, "high": 10.7, "low": 10.4, "close": 10.6,
+           "volume": 1_000_000, "amount": 11_000_000}
+    out = compute_intraday_extras(bar, prev_close=10.0)
+    assert out["overnight_gap"] == pytest.approx(0.05)
+
+
+def test_overnight_gap_negative_with_explicit_prev_close():
+    """T-1 close 20.0, T_open 19.0 → -5.0% gap."""
+    bar = {"open": 19.0, "high": 19.1, "low": 18.9, "close": 19.0,
+           "volume": 500_000, "amount": 9_500_000}
+    out = compute_intraday_extras(bar, prev_close=20.0)
+    assert out["overnight_gap"] == pytest.approx(-0.05)
+
+
+def test_overnight_gap_falls_back_to_eod_history_close():
+    """No explicit prev_close → use last close in eod_history."""
+    hist = pd.DataFrame({"close": [9.0, 9.5, 10.0], "volume": [1e6] * 3})
+    bar = {"open": 10.5, "high": 10.7, "low": 10.4, "close": 10.6,
+           "volume": 1_000_000, "amount": 11_000_000}
+    out = compute_intraday_extras(bar, eod_history=hist)
+    # last close = 10.0; gap = (10.5 - 10.0) / 10.0 = 0.05
+    assert out["overnight_gap"] == pytest.approx(0.05)
+
+
+def test_overnight_gap_explicit_prev_close_wins_over_history():
+    """If both explicit prev_close and eod_history.close provided, explicit wins."""
+    hist = pd.DataFrame({"close": [10.0] * 5, "volume": [1e6] * 5})
+    bar = {"open": 10.5, "close": 10.6, "volume": 1e6, "amount": 11e6}
+    out = compute_intraday_extras(bar, eod_history=hist, prev_close=10.5)
+    # explicit prev_close = 10.5 → gap = 0
+    assert out["overnight_gap"] == pytest.approx(0.0)
+
+
+def test_overnight_gap_no_history_no_prev_close_returns_nan():
+    """Neither prev_close nor eod_history → overnight_gap NaN, others OK."""
+    bar = {"open": 10.5, "close": 10.6, "volume": 1e6, "amount": 11e6}
+    out = compute_intraday_extras(bar)
+    assert math.isnan(out["overnight_gap"])
+    assert not math.isnan(out["morning_return"])
+
+
+def test_overnight_gap_zero_prev_close_returns_nan():
+    """Bad data (T-1 close == 0) → NaN, no divide-by-zero."""
+    bar = {"open": 10.5, "close": 10.6, "volume": 1e6, "amount": 11e6}
+    out = compute_intraday_extras(bar, prev_close=0.0)
+    assert math.isnan(out["overnight_gap"])
+
+
+def test_overnight_gap_zero_open_returns_nan():
+    """T_open missing → overnight_gap NaN."""
+    bar = {"open": 0.0, "close": 10.6, "volume": 1e6, "amount": 11e6}
+    out = compute_intraday_extras(bar, prev_close=10.0)
+    assert math.isnan(out["overnight_gap"])
+
+
+def test_overnight_gap_string_prev_close():
+    """String prev_close from JSON sources is fine — function coerces in float()."""
+    bar = {"open": 10.5, "close": 10.6, "volume": 1e6, "amount": 11e6}
+    # Explicit prev_close as float (no string coerce on this arg — keep it strict)
+    out = compute_intraday_extras(bar, prev_close=10.0)
+    assert out["overnight_gap"] == pytest.approx(0.05)
+
+
+def test_empty_bar_returns_nan_quad():
+    """Empty dict → all four extras NaN, no raise."""
     out = compute_intraday_extras({})
     for col in INTRADAY_EXTRA_COLUMNS:
         assert math.isnan(out[col]), f"{col} expected NaN, got {out[col]}"
@@ -219,10 +290,13 @@ def test_idempotent_no_history():
 
 
 def test_idempotent_with_history():
-    """Same with history — function is pure."""
+    """Same with history — function is pure (NaN-safe equality)."""
     hist = pd.DataFrame({"volume": np.linspace(800_000, 1_200_000, 25)})
     bar = {"open": 10.0, "high": 10.5, "low": 9.9, "close": 10.3,
            "volume": 1_500_000, "amount": 15_400_000}
     out1 = compute_intraday_extras(bar, eod_history=hist)
     out2 = compute_intraday_extras(bar, eod_history=hist)
-    assert out1 == out2
+    assert out1.keys() == out2.keys()
+    for k in out1:
+        a, b = out1[k], out2[k]
+        assert (math.isnan(a) and math.isnan(b)) or a == b, f"key {k}: {a} != {b}"

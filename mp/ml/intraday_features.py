@@ -19,22 +19,24 @@ Feature contract
   panel where today's T 14:30 OHLCV is appended as a synthetic bar via
   the existing :func:`mp.ml.dataset._process_single_stock` injection hook
   (this hook was built for the midday-report path and is battle-tested).
-- ``INTRADAY_EXTRA_COLUMNS`` (3): morning-session-specific features that
+- ``INTRADAY_EXTRA_COLUMNS`` (4): morning-session-specific features that
   do not exist in the EOD-only schema. Names are stable — model artifacts
   trained on this schema (``data/intraday_blend_*.lgb``, P11-2) will refer
   to these columns by name.
 
-Why three and not zero (or twenty)
-----------------------------------
-The advisor (round 73) asked for "1-3 intraday-specific" features and to
-"keep schema small". Three captures the most information-dense slices of
-the morning session without overfitting risk:
+Why four (round-75 schema)
+--------------------------
+The round-73 baseline was 3; round 75 advisor extension added
+``overnight_gap`` (leak-free, high A股 signal). Lock at 4 for P11-2
+training; revisit only if P11-3 walk-forward Sharpe gain insufficient.
 
-  1. ``morning_return`` — directional signal (was the stock up or down by
-     14:30?). Cleanest possible intraday momentum feature.
-  2. ``morning_vwap_dev`` — close-vs-VWAP gap, a classic intraday strength
+  1. ``overnight_gap`` — (T_open - T-1_close) / T-1_close. CLEAN, no leak
+     (open is known at 9:30 sharp). Captures gap-up/-down sentiment.
+  2. ``morning_return`` — (T 14:30 close - T_open) / T_open. Directional
+     signal (was the stock up or down by 14:30?).
+  3. ``morning_vwap_dev`` — close-vs-VWAP gap, a classic intraday strength
      signal (close > VWAP = late-session buying; close < VWAP = distribution).
-  3. ``morning_vol_ratio`` — today-morning volume vs 20d EOD daily volume.
+  4. ``morning_vol_ratio`` — today-morning volume vs 20d EOD daily volume.
      Captures unusual-attention spikes. Imperfect (true comparison would
      be 20d morning-session totals) but informative; P11-4 will replace
      the EOD-daily denominator with historical morning-session totals once
@@ -58,10 +60,16 @@ import pandas as pd
 
 from mp.ml.dataset import FACTOR_COLUMNS, build_latest_features
 
-# 3 intraday-specific features. Names are part of the model contract once
+# 4 intraday-specific features. Names are part of the model contract once
 # P11-2 trains against this schema — do not rename without retraining.
+#
+# overnight_gap added in round 75 (advisor extension) — leak-free: T_open
+# is known at 9:30 sharp, no proxy needed. A股 gap signal is strong
+# (limit-up gap, news, overnight sentiment) and not captured by the EOD
+# features.
 INTRADAY_EXTRA_COLUMNS: List[str] = [
-    "morning_return",     # (T 14:30 close - T open) / T open
+    "overnight_gap",      # (T_open - T-1_close) / T-1_close   (clean, no leak)
+    "morning_return",     # (T 14:30 close - T_open) / T_open
     "morning_vwap_dev",   # (T 14:30 close - morning_VWAP) / morning_VWAP
     "morning_vol_ratio",  # T morning volume / 20-day EOD volume MA (proxy)
 ]
@@ -75,8 +83,9 @@ INTRADAY_FEATURE_COLS: List[str] = FACTOR_COLUMNS + INTRADAY_EXTRA_COLUMNS
 def compute_intraday_extras(
     intraday_bar: Dict,
     eod_history: Optional[pd.DataFrame] = None,
+    prev_close: Optional[float] = None,
 ) -> Dict[str, float]:
-    """Compute the 3 intraday-specific features for one ``(code, T 14:30)`` point.
+    """Compute the 4 intraday-specific features for one ``(code, T 14:30)`` point.
 
     Pure function — no I/O, safe to call from training loops.
 
@@ -95,8 +104,13 @@ def compute_intraday_extras(
         Optional EOD bar history (rows ending at T-1) with at least a
         ``volume`` column. Used to normalize ``morning_vol_ratio`` against
         a 20-day EOD-volume moving average. When ``None`` or shorter than
-        20 rows, ``morning_vol_ratio`` is NaN (``morning_return`` and
-        ``morning_vwap_dev`` remain computable).
+        20 rows, ``morning_vol_ratio`` is NaN. When a ``close`` column is
+        present and the explicit ``prev_close`` arg is None, the last EOD
+        close is used as the T-1 close for ``overnight_gap``.
+    prev_close : float or None
+        Explicit T-1 close for ``overnight_gap``. Takes precedence over the
+        eod_history fallback. ``None`` → fall back to eod_history; if both
+        missing, ``overnight_gap`` is NaN.
 
     Returns
     -------
@@ -108,6 +122,17 @@ def compute_intraday_extras(
     close_p = float(intraday_bar.get("close") or 0.0)
     volume = float(intraday_bar.get("volume") or 0.0)
     amount = float(intraday_bar.get("amount") or 0.0)
+
+    # overnight_gap — leak-free: T_open vs T-1 close.
+    if prev_close is None and eod_history is not None and "close" in eod_history.columns and len(eod_history) >= 1:
+        try:
+            prev_close = float(eod_history["close"].iloc[-1])
+        except (ValueError, TypeError):
+            prev_close = None
+    if open_p > 0 and prev_close is not None and prev_close > 0:
+        overnight_gap = (open_p - prev_close) / prev_close
+    else:
+        overnight_gap = float("nan")
 
     if open_p > 0 and close_p > 0:
         morning_return = (close_p - open_p) / open_p
@@ -136,6 +161,7 @@ def compute_intraday_extras(
         morning_vol_ratio = float("nan")
 
     return {
+        "overnight_gap": overnight_gap,
         "morning_return": morning_return,
         "morning_vwap_dev": morning_vwap_dev,
         "morning_vol_ratio": morning_vol_ratio,
@@ -172,10 +198,12 @@ def build_intraday_panel(
     include_fundamentals : bool
         Whether to merge in fundamentals (PE/PB/ROE etc).
     eod_history_map : dict[code → DataFrame] or None
-        Optional per-code EOD bar history used to fill ``morning_vol_ratio``.
-        When omitted, ``morning_vol_ratio`` is NaN for all rows (the other
-        two extras are still populated). P11-4 will wire this up against
-        the proper historical morning-session totals.
+        Optional per-code EOD bar history (rows ending T-1) used to fill
+        ``morning_vol_ratio`` (20-day volume MA) and ``overnight_gap`` (T-1
+        close as fallback when no explicit prev_close). When omitted, those
+        two columns are NaN for all rows (``morning_return`` and
+        ``morning_vwap_dev`` are still populated). P11-4 will wire this up
+        against proper historical morning-session totals.
 
     Returns
     -------
