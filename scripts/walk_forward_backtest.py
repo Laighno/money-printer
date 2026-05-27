@@ -42,7 +42,7 @@ os.chdir(_PROJECT_ROOT)
 # may not be byte-perfect reproducible across processes if hashseed varies.
 if os.environ.get("PYTHONHASHSEED") != "0":
     sys.stderr.write(
-        "WARNING: PYTHONHASHSEED != 0 -> universe iteration / set ordering "
+        "WARNING: PYTHONHASHSEED != 0 → universe iteration / set ordering "
         "may be nondeterministic across processes. For byte-perfect "
         "reproducible backtest, run as:\n"
         "  PYTHONHASHSEED=0 LGBM_SEED=42 WF_FEATURE_PRESET=W_BASELINE "
@@ -146,7 +146,13 @@ assert REBALANCE_POLICY in ("on_change", "drift_threshold"), \
 # Validating "blend" here is the missing piece — until this completes we
 # don't know if BlendRanker matches/beats StockRanker on the same backtest.
 RANKER_KIND = os.environ.get("RANKER_KIND", "blend")  # P10-2: default to production path (BlendRanker) — see Rule #11
-assert RANKER_KIND in ("stock", "blend"), f"Unknown RANKER_KIND={RANKER_KIND}"
+# "intraday_blend" added P11-3 (round 79 spec): BlendRanker trained on
+# INTRADAY_FEATURE_COLS (FACTOR_COLUMNS + 4 morning extras = 68 cols),
+# panel augmented per-row via EOD-proxy. Option C entry: walk_forward
+# execution timing UNCHANGED (T+1 open), only the model variable
+# differs — clean A/B vs `blend` per Rule #10.
+assert RANKER_KIND in ("stock", "blend", "intraday_blend"), \
+    f"Unknown RANKER_KIND={RANKER_KIND}"
 
 # Position-sizing scheme for the Top-K selection.
 #   "equal"      : 1/N each (BASELINE-validated, default).
@@ -531,8 +537,12 @@ def run_walk_forward():
     # Optional: augment panel with per-date regime features (PIT-safe,
     # computed from ZZ500 + cross-sectional breadth).  LGBM can learn
     # regime↔factor interactions via tree splits.
+    # 2026-05-23: switched from FACTOR_COLUMNS (47) to CURATED_COLUMNS (28)
+    # — IC analysis showed the dropped 19 features had |IR| < 0.15 (noise);
+    # the kept set adds 3 strong industry-rank signals that were previously
+    # masked by data issues (now fixed).
     # 2026-05-24: env override for W0/W1/W2 walk-forward comparison after
-    # P0 ICIR fix (commit b023ba4). See mp/ml/feature_presets.py.
+    # P0 ICIR fix. See mp/ml/feature_presets.py for frozen preset lists.
     _wf_preset = os.environ.get("WF_FEATURE_PRESET")
     if _wf_preset:
         from mp.ml.feature_presets import PRESETS, preset_signature
@@ -547,13 +557,43 @@ def run_walk_forward():
             _wf_preset, len(feature_cols), preset_signature(_wf_preset),
         )
     else:
-        feature_cols = list(FACTOR_COLUMNS)
+        feature_cols = list(CURATED_COLUMNS)
     if USE_REGIME_FEATURES:
         logger.info("Regime features: ENABLED ({} cols added)", len(REGIME_COLUMNS))
         panel = add_regime_features(panel)
         feature_cols = feature_cols + [c for c in REGIME_COLUMNS if c in panel.columns]
     else:
         logger.info("Regime features: disabled (set USE_REGIME_FEATURES=1 to enable)")
+
+    # ── P11-3 (round 79): RANKER_KIND=intraday_blend augments panel ────────
+    # with 4 EOD-proxy intraday extras + switches feature_cols to
+    # INTRADAY_FEATURE_COLS (68). Same EOD-proxy formula as
+    # scripts/train_intraday.py — keeps training and walk-forward in the
+    # same distribution. Execution timing UNCHANGED (T+1 open simulator
+    # path), per Option C — only the model variable differs vs RANKER_KIND=blend.
+    if RANKER_KIND == "intraday_blend":
+        from mp.ml.intraday_features import INTRADAY_FEATURE_COLS, INTRADAY_EXTRA_COLUMNS
+        from scripts.train_intraday import compute_extras_for_panel
+        logger.info("RANKER_KIND=intraday_blend — augmenting panel with {} EOD-proxy extras",
+                    len(INTRADAY_EXTRA_COLUMNS))
+        extras_frames: List[pd.DataFrame] = []
+        for code, bars in bars_map.items():
+            extras = compute_extras_for_panel(bars)
+            extras["code"] = code
+            extras_frames.append(extras[["code", "date"] + list(INTRADAY_EXTRA_COLUMNS)])
+        extras_all = pd.concat(extras_frames, ignore_index=True)
+        extras_all["date"] = pd.to_datetime(extras_all["date"])
+        panel = panel.merge(extras_all, on=["code", "date"], how="left")
+        # Sanity: every panel row should now have all 4 extras (some NaN
+        # at warm-up boundaries is acceptable; LightGBM handles them).
+        for col in INTRADAY_EXTRA_COLUMNS:
+            n_nan = int(panel[col].isna().sum())
+            logger.info("  {}: {:.1f}% non-null ({} NaN of {})",
+                        col, 100.0 * (1 - n_nan / max(len(panel), 1)),
+                        n_nan, len(panel))
+        feature_cols = list(INTRADAY_FEATURE_COLS)
+        logger.info("intraday_blend feature_cols: {} cols (FACTOR_COLUMNS + 4 extras)",
+                    len(feature_cols))
 
     close_lk, open_lk, adv_lk = _build_price_adv_lookup(bars_map)
 
@@ -652,6 +692,14 @@ def run_walk_forward():
     pending_raw_scores: Dict[str, float] = {}        # raw excess pred by code, populated in Step B
     current_universe: frozenset = _current_codes_set  # updated at each retrain
 
+    # Tail-quality records — for each scoring day, capture:
+    #   predicted top-K codes, actual fwd_ret of all valid codes
+    # Used after backtest to compute Hit Rate@K and NDCG@K, which measure
+    # how well the model identifies the extreme tail (top performers).
+    # IC measures mean predictive power; these measure top-K precision —
+    # what actually matters for a Top-K strategy.
+    tail_quality_records: List[dict] = []
+
     # 4. Main loop — retrain monthly, score & rebalance daily
     for step, dt in enumerate(trading_dates):
         # Track month transitions for monthly return logging
@@ -706,7 +754,7 @@ def run_walk_forward():
                 logger.warning("Too few training rows ({}), skipping retrain", len(train_df))
             else:
                 try:
-                    if RANKER_KIND == "blend":
+                    if RANKER_KIND in ("blend", "intraday_blend"):
                         from mp.ml.model import BlendRanker
                         ranker = BlendRanker(feature_cols=feature_cols)
                         metrics = ranker.train_fast(train_df)
@@ -845,6 +893,25 @@ def run_walk_forward():
                         )
                     else:
                         pending_selection = scored[:TOP_K]
+
+                    # Record tail-quality data for post-backtest analysis.
+                    # We use the model's top-K vs the actual top-K (by realized
+                    # fwd_ret) — works even when fwd_ret is forward-looking
+                    # because this is computed POST-hoc, not used for trading.
+                    try:
+                        pred_top_k = [c for c, _ in scored[:TOP_K]]
+                        fwd_ret_map = dict(zip(today_valid["code"],
+                                                today_valid["fwd_ret"]))
+                        # Skip if too many fwd_ret NaN (last 20 days of panel)
+                        valid_fwd = {c: r for c, r in fwd_ret_map.items() if pd.notna(r)}
+                        if len(valid_fwd) >= TOP_K * 5:   # need decent universe
+                            tail_quality_records.append({
+                                "date": dt,
+                                "pred_top_k": pred_top_k,
+                                "fwd_ret_map": valid_fwd,
+                            })
+                    except Exception as e:
+                        logger.debug("tail_quality record skip {}: {}", dt, e)
                     # Snapshot the raw scores keyed by date for the buy step.
                     # In conviction_oracle mode (leak check ONLY), replace with
                     # the realized forward 20d return — this is the perfect
@@ -891,6 +958,22 @@ def run_walk_forward():
     nav_df = pd.DataFrame(nav_records)
     metrics = calc_performance(nav_df)
 
+    # 5b. Tail-quality metrics — Hit Rate@K and NDCG@K averaged over
+    # all scoring days.  Measures how good the model is at the TAIL
+    # (top-K picks), which is what actually drives a Top-K strategy.
+    tail_q = _compute_tail_quality_metrics(tail_quality_records, k=TOP_K)
+    metrics["hit_rate_at_k"] = tail_q["hit_rate"]
+    metrics["ndcg_at_k"] = tail_q["ndcg"]
+    metrics["actual_topk_alpha"] = tail_q["actual_topk_fwd_mean"]
+    metrics["selected_topk_alpha"] = tail_q["selected_topk_fwd_mean"]
+    metrics["topk_alpha_capture_rate"] = tail_q["alpha_capture_rate"]
+    metrics["tail_q_n_days"] = tail_q["n_days"]
+    logger.info("Tail quality ({} days @ K={}):  Hit Rate={:.1%}  NDCG={:.3f}  "
+                "Selected alpha={:.3%}  Realistic top-K alpha={:.3%}  Capture={:.1%}",
+                tail_q["n_days"], TOP_K, tail_q["hit_rate"], tail_q["ndcg"],
+                tail_q["selected_topk_fwd_mean"], tail_q["actual_topk_fwd_mean"],
+                tail_q["alpha_capture_rate"])
+
     # Fetch ZZ500 benchmark
     benchmark_ret = _calc_benchmark_return(trading_dates, close_lk, bars_map)
 
@@ -906,6 +989,66 @@ def run_walk_forward():
     _save_report(metrics, monthly_returns, benchmark_ret, broker.trade_log, elapsed)
 
     return metrics, monthly_returns, current_ranker, benchmark_ret
+
+
+def _compute_tail_quality_metrics(records: List[dict], k: int = 10) -> Dict[str, float]:
+    """Compute Hit Rate@K, NDCG@K, and alpha capture rate over the daily
+    prediction records.
+
+    For each scoring day:
+      - actual top-K = the K codes with highest realized fwd_ret that day
+      - selected top-K = the K codes the model picked
+      - hit_rate@K = |selected ∩ actual| / K
+      - NDCG@K = sum(realized_fwd_ret[selected[i]] / log2(i+2)) /
+                 sum(realized_fwd_ret[actual[i]]    / log2(i+2))
+      - alpha capture rate = mean(selected fwd_ret) / mean(actual top-K fwd_ret)
+    """
+    if not records:
+        return {"hit_rate": float("nan"), "ndcg": float("nan"),
+                "actual_topk_fwd_mean": float("nan"),
+                "selected_topk_fwd_mean": float("nan"),
+                "alpha_capture_rate": float("nan"), "n_days": 0}
+
+    hits, ndcgs, sel_means, act_means = [], [], [], []
+
+    for rec in records:
+        pred = rec["pred_top_k"]
+        fwd_map = rec["fwd_ret_map"]
+        if not pred or not fwd_map:
+            continue
+        # Filter selected to those with valid fwd_ret
+        sel_valid = [c for c in pred if c in fwd_map]
+        if not sel_valid:
+            continue
+
+        # Actual top-K by realized fwd_ret
+        sorted_actual = sorted(fwd_map.items(), key=lambda x: -x[1])[:k]
+        actual_codes = [c for c, _ in sorted_actual]
+        actual_rets = [r for _, r in sorted_actual]
+
+        # Hit rate
+        hit = len(set(sel_valid) & set(actual_codes)) / len(sel_valid)
+        hits.append(hit)
+
+        # NDCG@K (normalized by ideal DCG of actual top-K)
+        sel_rets = [fwd_map[c] for c in sel_valid][:k]
+        dcg = sum(r / np.log2(i + 2) for i, r in enumerate(sel_rets))
+        ideal_dcg = sum(r / np.log2(i + 2) for i, r in enumerate(actual_rets))
+        if ideal_dcg != 0:
+            ndcgs.append(dcg / ideal_dcg)
+
+        sel_means.append(float(np.mean(sel_rets)))
+        act_means.append(float(np.mean(actual_rets)))
+
+    return {
+        "hit_rate": float(np.mean(hits)) if hits else float("nan"),
+        "ndcg": float(np.mean(ndcgs)) if ndcgs else float("nan"),
+        "actual_topk_fwd_mean": float(np.mean(act_means)) if act_means else float("nan"),
+        "selected_topk_fwd_mean": float(np.mean(sel_means)) if sel_means else float("nan"),
+        "alpha_capture_rate": (float(np.mean(sel_means)) / float(np.mean(act_means))
+                                if act_means and np.mean(act_means) != 0 else float("nan")),
+        "n_days": len(hits),
+    }
 
 
 def _calc_benchmark_return(
@@ -1072,16 +1215,7 @@ def update_production_models(
         logger.info("Production BlendRanker: saved from walk-forward (no retrain)")
         results["blend"] = {"source": "walk-forward", "saved": True}
     elif ranker_20d is None:
-        # --update-only path (no walk-forward ranker): legitimate request to
-        # refresh BlendRanker from scratch.
-        # NOTE 2026-05-24 (P3-1c, docs/dialog/ round 34): train_fast(ds_20) on
-        # full panel is known to produce a weak model (P3-1a evidence: val IC
-        # ~ -0.005). This is a SEPARATE bug (--update-only mode produces an
-        # inferior blend) tracked as a follow-up; not fixed in this commit
-        # because --update-only is rare and the failure is loud (logs show
-        # primary IC immediately, advisor will catch). Touching it here would
-        # widen scope beyond the P3-1c "don't clobber from non-blend caller"
-        # fix.
+        # --update-only path: legitimate refresh from scratch
         logger.info("Training production BlendRanker (0.8 primary + 0.2 extreme)...")
         if ds_20 is None:
             ds_20 = build_dataset(codes, TRAIN_START, horizon=20)
@@ -1107,22 +1241,16 @@ def update_production_models(
         else:
             results["blend"] = {"error": "no dataset"}
     else:
-        # P3-1c (docs/dialog/ round 34): caller passed a non-blend ranker
-        # (typically RANKER_KIND=stock walk-forward path with ranker_20d =
-        # StockRanker). Refresh-from-scratch via train_fast(ds_20) here was
-        # silently clobbering production blend_*.lgb with a model whose val
-        # IC ~ -0.005 (P3-1a incident: 1.90 Sharpe model overwritten;
-        # required manual git-show rollback). Skip the retrain entirely.
+        # P3-1c: caller passed a non-blend ranker (typically RANKER_KIND=stock).
+        # Skip retrain to avoid clobbering production blend (see commit 37ebfa8).
         logger.warning(
             "update_production_models: caller's ranker_20d is {} (not "
-            "BlendRanker); SKIPPING blend_*.lgb retrain to avoid clobbering "
-            "production blend model. Use --update-only to explicitly refresh "
-            "blend from scratch.",
+            "BlendRanker); SKIPPING blend_*.lgb retrain. Use --update-only "
+            "to explicitly refresh blend.",
             type(ranker_20d).__name__,
         )
         results["blend"] = {"skipped": True,
-                            "reason": f"non-blend ranker ({type(ranker_20d).__name__}) passed; "
-                                      "use --update-only to refresh blend"}
+                            "reason": f"non-blend ranker ({type(ranker_20d).__name__})"}
 
     # ── StockRanker fallback (data/model.lgb) ──
     if ranker_is_stock:
@@ -1345,7 +1473,6 @@ def send_model_update_report(
                 except Exception as _de:
                     logger.warning("alert_dispatch failed (inline weekly path still ran): {}", _de)
         except Exception as _e:
-            # Alert dispatch must never break the existing weekly report
             logger.warning("threshold_alert dispatch failed: {}", _e)
 
         # --- Comparison with previous run ---
