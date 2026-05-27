@@ -6459,6 +6459,58 @@ P11-5 涉及的 production change (round 73 outline 提到):
 P11-3 N=6 完成 (commit `2574a85`): intraday_blend mean Sharpe 1.99 vs EOD baseline 1.86 = delta **+0.132**. 严格 +0.15 阈值差 0.018, 但 5/6 per-seed directional 正向, **触发 round 81 secondary rule → MIGRATE**. MDD 改善 -7.75pp 在 multiple regimes 持续 (2024-01 EOD -14.72% 在 intraday 不出现), Vol 也 -1.59pp 优. Q1 sanity: 不是 single regime concentrated. Q2: fold 3 outlier = 2020-03 COVID crash, normal LightGBM regime-shift behavior. 等 advisor confirm migrate, 然后启动 P11-5 spec (建议 staged migration via 2-week paper trade). Production 9:30 path 仍正常.
 
 
+## [2026-05-27 15:10] 第 84 轮 (MIGRATE ACK + decision_log freeze) · 2 commits `d9e91e3` + `b9bd340`
+
+### 上一轮你 (round 83)
+P11-3 N=6 ACK ✅. MIGRATE confirmed (per round 81 secondary rule). Catch #12 不加 (one-shot rule, 不写 permanent). **Hold for user** — 不 auto-roll into P11-5; 等 user 决策 cutover 方式 / 模型版本 / broker order type. 但 P11-3 章节 decision_log 现在可以 pre-emptive 写 (research 阶段完成, freeze audit trail).
+
+### 这一轮做完 (2 commits)
+
+**Commit `d9e91e3` — decision_log P11-3 chapter**
+
+`docs/decision_log.md` +160 lines. 新 `## P11-3 chain · intraday_blend research → MIGRATE confirmed (2026-05-27)` 章节, 跟 P10-2 style 严格对齐:
+
+- **Phase summary** (P11-1 → P11-3 N=6, 7 rows, 12 commit SHA)
+- **Final N=6 12-数字 table** (intraday vs EOD, 4 metric rows, delta row)
+- **Per-seed directional** (5/6 positive 详细)
+- **Borderline secondary rule** explicit: round 81 one-shot, **不 promote permanent**
+- **Q1 + Q2 sanity** condensed (2024-01 absent, 2020-03 COVID artifact)
+- **Walk-forward per-fold IC trajectory** (mean 0.06-0.07, > production 0.03-0.05)
+- **Production state** explicit unchanged (data/blend_*.lgb May 24 17:45 timestamps)
+- **Rule compliance** table (#1/#4/#7/#9/#10/#11 ✓)
+- **P11-5 user-gated 3 forks** documented (cutover / model version / order type)
+- **Commits audit trail** (12 SHAs from `26e90e6` → `d9e91e3`)
+- **Round audit trail** (73-83, who-triggered-what)
+
+**Commit `b9bd340` — SHA backfill**
+
+`_THIS_COMMIT_` placeholder × 2 → 实际 SHA `d9e91e3` (phase table row + commits list).
+
+### 严格按你 round 83 指令
+
+- ✅ 不写 P11-5 actions (user-gated)
+- ✅ 不 promote secondary rule 为 permanent (one-shot 文档)
+- ✅ BASELINE.md / framework_evaluation.md 不动 (research conclusion 不上 baseline 层)
+- ✅ decision_log 章节 freeze 当前 research, 即便后续 P11-5 ordering pending
+- ✅ Rule #11 schema-level satisfied (walk-forward vs P11-2-trained .lgb 都 INTRADAY_FEATURE_COLS 68)
+
+### 等你
+
+ACK round 84 (decision_log freeze ✓). P11-3 chain 正式 research-complete 等 user.
+
+### 主动给 user
+
+P11-3 chain 正式 freeze 在 audit trail (commits `d9e91e3` + `b9bd340`). decision_log 新 P11-3 章节 160 行涵盖: phase summary 12 commits, N=6 12 数字, 5/6 directional 推理, Q1+Q2 sanity, walk-forward 多 fold IC 0.06-0.07 > production 0.03-0.05 (证 train_fast single-split 0.008 是 noise 非 model bug), Rule #1/#4/#7/#9/#10/#11 全 ✓ summary, P11-5 三个 user-gated forks 文档. **MIGRATE 决策已 frozen, 实际 production change 等你 (user) 拍板**:
+
+1. 14:30 → 14:50 实盘 cutover: 直接 full cut 还是 2 周 paper trade 先验? (engineer 建议 paper)
+2. 模型版本: 立刻用 EOD-proxy 训出的 .lgb 上 paper, 还是先做 P11-4 真 intraday 数据重训 (~5天)? (engineer 建议 先 EOD-proxy 上 paper, P11-4 后台 queue)
+3. 14:50 broker 订单: limit (with T_close × buffer) 还是 market? (P11-5 spec 阶段细化)
+
+Production 9:30 path 今天仍正常跑 (账户 8886933837, 7/7 fills 已实战验证).
+
+
+
+
 
 
 
