@@ -221,6 +221,10 @@ def main() -> int:
                          "data/intraday_blend_primary.lgb + data/intraday_blend_extreme.lgb)")
     ap.add_argument("--smoke", action="store_true",
                     help="Smoke run: 3 stocks × 1 year only, verify pipeline; do NOT overwrite production-style artifacts.")
+    ap.add_argument("--no-extras", action="store_true",
+                    help="P11-2b control: train BlendRanker(feature_cols=FACTOR_COLUMNS) only (64 cols, no 4 intraday extras). "
+                         "Same dataset / seed / val_frac / label as the full P11-2 run — clean A/B per Rule #10. "
+                         "Output prefix gains '_control' suffix.")
     args = ap.parse_args()
 
     # Rule #4 guardrail: refuse to overwrite production blend
@@ -239,9 +243,10 @@ def main() -> int:
     else:
         codes = get_recommendation_universe()
         start = args.start
-        logger.info("=== Full intraday training: {} codes, start={}, horizon={} → {} ===",
-                    len(codes), start, args.horizon, args.output_prefix)
-        output_prefix = args.output_prefix
+        suffix = "_control" if args.no_extras else ""
+        output_prefix = args.output_prefix + suffix
+        logger.info("=== Full intraday training: {} codes, start={}, horizon={}, no_extras={} → {} ===",
+                    len(codes), start, args.horizon, args.no_extras, output_prefix)
 
     # 1. Build EOD base panel
     t0 = time.time()
@@ -269,13 +274,21 @@ def main() -> int:
         logger.error("Panel missing {} INTRADAY_FEATURE_COLS: {}", len(missing), sorted(missing)[:10])
         return 3
 
-    # 4. Train BlendRanker on the 68-feature schema
-    logger.info("Training BlendRanker(feature_cols=INTRADAY_FEATURE_COLS, {} cols)...",
-                len(INTRADAY_FEATURE_COLS))
+    # 4. Train BlendRanker. --no-extras (P11-2b control) restricts to
+    # FACTOR_COLUMNS only so the only thing varying vs the full P11-2 run
+    # is the feature set (Rule #10 single-variable A/B).
+    if args.no_extras:
+        feature_cols = list(FACTOR_COLUMNS)
+        logger.info("P11-2b CONTROL: feature_cols=FACTOR_COLUMNS ({} cols, no 4 intraday extras)",
+                    len(feature_cols))
+    else:
+        feature_cols = INTRADAY_FEATURE_COLS
+        logger.info("Training BlendRanker(feature_cols=INTRADAY_FEATURE_COLS, {} cols)...",
+                    len(feature_cols))
     seed = int(os.environ.get("LGBM_SEED", "42"))
     logger.info("LGBM_SEED={} (override via env)", seed)
     t0 = time.time()
-    ranker = BlendRanker(feature_cols=INTRADAY_FEATURE_COLS)
+    ranker = BlendRanker(feature_cols=feature_cols)
     metrics = ranker.train_fast(panel)
     logger.info("Training complete in {:.1f}s", time.time() - t0)
     logger.info("  primary IC = {:.4f}", metrics.get("primary", {}).get("ic", float("nan")))
