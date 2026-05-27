@@ -1,0 +1,278 @@
+"""P11-4 Step 1: Fetch 9:30-14:30 1-minute OHLCV from xtdata for the
+hs300+zz500 universe over 2019-01-01 → 2026-04-30.
+
+Output: monthly partitioned parquet files at ``data/intraday_1m/YYYYMM.parquet``
+with columns: ``code, datetime, open, high, low, close, volume``.
+
+WHERE TO RUN
+============
+This script MUST run on the ECS Windows host that has QMT installed
+(``xtquant`` package is only available there).  Mac engineer side does
+NOT have ``xtdata`` — that's why P11-2 had to use EOD-proxy.
+
+WORKFLOW
+========
+On ECS Windows (PowerShell):
+  cd C:\\money-printer
+  py -3 scripts/p11_4_fetch_intraday.py --start 20190101 --end 20260430
+
+The script will:
+1. Compute the hs300+zz500 universe via the existing fetcher (~800 stocks)
+2. For each (code, year-month) tile:
+   a. Call ``xtdata.download_history_data`` to ensure the local cache
+      has 1m bars covering that month.
+   b. Call ``xtdata.get_local_data`` to retrieve raw bars.
+   c. Filter to trading hours 09:30 ≤ time < 14:30 (so the 14:30 bar
+      itself is NOT included — that bar's open IS the 14:30 prediction
+      anchor; including it would leak the score-time price).
+3. Append rows to a per-month buffer, flushed to parquet on month boundary.
+
+Resume safely after crash: existing parquet files are NOT overwritten
+unless ``--force`` is passed; the loop skips months where the parquet
+already exists.
+
+EXPECTED COSTS
+==============
+~800 codes × 75 months × ~3000 bars/code-month ≈ 180M rows raw.
+Parquet zstd compression should produce ~600 MB - 1.2 GB total.
+
+xtdata.download_history_data is throttled by xtquant — expect 1-2 days
+wall clock for the initial cold fetch.  Subsequent re-runs from local
+cache are much faster (~30 min for full reread + parquet write).
+
+RUNBOOK (post-run on ECS → Mac sync)
+====================================
+After ECS run completes:
+  rsync -av ECS_USER@ECS_HOST:/c/money-printer/data/intraday_1m/ \\
+        /Users/laighno/laighno/money-printer/data/intraday_1m/
+
+Then on Mac, sanity-check via:
+  ls -la data/intraday_1m/ | head
+  .venv/bin/python -c "import pandas as pd; \\
+    df = pd.read_parquet('data/intraday_1m/202404.parquet'); \\
+    print(df.shape, df.columns.tolist(), df.head())"
+
+OUTPUT SCHEMA (per-month parquet)
+=================================
+| col      | dtype     | example                  |
+|----------|-----------|--------------------------|
+| code     | str       | "002385" (6-digit, no suffix) |
+| datetime | datetime  | 2024-04-15 09:30:00      |
+| open     | float64   | 12.34                    |
+| high     | float64   | 12.40                    |
+| low      | float64   | 12.30                    |
+| close    | float64   | 12.38                    |
+| volume   | int64     | 12345 (shares)           |
+
+P11-4 Step 2 (feature recompute) is in a separate script and DOES NOT
+run on ECS — that's Mac-side after rsync.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from datetime import datetime, time as dt_time
+from pathlib import Path
+from typing import Iterable, List, Optional
+
+from loguru import logger
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+
+# Trading-hour bounds for the 14:30 entry path.  IMPORTANT: we include
+# bars FROM 09:30 (the open auction) up to but NOT INCLUDING 14:30.  At
+# 14:30 the script that runs in production will be predicting; including
+# the 14:30 bar in training data would leak the prediction-time price.
+MORNING_OPEN = dt_time(9, 30)
+AFTERNOON_CUTOFF = dt_time(14, 30)
+
+
+def _code_to_xtquant(code: str) -> str:
+    """Convert 6-digit A-share code to xtquant code with exchange suffix.
+
+    Rules (no special cases for STAR/CHINEXT — exchange determined by prefix):
+      6xxxxx → SH
+      otherwise → SZ
+    """
+    code = str(code).zfill(6)
+    return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
+
+
+def _xtquant_to_code(xt_code: str) -> str:
+    """Strip the .SH/.SZ suffix."""
+    return xt_code.split(".")[0]
+
+
+def _month_range(start_yyyymmdd: str, end_yyyymmdd: str) -> List[str]:
+    """Inclusive list of yyyymm tiles spanning ``[start, end]``."""
+    import pandas as pd
+    start = pd.to_datetime(str(start_yyyymmdd))
+    end = pd.to_datetime(str(end_yyyymmdd))
+    months: List[str] = []
+    cur = start.replace(day=1)
+    while cur <= end:
+        months.append(cur.strftime("%Y%m"))
+        cur = (cur + pd.offsets.MonthBegin(1)).to_pydatetime()
+    return months
+
+
+def _ensure_universe() -> List[str]:
+    """Return current hs300+zz500 universe via existing fetcher."""
+    from mp.data.fetcher import get_recommendation_universe
+    codes = get_recommendation_universe()
+    logger.info("Universe: {} codes (hs300+zz500)", len(codes))
+    return [str(c).zfill(6) for c in codes]
+
+
+def _fetch_one_month(
+    xt_codes: List[str],
+    yyyymm: str,
+    force: bool,
+    out_dir: Path,
+) -> Optional[Path]:
+    """Fetch 1m bars for one month-tile, save parquet.  Returns path or None."""
+    import pandas as pd
+    from xtquant import xtdata  # noqa: WPS433 — windows-only import
+
+    out_path = out_dir / f"{yyyymm}.parquet"
+    if out_path.exists() and not force:
+        logger.info("[{}] skip (already exists)", yyyymm)
+        return out_path
+
+    year = int(yyyymm[:4])
+    month = int(yyyymm[4:])
+    month_start = pd.Timestamp(year=year, month=month, day=1)
+    month_end_excl = month_start + pd.offsets.MonthBegin(1)
+    start_str = month_start.strftime("%Y%m%d000000")
+    end_str = month_end_excl.strftime("%Y%m%d000000")
+
+    # Step a — ensure local cache covers this month (throttled).
+    logger.info("[{}] download_history_data for {} codes...", yyyymm, len(xt_codes))
+    t0 = time.time()
+    for batch_start in range(0, len(xt_codes), 50):
+        batch = xt_codes[batch_start:batch_start + 50]
+        xtdata.download_history_data(
+            batch, period="1m", start_time=start_str, end_time=end_str,
+        )
+    logger.info("[{}] download completed in {:.1f}s", yyyymm, time.time() - t0)
+
+    # Step b — read back from local cache.
+    t0 = time.time()
+    field_list = ["open", "high", "low", "close", "volume"]
+    raw = xtdata.get_local_data(
+        field_list=field_list,
+        stock_list=xt_codes,
+        period="1m",
+        start_time=start_str,
+        end_time=end_str,
+        count=-1,
+        dividend_type="none",
+        fill_data=False,
+    )
+    # raw is a dict {field → DataFrame[rows=times, cols=codes]}; melt to long form.
+    if not raw or not all(isinstance(v, pd.DataFrame) for v in raw.values()):
+        logger.warning("[{}] xtdata.get_local_data returned unexpected shape, skipping", yyyymm)
+        return None
+
+    # Pivot to (code, datetime, open, high, low, close, volume) long form.
+    frames: List[pd.DataFrame] = []
+    for field, df in raw.items():
+        if df.empty:
+            continue
+        long_df = df.reset_index().melt(id_vars=df.index.name or "time",
+                                         var_name="code_xt", value_name=field)
+        time_col = df.index.name or "time"
+        long_df = long_df.rename(columns={time_col: "datetime"})
+        frames.append(long_df.set_index(["code_xt", "datetime"]))
+    if not frames:
+        logger.warning("[{}] no rows pivoted, skipping", yyyymm)
+        return None
+    merged = pd.concat(frames, axis=1).reset_index()
+    merged["code"] = merged["code_xt"].apply(_xtquant_to_code)
+    merged.drop(columns=["code_xt"], inplace=True)
+
+    # Step c — filter to MORNING_OPEN ≤ t < AFTERNOON_CUTOFF (9:30-14:30 exclusive).
+    merged["datetime"] = pd.to_datetime(merged["datetime"])
+    times = merged["datetime"].dt.time
+    mask = (times >= MORNING_OPEN) & (times < AFTERNOON_CUTOFF)
+    merged = merged.loc[mask].copy()
+
+    if merged.empty:
+        logger.warning("[{}] empty after time filter, skipping", yyyymm)
+        return None
+
+    # Cast volume to int64 (xtquant returns float; raw share counts are integer).
+    merged["volume"] = merged["volume"].fillna(0).astype("int64")
+    for col in ("open", "high", "low", "close"):
+        merged[col] = merged[col].astype("float64")
+    merged = merged[["code", "datetime", "open", "high", "low", "close", "volume"]]
+    merged = merged.sort_values(["code", "datetime"]).reset_index(drop=True)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    merged.to_parquet(out_path, compression="zstd", index=False)
+    logger.info("[{}] saved {} rows ({} codes × ~{} bars) → {} ({:.1f} MB) in {:.1f}s",
+                yyyymm, len(merged), merged["code"].nunique(),
+                int(len(merged) / max(merged["code"].nunique(), 1)),
+                out_path, out_path.stat().st_size / 1e6,
+                time.time() - t0)
+    return out_path
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--start", default="20190101", help="YYYYMMDD start date (inclusive)")
+    ap.add_argument("--end", default="20260430", help="YYYYMMDD end date (inclusive)")
+    ap.add_argument("--out-dir", default="data/intraday_1m",
+                    help="Output parquet directory (default: data/intraday_1m)")
+    ap.add_argument("--force", action="store_true",
+                    help="Re-fetch even if monthly parquet already exists")
+    ap.add_argument("--limit-codes", type=int, default=0,
+                    help="If > 0, only fetch first N codes (for smoke testing on ECS)")
+    args = ap.parse_args()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        codes = _ensure_universe()
+    except Exception as e:
+        logger.error("Failed to load universe: {}", e)
+        return 1
+
+    if args.limit_codes > 0:
+        codes = codes[: args.limit_codes]
+        logger.warning("Smoke mode: limited to {} codes", len(codes))
+
+    xt_codes = [_code_to_xtquant(c) for c in codes]
+
+    months = _month_range(args.start, args.end)
+    logger.info("=== P11-4 Step 1 fetch: {} codes × {} months ({}~{}) → {} ===",
+                len(codes), len(months), args.start, args.end, out_dir)
+
+    t_overall = time.time()
+    ok = 0
+    failed = 0
+    for yyyymm in months:
+        try:
+            result = _fetch_one_month(xt_codes, yyyymm, args.force, out_dir)
+            if result is not None:
+                ok += 1
+            else:
+                failed += 1
+        except Exception as e:
+            logger.error("[{}] fetch failed: {}", yyyymm, e)
+            failed += 1
+
+    logger.info("=" * 60)
+    logger.info("Done: {} OK, {} failed, {:.1f} min total",
+                ok, failed, (time.time() - t_overall) / 60)
+    logger.info("Output dir: {}", out_dir)
+    logger.info("Next: rsync to Mac, then P11-4 Step 2 (feature recompute)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
