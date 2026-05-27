@@ -358,7 +358,7 @@ weeks total estimate) with the strict decision rule:
 | **P11-2b** control + spike | 77-78 | `dbc71c0` + `fb6c4c5` | `--no-extras` flag; control IC -0.003 (extras NOT the root cause); `morning_vwap_dev` ↔ `vwap_dev` collinearity (delta -581 gain); extras +91% for extreme model; `docs/p11_4_spike.md` (5-day budget design) |
 | **P11-3 N=3** | 79-80 | `4d64de2` + `f4e3c5f` | `scripts/walk_forward_backtest.py` extended with `RANKER_KIND=intraday_blend`; 3-seed runs (42/43/44); N=3 mean Sharpe Δ=+0.13, borderline ±0.15 threshold |
 | **P11-3 N=6** | 81-82 | `2574a85` + `9dff3d4` | 6 additional seed runs (45-47 × {blend, intraday_blend}); N=6 mean Δ=+0.132; per-seed directional 5/6 positive |
-| **P11-3 MIGRATE** | 83 | `_THIS_COMMIT_` | This audit-trail entry |
+| **P11-3 MIGRATE** | 83 | `d9e91e3` | This audit-trail entry |
 
 ### Final N=6 results (research conclusion)
 
@@ -475,7 +475,7 @@ require user choice (round 83 outline):
 - `f4e3c5f` round 80 report
 - `2574a85` P11-3 N=6 expand (3 additional seeds 45/46/47 × 2 configs)
 - `9dff3d4` round 82 report
-- `_THIS_COMMIT_` decision_log P11-3 chain MIGRATE confirmed (audit trail)
+- `d9e91e3` decision_log P11-3 chain MIGRATE confirmed (audit trail)
 
 ### Audit trail (rounds 73-83)
 
