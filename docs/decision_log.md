@@ -333,3 +333,163 @@ This is a *new model*, not a different execution time on the same model.
 - Live execute baseline: `scripts/ecs_auto_execute.ps1` (commit 9b3c275)
 - B' ×1.03 hybrid as short-term alternative (not yet implemented as of
   2026-05-27 09:00)
+
+## P11-3 chain · intraday_blend research → MIGRATE confirmed (2026-05-27)
+
+### Trigger
+
+User round 73 activated the P11 candidate (see "P11 candidate" entry above)
+right after first successful live execute at T 09:30 on account 8886933837
+(7/7 fills, ¥104,798 → ¥104,154 with ¥841 actual slippage savings vs feared
+1% buffer cost).  Advisor scoped research into 5 phases P11-1 → P11-5 (~2-4
+weeks total estimate) with the strict decision rule:
+
+- mean N walk-forward intraday Sharpe ≥ mean EOD Sharpe + **0.15** → migrate
+- ∈ [-0.10, +0.15] → archive intraday model, queue P11-4 (real intraday data)
+- < -0.10 → kill P11
+
+### Phase summary (P11-1 → P11-3 N=6)
+
+| Phase | Round(s) | Commit(s) | What landed |
+|---|---|---|---|
+| **P11-1** schema | 73-74 | `26e90e6` + `132ae27` | `mp/ml/intraday_features.py` (207 L) + 20 tests; 67-feature contract (later bumped to 68) |
+| **P11-1 bump** overnight_gap | 75-76 | `6ea01c9` | INTRADAY_EXTRA_COLUMNS bumped 3→4 (added `overnight_gap` clean / no-leak) |
+| **P11-2** train | 75-76 | `20c4b8e` + `372f8d6` | `scripts/train_intraday.py` (302 L) + `data/intraday_blend_{primary,extreme}.lgb`. 786k rows × 5yr, 5.1 min total. Primary IC 0.008 flagged as concern. |
+| **P11-2b** control + spike | 77-78 | `dbc71c0` + `fb6c4c5` | `--no-extras` flag; control IC -0.003 (extras NOT the root cause); `morning_vwap_dev` ↔ `vwap_dev` collinearity (delta -581 gain); extras +91% for extreme model; `docs/p11_4_spike.md` (5-day budget design) |
+| **P11-3 N=3** | 79-80 | `4d64de2` + `f4e3c5f` | `scripts/walk_forward_backtest.py` extended with `RANKER_KIND=intraday_blend`; 3-seed runs (42/43/44); N=3 mean Sharpe Δ=+0.13, borderline ±0.15 threshold |
+| **P11-3 N=6** | 81-82 | `2574a85` + `9dff3d4` | 6 additional seed runs (45-47 × {blend, intraday_blend}); N=6 mean Δ=+0.132; per-seed directional 5/6 positive |
+| **P11-3 MIGRATE** | 83 | `_THIS_COMMIT_` | This audit-trail entry |
+
+### Final N=6 results (research conclusion)
+
+**Hold-constant (Rule #10)**: window 2020-01 ~ 2026-04, hs300+zz500 universe,
+Top-K=10, conviction sizing, EXCESS_CAP=0.50 winsorize ON, deterministic
+config (PYTHONHASHSEED=0, num_threads=1, force_row_wise=True), --skip-update
+(Rule #4).  Only diff: RANKER_KIND.
+
+| Config | mean Sharpe | mean Annual | mean Vol | mean Max DD |
+|---|---:|---:|---:|---:|
+| EOD blend (baseline) | 1.858 | 61.18% | 32.88% | -36.79% |
+| Intraday_blend | 1.990 | 62.19% | 31.29% | -29.04% |
+| **Delta** | **+0.132** | +1.01 pp | **-1.59 pp 优** | **-7.75 pp 优** |
+
+Per-seed Sharpe delta {42, 43, 44, 45, 46, 47} = {+0.05, +0.03, +0.31, +0.35,
++0.08, -0.03} — **5/6 directional positive** (only seed 47 marginally
+negative).  Bootstrap 95% CI on mean delta: [+0.04, +0.23] (0 excluded with
+margin).  SE ≈ 0.053.
+
+### Borderline-case secondary rule (round 81)
+
+Mean delta +0.132 falls in [+0.10, +0.15] borderline range.  Advisor round 81
+added a borderline-only secondary rule:
+
+> If mean Δ Sharpe ∈ [+0.10, +0.15] AND per-seed directional ≥ 5/N positive → migrate.
+
+This rule is **one-shot for this case** and is NOT promoted to a permanent
+Rule.  Round 83 explicitly declined to add a "Catch #12" — the current
+strict-threshold logic + measurement discipline is unchanged; only this
+specific borderline judgement is documented here.
+
+5/6 directional ≥ 5/6 → **MIGRATE triggered**.
+
+### Sanity checks (Q1 + Q2 from round 81)
+
+**Q1 fold-level MDD: broad-based, not regime-concentrated**.  Pooling
+seeds 45-47 monthly returns:
+
+- EOD blend worst-8 monthly returns include 2024-01 -14.72% AND -13.05%
+  (two seeds both hit by the same Jan-2024 China-US rate stress).
+- Intraday_blend worst-8 has **none** of the 2024-01 outliers, max is
+  2022-12 -12.13%.
+- Months < -10%: EOD 10/225 vs intraday 7/225 (30% reduction).
+- Months < -14%: EOD 3/225 vs intraday 0/225.
+
+Confirms MDD improvement spans multiple regimes, not concentrated on one
+specific stress period.
+
+**Q2 fold 3 IC=0.001 outlier (round 80)**.  Seed 43 intraday_blend retrain
+schedule from log: fold 3 = **2020-03-02 retrain** = A股 COVID-19 crash +
+US-market circuit-breakers (4× halts that month).  LightGBM cross-sectional
+IC drops to near-zero on regime-shift training data; the very next fold
+(2020-04-01) recovers to primary IC=0.070.  Standard regime-shift artifact,
+not a schema bug.
+
+### Walk-forward per-fold IC trajectory (sanity)
+
+Seed 43 intraday_blend: primary IC across folds = {0.063, 0.059, 0.001 (Q2),
+0.070, 0.068, 0.089, 0.075, 0.083, ...}, **mean ≈ 0.06-0.07**.  Production
+blend's typical per-fold primary IC is 0.03-0.05.  So intraday_blend's
+walk-forward IC is **slightly better than production**.
+
+This confirms the round-78 hypothesis that **train_fast single-split IC=0.008
+was metric noise**, not a model-quality issue — the model is healthy at
+every fold except the one COVID-crash outlier.
+
+### Production state — UNCHANGED
+
+- `data/blend_primary.lgb` + `data/blend_extreme.lgb` timestamps remain
+  May-24 17:45 (Rule #4 satisfied across all 12 walk-forward runs in this
+  chain via `--skip-update`).
+- Production daily_report.py / paper_trade.py still load EOD blend.
+- `data/intraday_blend_{primary,extreme}.lgb` exist as parallel artifacts
+  (P11-2 commit `20c4b8e`) but no production loader code path references
+  them yet (P11-5 scope).
+
+### Rule compliance summary
+
+| Rule | Status |
+|---|---|
+| #1 stage diff | ✓ — every commit in this chain staged explicit files only |
+| #4 production .lgb sacrosanct | ✓ — `data/blend_*.lgb` timestamps unchanged across the whole chain |
+| #7 deterministic N report | ✓ — all 12 walk-forward runs N=1 seed each, fully reproducible config |
+| #9 env/flag verify | ✓ — RANKER_KIND, EXCESS_CAP, LGBM_SEED, PYTHONHASHSEED all consume-verified per run log |
+| #10 single-variable A/B | ✓ — hold-constant clause explicit in rounds 80 + 82, only RANKER_KIND differs |
+| #11 walk_forward = production | ✓ schema-level — both walk_forward fresh-train and production-loaded `data/intraday_blend_*.lgb` use INTRADAY_FEATURE_COLS 68-col schema. Internal walk-forward-fresh-train vs P11-2-single-train difference is the same kind of internal precedent set by P10-2. |
+
+### Decision: MIGRATE confirmed; P11-5 user-gated
+
+P11-5 (live execution path change, T 14:30 entry replacing T 09:30) is a
+user-gated decision because it touches real-money production.  Three forks
+require user choice (round 83 outline):
+
+1. **Cutover style**: full cutover vs 2-week paper-trade parallel (engineer
+   leans paper-trade — walk-forward T_close × scaling proxy for fill is not
+   the same as real 集合竞价收盘 撮合).
+2. **Model version**: deploy current EOD-proxy-trained `data/intraday_blend_*.lgb`
+   immediately on paper, or wait for P11-4 (real intraday data, ~5 working
+   days per spike, then retrain).  Engineer leans "deploy proxy now, queue
+   P11-4 behind paper-trade".
+3. **14:50 broker order type**: limit vs market; if limit, anchor at
+   T_close ± buffer or live last_price?  (P11-5 spec scope.)
+
+### Commits (audit trail, this chain only)
+
+- `26e90e6` P11-1 module + 20 tests (3 extras initial)
+- `132ae27` round 74 report
+- `6ea01c9` P11-1 schema bump (overnight_gap → 4 extras = 68 cols)
+- `20c4b8e` P11-2 training + `data/intraday_blend_*.lgb` artifacts
+- `372f8d6` round 76 report
+- `dbc71c0` P11-2b control + `docs/p11_4_spike.md`
+- `fb6c4c5` round 78 report
+- `4d64de2` P11-3 walk_forward extension + 3-seed runs (42/43/44)
+- `f4e3c5f` round 80 report
+- `2574a85` P11-3 N=6 expand (3 additional seeds 45/46/47 × 2 configs)
+- `9dff3d4` round 82 report
+- `_THIS_COMMIT_` decision_log P11-3 chain MIGRATE confirmed (audit trail)
+
+### Audit trail (rounds 73-83)
+
+| Round | Trigger | Engineer action |
+|---|---|---|
+| 73 | Advisor P11-START + scope | ACK + read P11-1 spec |
+| 74 | (engineer) | P11-1 schema + tests `26e90e6` |
+| 75 | Advisor schema bump + P11-2 green light | (engineer reply only) |
+| 76 | (engineer) | Schema bump `6ea01c9` + P11-2 train `20c4b8e` |
+| 77 | Advisor "B route: root-cause IC 0.008" | (engineer reply only) |
+| 78 | (engineer) | P11-2b control `dbc71c0` (IC also low → extras not root) |
+| 79 | Advisor "(I) P11-3 first, Option C" | (engineer reply only) |
+| 80 | (engineer) | P11-3 N=3 walk_forward `4d64de2`, delta +0.13 borderline |
+| 81 | Advisor "(C) N=6 expand + secondary rule" | (engineer reply only) |
+| 82 | (engineer) | P11-3 N=6 `2574a85`, delta +0.132, 5/6 directional → MIGRATE per secondary rule |
+| 83 | Advisor "MIGRATE confirmed + hold for user" | (engineer reply only — this commit) |
+
