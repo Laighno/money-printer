@@ -27,9 +27,9 @@ PHASE A SCOPE (this file)
 1. Sleep-to-snapshot 14:30:00 (when invoked under cron at 14:29:xx).
 2. Universe = hs300+zz500 minus 创业板/科创板 (same filter as
    daily_report 9:25 path + p11_4_fetch_intraday).
-3. xtdata: download_history_data2 + get_market_data for today's 1m bars,
-   filter 09:30 ≤ t < 14:30 (Rule #11 — exclude 14:30 bar to match the
-   PIT contract Phase B trained on).
+3. xtdata: get_market_data (cache-read, NO download — round 109) for
+   today's 1m bars, filter 09:30 ≤ t < 14:30 (Rule #11 — exclude 14:30
+   bar to match the PIT contract Phase B trained on).
 4. Aggregate 1m → per-code morning bar (open=first, high/low=ext, close
    = last 14:29 bar close, volume/amount = sums).
 5. 20-day EOD history per code (for volume MA and prev-close fallback)
@@ -172,51 +172,6 @@ def _xtquant_to_code(xt_code: str) -> str:
     return xt_code.split(".")[0]
 
 
-def _chunked_download(xtdata, xt_codes: List[str], period: str,
-                      start_str: str, end_str: str, *,
-                      chunk_size: int = 25, timeout: float = 30.0,
-                      retry: int = 1) -> int:
-    """Drive xtdata.download_history_data2 in thread-timed chunks with retry.
-
-    Round 107: chunk 50→25 + retry-once for timed-out chunks. The 5/28 run
-    had 6 of 13 50-code chunks alternately time out (~3min wasted), which
-    looks like an xtquant rate-limit / chunked-download hiccup; smaller
-    chunks + a retry pass recover most stragglers. Returns the count of
-    chunks still timed-out after retries (0 = all cached).
-    """
-    import threading
-
-    def _worker(stock_list, done_event):
-        try:
-            xtdata.download_history_data2(
-                stock_list=stock_list, period=period,
-                start_time=start_str, end_time=end_str,
-                callback=lambda d: None,
-            )
-        except Exception as e:
-            logger.warning("download chunk inner exception: {}", e)
-        finally:
-            done_event.set()
-
-    def _run_chunk(chunk) -> bool:
-        ev = threading.Event()
-        t = threading.Thread(target=_worker, args=(chunk, ev), daemon=True)
-        t.start()
-        t.join(timeout=timeout)
-        return ev.is_set()
-
-    pending = [xt_codes[i:i + chunk_size] for i in range(0, len(xt_codes), chunk_size)]
-    timed_out = [c for c in pending if not _run_chunk(c)]
-    for _ in range(retry):
-        if not timed_out:
-            break
-        timed_out = [c for c in timed_out if not _run_chunk(c)]
-    if timed_out:
-        logger.warning("{} chunk(s) still timed out after {} retr(ies)",
-                       len(timed_out), retry)
-    return len(timed_out)
-
-
 def _canonicalize_xtdata_bars(df: pd.DataFrame) -> pd.DataFrame:
     """Self-calibrate xtdata volume/amount to canonical 股/元.
 
@@ -256,27 +211,40 @@ def _canonicalize_xtdata_bars(df: pd.DataFrame) -> pd.DataFrame:
 
 def warm_daily_bars_via_xtdata(codes: List[str], asof_date: date,
                                max_lookback_cal_days: int = 365) -> dict:
-    """Bulk-fetch daily bars via xtdata and upsert into the local DB so the
-    subsequent build_latest_features hits warm DB instead of fetching from
-    Sina serially per stock (round 107 root cause — that serial path took
-    ~15min for 615 codes when the DB was stale).
+    """Stale-gated read-cache warm: when the local DB lags T-1, read the
+    missing daily-bar tail from XtMiniQmt's local cache (get_market_data,
+    no download) and upsert it, so the subsequent build_latest_features
+    hits a warm DB instead of fetching from Sina serially per stock.
+
+    Why this still exists after round 109 (advisor offered "delete OR keep
+    a DB-fresh check, stale-only top-up — just no download_history_data2"):
+    the round 107 failure was DB-staleness-induced — the ECS DB sat at 5/26
+    on 5/28, so build_latest_features did 615 serial per-code get_daily_bars
+    → Sina → ~15min. round 109 swaps intraday_plan's OWN fetches to cache-
+    read, but build_latest_features still reads the DB; if the DB is stale
+    that 15min path returns. This warm is cheap insurance against exactly
+    that: a no-op when the DB is fresh (one GROUP BY), a fast cache-read +
+    upsert when it is not. Round 109 change: get_market_data (cache read),
+    NOT download_history_data2 (the round 108 mistake that hung for minutes).
 
     Mechanism: get_daily_bars short-circuits to the DB when
     ``db_max >= _last_expected_trading_day()``. At 14:30 (before 16:00)
     that threshold is T-1, so warming the DB to T-1 makes every per-stock
     get_daily_bars return instantly (no API).
 
-    Scope: only the MISSING tail [earliest db_max + 1, T-1] is fetched
+    Scope: only the MISSING tail [earliest db_max + 1, T-1] is read
     (capped at ``max_lookback_cal_days`` for empty/very-stale codes). The
-    common case (DB stale by 1 trading day) fetches a single day in one
-    bulk RPC — fast, and it avoids overwriting existing turnover-bearing
-    Sina rows wholesale.
+    common case (DB stale by 1 trading day) reads a single day in one
+    cache call, and it avoids overwriting existing turnover-bearing Sina
+    rows wholesale.
 
     Correctness (Rule #11): fetch_end = T-1, NEVER today. Today's 14:30
     bar is incomplete; it must not enter the EOD factor window. Today's
     morning session enters separately via intraday_bars in build_intraday_panel.
 
-    Returns a stats dict for the round report.
+    Returns a stats dict for the round report. If the cache read comes back
+    empty/bad-shape, returns ``warmed=False`` and scoring falls through to
+    the per-code path (degraded but not fatal).
     """
     from datetime import timedelta
 
@@ -324,10 +292,8 @@ def warm_daily_bars_via_xtdata(codes: List[str], asof_date: date,
     end_str = fetch_end.strftime("%Y%m%d235959")
     xt_codes = [_code_to_xtquant(c) for c in codes]
 
-    logger.info("warm: {}/{} codes stale; xtdata 1d fetch {}~{} ({} codes)",
+    logger.info("warm: {}/{} codes stale; xtdata 1d cache-read {}~{} ({} codes)",
                 len(stale), len(codes), fetch_start, fetch_end, len(xt_codes))
-
-    _chunked_download(xtdata, xt_codes, "1d", start_str, end_str)
 
     field_list = ["open", "high", "low", "close", "volume", "amount"]
     raw = xtdata.get_market_data(
@@ -412,10 +378,13 @@ def fetch_today_1m_and_eod_history(
     today_start = f"{today_str}000000"
     today_end = f"{today_str}235959"
 
-    # ── 1) today's 1m bars ──────────────────────────────────────────
-    logger.info("download_history_data2 (1m) for {} codes, asof={}",
+    # ── 1) today's 1m bars (cache-read, NO download — round 109) ─────
+    # XtMiniQmt runs all day and auto-caches today's 1m bars locally;
+    # get_market_data reads that cache (~35s for 615 codes) vs
+    # download_history_data2's ~6min server pull. We filter t < 14:30
+    # below for the PIT contract (Rule #11) regardless of the window.
+    logger.info("get_market_data (1m cache-read) for {} codes, asof={}",
                 len(xt_codes), today_str)
-    timed_out = _chunked_download(xtdata, xt_codes, "1m", today_start, today_end)
 
     field_list = ["open", "high", "low", "close", "volume", "amount"]
     raw = xtdata.get_market_data(
@@ -456,18 +425,17 @@ def fetch_today_1m_and_eod_history(
         today_long[col] = today_long[col].astype(float)
     today_long["volume"] = today_long["volume"].fillna(0).astype("int64")
     today_long.sort_values(["code", "datetime"], inplace=True, ignore_index=True)
-    logger.info("today 1m rows after filter: {} ({} timed-out chunks)",
-                len(today_long), timed_out)
+    logger.info("today 1m rows after filter (09:30<=t<14:30): {}",
+                len(today_long))
 
     # ── 2) 20-day EOD history ────────────────────────────────────────
     eod_start_dt = pd.Timestamp(asof_date) - pd.Timedelta(days=eod_days_back + 5)
     eod_start_str = eod_start_dt.strftime("%Y%m%d000000")
     eod_end_str = (pd.Timestamp(asof_date) - pd.Timedelta(days=1)).strftime("%Y%m%d235959")
-    logger.info("download_history_data2 (1d) {}~{} for {} codes",
+    logger.info("get_market_data (1d cache-read) {}~{} for {} codes",
                 eod_start_dt.strftime("%Y%m%d"),
                 (pd.Timestamp(asof_date) - pd.Timedelta(days=1)).strftime("%Y%m%d"),
                 len(xt_codes))
-    _chunked_download(xtdata, xt_codes, "1d", eod_start_str, eod_end_str)
 
     eod_raw = xtdata.get_market_data(
         field_list=field_list,
@@ -782,10 +750,12 @@ def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
     logger.info("Scoring {} codes (universe {} → bars present {})",
                 len(scoring_codes), len(codes), len(intraday_bars))
 
-    # Round 107 perf fix: bulk-warm the DB to T-1 via xtdata BEFORE scoring,
-    # so build_latest_features hits warm DB (seconds) instead of fetching
-    # from Sina serially per stock (~15min for 615 codes). Non-fatal: a warm
-    # failure just means scoring falls back to the slow path.
+    # Round 109: stale-gated read-cache warm. No-op when the DB is already
+    # fresh to T-1 (one GROUP BY); when stale, reads the missing tail from
+    # XtMiniQmt's local cache (get_market_data, NOT download) and upserts so
+    # build_latest_features hits warm DB (seconds) instead of fetching from
+    # Sina serially per stock (~15min for 615 codes — the round 107 failure).
+    # Non-fatal: a warm failure just means scoring falls back to the slow path.
     t_warm = time.time()
     try:
         warm_stats = warm_daily_bars_via_xtdata(scoring_codes, asof_date)
