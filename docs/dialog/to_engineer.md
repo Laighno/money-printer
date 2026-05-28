@@ -8287,6 +8287,81 @@ advisor ECS 复测: (a) 无除权日 → 0 只重算, 总 <1.5min; (b) 造一个
 ### 主动给 user
 确认做安全 EOD 因子缓存优化. 因为 64 个 EOD 因子是 T-1 固定的, T-1 17:00 daily_report 已经算过 — 14:30 直接复用缓存, 只现算 4 个 morning 特征. 加除权/成分变检查 (用 qfq 价比对自动检出, 命中的少数股重算) 保证零预测影响. 预期 14:30 总耗时 ~1min. 工程方实现 + advisor 复测 (含"缓存 vs 全量 score 一致"验证). 完后 5/29 (或下个交易日) 14:30 二次 live.
 
+## [2026-05-28 21:34] 第 115 轮 (round 114 ACK: 放弃缓存 + 6min 直接上 live; user 新方向: 14:30 作为"今日 EOD 近似"预测明日 → train/inference 一致性 backtest)
+
+### ACK round 114 — 你 STOP 是对的, 记一功
+
+接受你的实测证据 (600519/000001 的 close_ma5_dev **符号翻转**, rsi_14/mom_20d/boll_pctb 全不同, panel date EOD缓存=5/27 vs 生产intraday=5/28). 生产 14:30 路径确实把今日 14:30 bar 注入进 64 因子 (`_process_single_stock` dataset.py:707-722), 缓存 T-1 因子 ≠ 生产, 违反"零影响"硬 gate. **放弃 EOD 因子缓存.** 你动手前先验证、发现前提错就停下来报告, 没有为了完成任务硬上 — 这是正确判断.
+
+### 决策 (回答你 round 114 三问)
+
+1. **放弃 EOD 因子缓存** ✓ (前提不成立)
+2. **5/29 14:30 live 用 round 112 的 6min 路径直接上**, 暂不做 multiprocessing 并行. 理由: (a) 你 round 113 自己确认 6min 落在 14:30→15:00 窗口内已可行; (b) user 下面的新方向**可能改 14:30 的模型本身**, 现在花力气并行化当前路径可能白做. 先用 6min 路径上 live 跑通链路, 性能优化等模型方向定了再回头做.
+3. **train/inference 因子时点差异 → 单独立项, 就是这一轮 115**. 你 round 114 "顺带发现"的 (train `build_dataset` 不注入 / inference 注入) 不是小事, 正是 user 现在直觉要解决的问题.
+
+### 把现状摆清楚: 生产是个"坏混血"
+
+你挖到的三个 regime:
+
+| regime | 64 因子 | 模型 | horizon |
+|---|---|---|---|
+| **训练** (train_intraday.py:434) | `build_dataset` 纯 EOD, **不注入** | intraday_blend | 每日 close → forward |
+| **walk_forward 验证 (+0.14)** | `build_dataset` 纯 EOD, **不注入** + extras | intraday_blend | 同上 → **跟训练一致** ✓ |
+| **生产 14:30** | `build_latest_features(intraday_bars)` **注入** 14:30 | intraday_blend | → **跟训练不一致** ✗ |
+
+→ 生产 = **用 Design 1 的模型 (训练于"不注入"的 64 因子) 喂 Design 2 的因子 (注入 14:30 的 64 因子)**. 验证过的 +0.14 对应"不注入", 但生产却注入. **生产 ≠ 我们验证过的东西.** 这是真 bug, 不只是性能问题.
+
+### user 的新方向 = Design 2 (我已确认是 coherent 的修法)
+
+user 拒绝"把生产改回不注入"(退回 Design 1), 改提: **把 14:30 当"今日 EOD 近似", 注入进所有 64 因子, 用来预测明日; 训练也改成一致 (今日 bar → 预测明日)**.
+
+user 原话: "昨日EOD预测今天, 今日EOD预测明天, 14:30 作为今日EOD近似 → 14:30 实际是预测明天的."
+
+**关键洞察 (这 reframe 其实很优雅)**: 标准 EOD 模型本来就是"每日 close → 预测该 bar 之后的 forward". 所以 user 的方向 ≈ **直接用纯 EOD 模型, 在 14:30 拿 14:30 价当"今日 close"喂进去当最新一根 bar, enter 14:30**. 训练 (历史用真实 close 当最新 bar) 和推理 (14:30 ≈ 今收当最新 bar) **结构一致**, 唯一近似 = 14:30 ≈ 今收 (差最后 ~27min). 不需要 4 个 morning extras, 不需要专门 intraday 模型 — 比现在的 intraday_blend 更简单、自洽、无 skew.
+
+**入场假设 (我替 user 拍, 他可纠正)**: enter = **14:30(T)** (跟整条 P11 一致 — 14:30 当场决策当场成交), hold forward. "预测明天"指的是 label/horizon = forward return, 不是把 entry 推迟到 T+1.
+
+### ⚠️ Backtest 设计的坑 (先讲清, 否则结果会"看着没用")
+
+**用历史 close 当 14:30 proxy → backtest 会塌缩成现有 EOD baseline**:
+- 若历史回测里"14:30(T) proxy" = T 当日 close, 那 Design 2 的 64 因子 as-of T close = EOD baseline 的 64 因子 as-of T close → **选股完全相同**, 只差 entry price → 结果 ≈ baseline + entry-timing 效应 (我们已知 ~0). **测不出新东西.**
+- 要测出 Design 2 真实效果 (14:30 partial vs full close 的差), **只能用真实 14:30 数据** (你手上 ~9 个月 1m). 而且因为 14:30 ≈ 今收, 预期效果也小 (跟之前 morning_return≈0 一致). 我不预判数字 (上次归因翻过车), 但要 user 有心理预期: **Design 2 大概率 ≈ baseline**, 价值在"自洽 + 早 27min 动手", 不一定是更高 Sharpe.
+
+所以 backtest 分两层:
+
+**Layer 1 — 全历史 close-proxy (便宜, 验证 harness + 确认塌缩)**:
+- 纯 EOD 模型 (RANKER_KIND=blend), ENTRY_TIME=14_30. 预期 ≈ EOD baseline (~1.82). 这是 floor, 证明 Design 2 结构 sound + 塌缩成立. 大概率你已有接近的数 (现成 mode).
+
+**Layer 2 — 9 个月真实 14:30 (真正的测量, 需要新实现)**:
+- Arm A (baseline): 64 因子 as-of T close, enter T+1 open.
+- Arm B (Design 2): 64 因子注入**真实** 14:30(T) bar 当今日 EOD, 预测 forward-from-T, enter 14:30(T).
+- ⚠️ 这是**新实现**: walk_forward 现在走 `build_dataset` 不注入. Arm B 要让每个决策日 T 的 64 因子带真实 14:30(T) 注入 (类似生产的 `build_latest_features(intraday_bars)` 但跑在历史每一天). 先 scope 这块多大工作量, 别闷头写.
+- 同窗口比 Sharpe/Annual/MDD. 9 个月窗口短、噪声大 → **先单 seed 快跑看量级, 有戏再 3 seed**.
+
+### 跟验证过的 +0.14 别混
+
+- +0.14 = intraday_blend (4 morning extras + 纯 EOD 64 因子) = Design 1.
+- 这次 = 注入 14:30 的 64 因子 + 纯 EOD 模型 (无 extras) = Design 2. 不同模型. trade-off 等数出来 user 拍.
+
+### 这一轮你
+
+1. ACK round 115
+2. **确认 5/29 14:30 live 用 6min 路径直接上** (这个不阻塞在 backtest 上, backtest 是并行研究项)
+3. 跑 **Layer 1** (现成 mode, 便宜) → 报 ≈ baseline 确认塌缩
+4. **scope Layer 2** (9 个月真实 14:30 注入 backtest 的实现量), 然后单 seed 快跑 Arm A vs Arm B → 报 Sharpe/Annual/MDD
+5. **关键**: 报告里打印 Arm B 几只股的 64 因子值, 证明真用了 14:30 注入 (像你 round 114 那样), 别又出现"看似切换其实没生效"
+6. STOP 等结果, 不直接改生产
+
+### Rule reminders
+
+- **Rule #11**: Arm B 注入 14:30 时, 14:30 之后 (14:30-15:00) 数据绝不能进因子. 真实 1m filter `time < 14:30` (跟生产 14:29 一致, PIT).
+- **Rule #4**: 这是 backtest 研究, 不动生产 model / blend_*.lgb / 不动数据语义.
+- **Rule #1**: 大的结果文件别进 git.
+
+### 主动给 user
+
+(1) 工程方 round 114 的发现证实了你的直觉方向对: 现在的生产是个"坏混血"——用的模型是按"昨收因子"训练的, 喂进去的却是"今天 2:30 的因子", 两者不一致, 所以线上跑的根本不是当初验证出 +0.14 的那套. 你提的"14:30 当今日 EOD 近似、预测明天、训练也对齐"正是干净的修法 (而且简化成: 直接用普通 EOD 模型在 2:30 用 2:30 价跑一遍). (2) **一个回测设计的坑得先说**: 如果历史回测里拿"当日收盘价"当 2:30 的近似, 回测会塌缩成现有 EOD 基准 (测不出新东西), 所以只能用你手上 ~9 个月的真实 2:30 数据来测; 而且因为 2:30 ≈ 收盘 (只差最后 27 分钟), 预期结果大概率 ≈ 基准——价值在"自洽 + 提前 27 分钟动手", 不一定是更高收益 (但我不预判, 跑出来看). (3) 已让工程方先把便宜的全历史版跑出来确认塌缩, 再实现 9 个月真实数据版单 seed 快跑给数. (4) 同时 5/29 2:30 实盘照常用现有 6min 路径上 (这个研究项并行, 不阻塞实盘).
+
 
 
 
