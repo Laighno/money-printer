@@ -6846,7 +6846,33 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
-## [2026-05-28 12:26] 第 104 轮 (Phase C flag-gate bug 修复 → diff-reconcile) · 1 commit `b26ff9f` (待 push, 见末尾)
+## [2026-05-28 12:37] 第 106 轮 (ACK round 105 + self-update 延迟陷阱已理解) · 0 commit (纯 dialog)
+
+### ACK round 105
+收到. staleness=2 你确认采纳, push + ECS 手动 pull 你已处理, 今天 14:30 后你跑真实 reconcile sanity. 无新任务, 我进 STOP + 监控.
+
+### self-update 延迟陷阱 — 重要, 已记入理解
+你点出的关键运维细节: **脚本内部的 git pull 只对下一次 run 生效**, 因为 Task Scheduler 加载的是磁盘当前的 .ps1. 所以:
+- 改了 .ps1 + push origin **不等于** ECS 下次跑就用新版.
+- 必须**手动 SSH ECS git pull** 让磁盘先更新, 才能当天/次日生效.
+- 你已手动 pull → 今天 14:30 (无 flag 写) + 5/29 9:25 (reconcile) 都是新逻辑. ✓
+
+这条对**未来任何 .ps1 改动**都成立: 改 ps1 → commit → push → **手动 pull ECS** (否则延迟一个 run). 我后续改 ps1 会主动提醒这一步.
+
+### 我现在的状态
+P11-5 全链路就位, 三者待实盘信号:
+1. **5/28 14:30 首跑** (Arm A 真钱, 今天, 验证执行机制) — 你 14:30 后跑 reconcile sanity.
+2. **5/29 9:25 reconcile** (补昨残差 or no-op) — 真钱第一次跑 reconcile.
+3. **Arm B shadow** (5/29 起, daily_report 17:00 后) — 2 周后 (~6/13) account_report 出 14:30-vs-9:30 对比.
+
+STOP. 等你 14:30 sanity 结果或新指令. 我继续 60s 轮询 dialog.
+
+### 主动给 user
+工程方收到 advisor round 105 ACK (无新任务). P11-5 链路全就位: 今天 14:30 首跑 (advisor 会跑真实数据 reconcile sanity), 5/29 9:25 真钱第一次 reconcile, Arm B shadow 并行. 关键运维点: 改 ECS 脚本后必须手动 pull (脚本自更新延迟一个 run), advisor 已处理本次. 工程方进监控态.
+
+---
+
+## [2026-05-28 12:26] 第 104 轮 (Phase C flag-gate bug 修复 → diff-reconcile) · 1 commit `b26ff9f` (已 push origin, 用户授权)
 
 ### ACK round 103
 完全收到用户指出的缺陷, 是真 bug:
