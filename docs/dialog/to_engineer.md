@@ -8211,6 +8211,82 @@ build_latest_features(615) 卡 22min, 日志分解:
 ### 主动给 user
 round 110 把 fetch 从 15min 压到 25s (download→读缓存, 大成功). 但 scoring 还有 22min: financial 逐只打 EM 4min + get_daily_bars 逐只拉 18min. 后者主要是我收盘后复测的假象 (盘中锚 T-1 不会拉), 但逻辑脆弱要锚死. round 111: (1) 日期显式锚 T-1 消除"拉今天"; (2) financial 加 80 天 freshness gate (我批了). 预期总 ~1.5min. 改完 advisor 复测, 5/29 14:30 二次 live.
 
+## [2026-05-28 19:10] 第 113 轮 (round 112 复测确认 + EOD 因子缓存优化 spec, 含 ex-date 安全检查)
+
+### round 112 ECS 复测确认 (advisor)
+
+advisor pull `76c59f0` 到 ECS 复测 `--skip-sleep`, 完整 timing:
+```
+fetch (1m 14s + EOD 2s + warm no-op 2s) = ~20s ✓
+逐只拉日线 = 0 次 (全 "DB is fresh, skipping API", T-1 锚定生效) ✓
+financial EM save = 0 次 (80 天 gate 生效) ✓
+build_latest_features 因子计算 = ~6min (18:49:00 → 18:55:04)
+总 = 6min26s, 写出 plan ✓
+```
+**两大网络杀手 (18min 日线 + 4min financial) 彻底消除**. 剩 6min 是纯 CPU 因子计算 (4 核 ECS). 落在 14:30→15:00 窗口内, 已可行. (诊断 plan 已删, 不污染 5/29 reconcile.)
+
+### 用户决定: 做 EOD 因子缓存优化 (压到 ~1min), 但要保证对预测零影响
+
+用户问得好: 64 个 EOD 因子在 T-1 17:00 算 vs T 14:30 算, 数学上一致 (都 as-of T-1 close), **除两个边界 case**:
+1. **当天除权除息**: 某股今天 T 除权 → qfq 复权历史重新基准化 → 缓存的"除权前"因子 ≠ 现算"除权后". 频率 ~0-5/day (分红季多).
+2. **universe rebalance**: T-1→T 成分股变 → 缓存 panel 漏新进股. 半年一次.
+
+用户拍板要**安全缓存** (加检查, 命中的少数股重算, 保零影响).
+
+### round 113 spec — 安全 EOD 因子缓存
+
+**1. daily_report.py (T-1 17:00, Mac) dump 因子 panel**:
+- daily_report 内部已 `build_latest_features(universe)` 算 64 因子 panel (为生成 9:30 plan). 把这个 panel **dump parquet** → `data/intraday_factor_cache/<asof_eod_date>.parquet` (含 code + 64 FACTOR_COLUMNS + 当时用的 T-1 close 一列 `_cache_t1_close` 供 ex-date 检测).
+- 通过现有 daily_report.sh git push 一并上 ECS (小文件, ~615 行 × 65 列).
+
+**2. intraday_plan.py (T 14:30, ECS) 用缓存 + ex-date 检查**:
+```
+asof_eod = previous_trading_day(today)   # round 112 已有
+cache = load data/intraday_factor_cache/<asof_eod>.parquet
+if cache 不存在 or cache 日期 != asof_eod:
+    → fallback 全量 build_latest_features (现 6min 路径), 不优化 (graceful degrade)
+else:
+    # ex-date 检测: 比对缓存时的 T-1 close vs 现在的 T-1 close (qfq 重算会变)
+    cur_t1_close = get_market_data(1d, end=asof_eod) 取每股 T-1 close  # fetch 阶段已读, 复用
+    stale_codes = [c for c in cache if abs(cache._cache_t1_close[c] - cur_t1_close[c]) > eps]  # 除权股
+    new_codes = [c for c in current_universe if c not in cache]  # universe 新进
+    recompute = stale_codes + new_codes   # 通常 0 只
+    if recompute:
+        fresh = build_latest_features(recompute, end=asof_eod)  # 只算这几只, 便宜
+        panel = cache 替换 recompute 行 + fresh
+    else:
+        panel = cache    # 直接用, ~秒级
+    # 加 4 个 morning 特征 (今日 1m 现算, 不缓存)
+    panel = attach morning extras (overnight_gap/morning_return/morning_vwap_dev/morning_vol_ratio)
+    score
+```
+
+**关键正确性**:
+- ex-date 检测用 **cache T-1 close vs 现 T-1 close 比对** (qfq 重基准会让历史 close 变) — 不需要单独的 corporate-action 数据源, qfq mismatch 本身就是信号. eps 取相对 0.1% 之类.
+- cache 日期必须 == asof_eod (T-1). 跨日/stale → 全量 fallback.
+- 4 个 morning 特征永远现算 (不缓存), 这是 14:30 的真信号.
+
+**预期**: load cache ~1s + ex-date 检查 ~1s + (通常 0 只重算) + morning 特征 + score ~10s + fetch 20s = **总 ~30s-1min**. 分红季有除权股则多算几只, 仍 ~1min.
+
+### 验证口径
+advisor ECS 复测: (a) 无除权日 → 0 只重算, 总 <1.5min; (b) 造一个 fake ex-date (改 cache 里某股 _cache_t1_close) → 验证该股被检出重算; (c) 对比缓存路径 score 输出 == 全量路径 score 输出 (无除权日应 bit-identical 或在浮点误差内). 关键: **证明缓存路径的 predicted_excess 跟全量路径一致** (零预测影响).
+
+### 这一轮你
+1. ACK round 113
+2. daily_report.py: dump 因子 panel parquet (含 _cache_t1_close)
+3. intraday_plan.py: load cache + ex-date/universe 检查 + 少数重算 + morning 特征 + score; cache miss → 全量 fallback
+4. 加单元测试: ex-date 检出 / universe 新进 / cache stale fallback / 缓存vs全量 score 一致
+5. commit + push (有权限)
+6. STOP. advisor ECS 复测确认 <1.5min + 缓存vs全量 score 一致.
+
+### Rule reminders
+- Rule #11: EOD 因子 as-of T-1 (缓存的就是 T-1 算的, 一致); morning 现算
+- Rule #4: 不动 model; 缓存只是 build_latest_features 输出的存取优化, 数学等价
+- **零预测影响是硬要求**: 缓存路径 score 必须 == 全量路径 score (无除权日), 这是验证 gate
+
+### 主动给 user
+确认做安全 EOD 因子缓存优化. 因为 64 个 EOD 因子是 T-1 固定的, T-1 17:00 daily_report 已经算过 — 14:30 直接复用缓存, 只现算 4 个 morning 特征. 加除权/成分变检查 (用 qfq 价比对自动检出, 命中的少数股重算) 保证零预测影响. 预期 14:30 总耗时 ~1min. 工程方实现 + advisor 复测 (含"缓存 vs 全量 score 一致"验证). 完后 5/29 (或下个交易日) 14:30 二次 live.
+
 
 
 
