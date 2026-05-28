@@ -4,44 +4,64 @@
 # 更新方式: 发券商截图给 Claude，自动识别并更新
 # 规则: 清仓股票直接从列表移除（不再保留 shares=0 占位）
 #
-# 最后更新: 2026-05-26 22:25 (国金 QMT 账户 8886933837 实盘对接)
+# 最后更新: 2026-05-28 09:08 (从 QMT 8886933837 实测同步)
 #
 # === 账户切换 (2026-05-26) ===
 # 之前的 27 万账户 yaml 存档于 config/portfolio_27w_pre_qmt_switch.yaml.archive
-# 当前 portfolio.yaml 反映国金证券 QMT 账户 8886933837 实际持仓（β-3 验证后切换）
-# QMTBroker.get_account_info() 实测：
-#   total_assets=104,798.00  cash=41,087.00  market_value=63,711.00
-# 持仓股价均价来自 QMT query_stock_positions（broker 端 avg cost）
-# entry_date 未知，统一填 2026-05-26 作为切换日占位
+# 当前 portfolio.yaml 反映国金证券 QMT 账户 8886933837 实际持仓
+# 5/27 交易后 portfolio.yaml 一度 stale (未回写)；5/28 09:08 advisor 从 QMT
+# query_stock_positions 重新同步 — 002984 已清仓, 002773/600511/600808/000539
+# 新建仓, 002385 减仓, 002439 加仓
 
 # 账户快照（结构化，供 4 点日报订单清单生成用）
 account:
-  total_assets: 104798.00      # 总资产 (QMT 8886933837 实测 2026-05-26)
-  market_value: 63711.00       # 持仓市值
-  cash_available: 41087.00     # 可用资金 (39.2% 现金，有充足止损余量)
-  position_pct: 0.608          # 仓位 60.8% (相对 27 万账户的 99.8% 健康得多)
+  total_assets: 105074.73      # 总资产 (QMT 实测 2026-05-28 09:08)
+  market_value: 83189.00       # 持仓市值
+  cash_available: 21885.73     # 可用资金
+  position_pct: 0.792          # 仓位 79.2% (5/27 大量买入后)
   target_position_pct: 0.70    # 订单生成目标仓位（可调）
-  updated_at: '2026-05-26'
+  updated_at: '2026-05-28'
 
 holdings:
 - name: 大北农
   code: '002385'
   type: stock
   board: ''
-  shares: 7700               # QMT 实测 2026-05-26
-  avg_cost: 3.461            # QMT broker avg cost
-  entry_date: '2026-05-26'   # 切换日占位（实际建仓日未知）
+  shares: 3900               # 5/27 减仓 3800 后
+  avg_cost: 3.549            # QMT broker avg cost
+  entry_date: '2026-05-26'
 - name: 启明星辰
   code: '002439'
   type: stock
   board: ''
-  shares: 800
-  avg_cost: 15.176
+  shares: 900                # 5/27 加仓 100 后
+  avg_cost: 15.179
   entry_date: '2026-05-26'
-- name: 森麒麟
-  code: '002984'
+- name: 康弘药业
+  code: '002773'
   type: stock
   board: ''
-  shares: 1600
-  avg_cost: 15.703
-  entry_date: '2026-05-26'
+  shares: 600                # 5/27 新建仓
+  avg_cost: 21.188
+  entry_date: '2026-05-27'
+- name: 国药股份
+  code: '600511'
+  type: stock
+  board: ''
+  shares: 500                # 5/27 新建仓
+  avg_cost: 26.880
+  entry_date: '2026-05-27'
+- name: 马钢股份
+  code: '600808'
+  type: stock
+  board: ''
+  shares: 4100               # 5/27 新建仓
+  avg_cost: 3.161
+  entry_date: '2026-05-27'
+- name: 粤电力Ａ
+  code: '000539'
+  type: stock
+  board: ''
+  shares: 2500               # 5/27 新建仓
+  avg_cost: 6.622
+  entry_date: '2026-05-27'
