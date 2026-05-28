@@ -24,12 +24,14 @@
 #   6. Verify portfolio.yaml account = 8886933837
 #   7. Run scripts/intraday_preflight.py -- abort on > 5% drift
 #   8. Run scripts/execute_orders.py --mode auto --plan intraday_latest.json
-#   9. On success: write data\orders\intraday_success_<YYYYMMDD>.flag
-#  10. Log everything to data\orders\ecs_intraday.log
+#   9. Log everything to data\orders\ecs_intraday.log
 #
-# Phase C consumer: scripts\ecs_auto_execute.ps1 (9:25 Mon-Fri) checks
-# for intraday_success_<previous_trading_day>.flag at start; if present
-# → skip 9:30 execute. That's the cutover handover.
+# Round 103: NO success-flag write. 发单≠成交 (a 涨停/跌停 order can be
+# placed but never fill), so a flag would wrongly skip the next-day 9:25
+# residual fill. Handover is now via diff-reconcile: ecs_auto_execute.ps1
+# (9:25) compares live QMT to THIS 14:30 target (intraday_latest.json) and
+# fills only the residual — normal days → empty → no-op; 涨停/跌停 days →
+# fills the gap. intraday_latest.json IS the contract between the paths.
 #
 # Pre-conditions (MANUAL setup, one-time):
 #   - XtMiniQmt logged in with account 8886933837 (same as 9:30 path)
@@ -178,15 +180,15 @@ $execExit = $LASTEXITCODE
 Log "Step 8: execute_orders exit = $execExit"
 
 if ($execExit -ne 0) {
-    Abort "execute_orders failed (exit $execExit) -- 9:30 next day will take over"
+    Abort "execute_orders failed (exit $execExit) -- next day 9:25 reconcile will fill the gap"
 }
 
-# Step 9: Write success flag (consumed by Phase C 9:25 path next morning)
-$today = (Get-Date).ToString("yyyyMMdd")
-$flagPath = "$REPO\data\orders\intraday_success_$today.flag"
-$flagBody = "intraday pipeline succeeded at $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))`r`nHEAD: $head`r`n"
-Set-Content -Path $flagPath -Value $flagBody -Encoding UTF8
-Log "Step 9: wrote success flag $flagPath"
+# NOTE (round 103): the success-flag write is GONE. 发单≠成交 — a 涨停/跌停
+# name's order can be placed (exit 0) yet never fill, so a flag would have
+# wrongly told the next-day 9:25 path to skip, orphaning the residual. The
+# 9:25 path now diff-reconciles live QMT vs this 14:30 target instead, so it
+# fills any unfilled residual automatically. The executions JSON
+# (exec_<date>_intraday_*.json) remains the audit trail.
 
 Log "==================== ECS intraday-pipeline DONE ===================="
 exit 0
