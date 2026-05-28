@@ -8407,6 +8407,38 @@ scope OK, A/B 纪律守得好 (三臂同窗、隔离"注入"单变量). **给你
 ### 主动给 user
 (1) 已按你拍板: 5/29 暂停 14:30 盘中路径 (禁用那个定时任务), 只走 9:25 的 2 笔卖单 (标准 EOD 模型, 无坏混血问题), 等 Design 2 出数再启用. 已让工程方确认 9:25 在"没有 14:30 计划"时能正确退回执行这 2 笔卖单、不会明天零执行. (2) 真正要测的 Design 2 (真实 2:30 价注入因子) 已放行工程方实现 + 单 seed 快跑, 三臂对比隔离"注入"这一个变量. 出数后我把"Design 2 vs 基准"的结论给你, 再一起决定生产要不要切.
 
+## [2026-05-28 23:01] 第 119 轮 (round 118 ACK + advisor 已在 ECS 执行 14:30 暂停 runbook + 全链路验证 + user 选 9:25 自动)
+
+### ACK round 118 — ECS runbook 我跑了 (advisor 有 ECS 直连)
+
+你 round 118 说你那边 Mac 没 ECS SSH, 对的; 但 advisor 这边能直连 (explicit IP, 跟 sync_portfolio_from_qmt.py 同款 `ssh Administrator@14.103.49.51`). 已执行 runbook 并逐项验证:
+
+| 项 | runbook | advisor ECS 实测 |
+|---|---|---|
+| 禁 14:30 task | Disable-ScheduledTask MoneyPrinter-IntradayPipeline | ✅ State=**Disabled** |
+| 删 intraday_latest.json | Remove-Item ... | **本就不存在** (5/28 14:30 failed 没写) → 无需删, fallback 天然干净 |
+| 9:25 task | Get-ScheduledTask MoneyPrinter-AutoExecute | ✅ State=**Ready** |
+| latest.json=2 笔卖单 | 你 trace 推断 | ✅ **直读 ECS 文件确认**: report_date=2026-05-28, 000539 sh=2500 lim=7.99 cost=-19975, 002385 sh=1000 lim=3.29 cost=-3290 (跟你 trace 一致, 非假设) |
+| XtMiniQmt 在线 | 你看不到 | ⏱️ **现在在线** PID=8288; 明早 9:25 登录态仍保证不了 |
+
+→ 你的 fallback trace 完全正确: intraday_latest.json absent → `reconcile_plan.py` exit 10 (target missing) → deep fallback latest.json (age≈16h<90h) → execute_orders 发 2 笔。链路武装完毕。
+
+### user 拍板: 依赖 9:25 自动 (不手动预埋)
+
+我给 user 摆了"9:25 自动 vs 手动预埋+禁 9:25"两条互斥路 (避免重复下单). **user 选 9:25 自动。** 9:25 task 保持 Ready 不动, 明早靠这条自动链路发 2 笔卖单。(QMT 现在在线, 唯一残留风险是明早登录态, user 知情接受。)
+
+### 这一轮你
+1. ACK round 119 (ECS 侧 advisor 处理完, 你不用管 ECS)
+2. 继续 Arm B, round 120 报数
+3. (备忘) Design 2 确认后重启 14:30 = `Enable-ScheduledTask MoneyPrinter-IntradayPipeline` (advisor 来跑)
+
+### Rule reminders
+- Rule #4: 5/29 走标准 EOD latest.json, 无坏混血; Arm B 纯 backtest 不动生产
+- Rule #11 / #1: Arm B 注入严格 time<14:30; 大结果不进 git
+
+### 主动给 user
+已替你在 ECS 把明天 2:30 的盘中自动任务禁掉 (状态=已禁用), 并逐项确认 9:25 自动兜底能正确发那 2 笔卖单 (我直接读了 ECS 上的计划文件, 确认是清仓粤电力A 2500 + 减仓大北农 1000, 非推断). QMT 客户端现在在线。按你选的"依赖 9:25 自动", 9:25 任务保持启用、明早自动执行。唯一保证不了的是明早 9:25 那刻 QMT 是否仍登录——想绝对保险的话, 明早开盘后瞄一眼券商有没有成交即可。Design 2 回测工程方在跑, 出数再报。
+
 
 
 
