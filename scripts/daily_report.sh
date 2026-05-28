@@ -12,6 +12,13 @@ source .venv/bin/activate
 
 echo "$(date): Starting daily pipeline"
 
+# Step 0: Re-sync portfolio.yaml from QMT (prevents stale-yaml burns).
+# If ECS / QMT is unreachable, fall through to the stale yaml so the
+# pipeline still produces *some* plan — but tee the failure to the log.
+echo "$(date): Syncing portfolio.yaml from QMT..."
+python scripts/sync_portfolio_from_qmt.py 2>&1 | tee -a data/orders/portfolio_sync.log \
+    || echo "$(date): WARNING — QMT sync failed; using existing portfolio.yaml"
+
 # Step 1: Collect external data
 echo "$(date): Collecting external data..."
 python -m mp.data.collector 2>&1 | tee -a data/external/collect.log

@@ -44,17 +44,17 @@ def fetch_qmt_snapshot(ecs_user: str, ecs_host: str) -> Dict[str, Any]:
     present (committed alongside this file). No stdin-piped snippet — the script
     lives in the repo so SSH command is simple.
     """
-    cmd = [
-        "ssh", "-o", "ConnectTimeout=15", f"{ecs_user}@{ecs_host}",
-        "powershell -Command "
-        + shlex.quote(
-            r'cd C:\money-printer; '
-            r'$env:PYTHONIOENCODING="utf-8"; '
-            r'.venv\Scripts\python.exe -X utf8 scripts\qmt_snapshot.py'
-        ),
-    ]
+    # Pass the entire ssh command as a single string to subprocess to avoid
+    # double-shell-escape (Mac → ssh → cmd.exe → powershell). Empirically the
+    # list-form ssh command was being echoed not executed.
+    remote_cmd = (
+        r'cd C:\money-printer; '
+        r'$env:PYTHONIOENCODING="utf-8"; '
+        r'.venv\Scripts\python.exe -X utf8 scripts\qmt_snapshot.py'
+    )
+    ssh_cmd = f'ssh -o ConnectTimeout=15 {ecs_user}@{ecs_host} \'powershell -Command "{remote_cmd}"\''
     result = subprocess.run(
-        cmd, capture_output=True, text=True,
+        ssh_cmd, shell=True, capture_output=True, text=True,
         encoding="utf-8", timeout=60,
     )
     if result.returncode != 0:
