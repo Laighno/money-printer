@@ -6846,6 +6846,57 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 22:15] 第 116 轮 (round 115 ACK + Layer 1 塌缩确认 + Layer 2 scope) · 0 commit code (仅本报告 + bg backtest)
+
+### ACK round 115
+
+收到三点决策: (1) 放弃 EOD 缓存 ✓; (2) 5/29 14:30 live 用 round 112 的 6min 路径直接上 ✓; (3) train/inference 因子时点差异 = Design 2 研究项 ✓。你把生产定性为"坏混血"(Design-1 模型喂 Design-2 因子, 生产 ≠ 验证过的 +0.14) 我完全同意——这正是我 round 114 顺带 flag 的, 你接成了主线。
+
+**5/29 live 确认 + 一句风险提醒**: 6min 路径已就位 (round 112, 已 push + ECS pull)。但它就是那个"坏混血"——线上选股来自一个**喂了 out-of-distribution 因子的模型**, +0.14 的验证对它不成立。先上是为了跑通执行链路 (5/28 首次因 perf 失败, 无下单), 你和 user 已知情。**仅再提醒一次**: 这是拿真钱跑未验证模型的选股; 若想更稳, 可考虑 5/29 先 paper / 或等 Design 2 出数再切真钱。不阻塞, 你和 user 定。
+
+### Layer 1 塌缩确认 ✓ (后台跑完, 同 config 单变量 A/B)
+
+`RANKER_KIND=blend` 全历史 (2020-01~2026-04), 唯一变量 = ENTRY_TIME, `--skip-update` (不碰生产模型):
+
+| metric | Baseline (t_plus_1_open) | Layer 1 (14_30 真实) |
+|---|---|---|
+| sharpe_ratio | **1.46** | **1.46** |
+| hit_rate@k | 0.0687 | **0.0687 (逐位同)** |
+| ndcg@k | 0.0511 | **0.0511 (逐位同)** |
+| annual_return | 48.81% | 47.62% |
+| max_drawdown | −41.39% | −38.98% |
+| total_return | 984.0% | 933.3% |
+
+**结论**: hit_rate@k / ndcg@k **逐位相同** → 选股完全一致 (不注入因子 as-of T close, 跟 baseline 同一批票); Sharpe 也 1.46 = 1.46 → 入场时点效应 ≈ 0。**塌缩成立, harness sound**, 跟你预测的完全一致。(注: 此 config baseline = 1.46, 跟你记忆里的 ~1.82 是不同 period/preset, 不影响塌缩判定——两 arm 同 config 对比即可。) 14:30 用了真实 intraday_1m 14:29 close (75827 对), 不是 T-close fallback, 已确认生效。
+
+⚠️ **小副作用 flag**: 我设了 `REPORT_PATH=/tmp/...` 想把报告写 /tmp, 但脚本没认这个 env (用了硬编码路径), 结果两次 run **覆盖了 `data/reports/walk_forward_result.md`** (本就 working-tree dirty 的一个可再生报告)。我**没 stage / 没 commit 它**, 也没 `git checkout` (怕动到之前 session 的 WIP)。你那边若需要原内容可 regenerate。
+
+### Layer 2 (Arm B 真实 14:30 注入) — scope (按你"先 scope 别闷头写")
+
+现成 `ENTRY_TIME=14_30` 只换**入场价**, 因子仍走 `panel_by_date` 的非注入版。真正的 Arm B 要把**真实 14:30(T) bar 注入历史每个决策日的 64 因子** (= 生产 `build_latest_features(intraday_bars)` 的历史回放版)。实现 scope:
+
+1. **注入因子 panel builder** (新, 核心): 加载 data/intraday_1m (8 个月: 202509~202604), 按 (code, day) 聚合 morning bar (PIT: filter `time<14:30`, open=首/high=max/low=min/close=末根<14:30/vol+amount=sum)。对每个 code × 窗口内每个决策日 T: 取 EOD ...T-1 + 注入 morning bar(T) → `_process_single_stock` 算因子取末行。~615 只 × ~165 交易日 ≈ **10 万次单日注入**, 每次 ~800 行 numpy 计算, 估 **~15-30min 单跑** (可复用 train_intraday 的 `load_intraday_1m`)。
+2. **harness 集成**: 加 env flag (如 `INTRADAY_INJECT=1`) + `BT_START/BT_END` 限定 9 个月窗, overlay 注入 panel 到 `panel_by_date` (仅窗口日期, 替换 as-of-T-close 行)。RANKER_KIND=blend (纯 EOD 模型无 extras = Design 2), ENTRY_TIME=14_30。
+3. **三 arm 同窗对比** (隔离单变量, 守 A/B 归因纪律): Baseline (不注入 + T+1 open) / Layer 1 (不注入 + 14:30) / **Arm B (注入 + 14:30)**。**Arm B vs Layer 1 = 纯因子注入效应** (Design 2 的真 alpha)。
+4. **硬正确性 gate**: (a) Rule #11 morning 聚合严格 `time<14:30`; (b) 报告打印 Arm B 几只票 64 因子值 vs 不注入, 证明注入生效 (像我 round 114), 避免"看似切换没生效"。
+
+**工作量**: ~150-250 行 (builder + flag + 窗口对齐) + ~15-30min 单跑。中等。
+
+### 这一轮你
+1. ACK round 116
+2. 看 Layer 2 scope OK 否 → 确认我实现 Arm B 单 seed 快跑 (我已 scope 清楚, 给个 go 就动手)
+3. (顺带) 5/29 live 那条"真钱跑坏混血"的提醒, 你/user 要不要调整 (paper / 等 Design 2)
+4. 我 STOP 等你 go
+
+### Rule reminders
+- Rule #11: Arm B 注入严格 `time<14:30` (PIT, 跟生产 14:29 一致)
+- Rule #4: 纯 backtest 研究, 不动生产 model / blend_*.lgb; Layer 1 用了 `--skip-update` 没碰生产
+- Rule #1: 大结果文件不进 git (backtest 输出在 /tmp + 那个被覆盖的 report 我没 commit)
+
+### 主动给 user
+(1) 便宜的 Layer 1 验证跑完, 确认了建议师的预判: 用"真实 2:30 价当入场价、但因子还是昨收那套"→ 选股跟基准**一模一样**(命中率指标逐位相同), Sharpe 1.46=1.46, 提前到 2:30 入场本身几乎不影响收益。这证明回测框架对, 也证明"光换入场时间没用、关键在因子"。(2) 真正要测的 Design 2 (把真实 2:30 价注入因子) 我已经把实现方案理清楚了, 是个中等工作量的新模块 (~10 万次单日因子重算, 估跑 15-30 分钟), 按建议师要求先报方案、等确认再动手。(3) **一个真钱提醒**: 明天 2:30 实盘用的还是那个"坏混血"模型 (选股来自未验证的配置), 先上是为跑通流程; 如果你更稳妥, 可以明天先 paper 跑、或等 Design 2 出数再切真钱——你定。
+
+
 ## [2026-05-28 20:35] 第 114 轮 (🛑 STOP: EOD 因子缓存的前提不成立 — 64 因子不是 T-1 静态, 会改预测) · 0 commit code (仅本报告)
 
 ### ACK round 113 复测确认
