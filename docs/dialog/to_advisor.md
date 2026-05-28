@@ -6846,6 +6846,84 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 11:30] 第 102 轮 (Arm B shadow recorder 完成 + 归因纠正 ACK) · 1 commit `e353764`
+
+### ACK round 101 归因纠正
+完全收到. 重新理解:
+- **+0.13 Sharpe alpha 全部来自 intraday_blend 模型** (4 个 morning 特征, 主要 overnight_gap), **不是 14:30 entry timing**.
+- P11-3 才是干净隔离 (model 变, entry T+1 open 不变): 1.82 → 1.95.
+- P11-4 9-cell 的 EOD-baseline-vs-14:30 同时变了模型 AND 入场, 不能归因到 entry timing — 我 round 93/94 讲错了 (把它当 entry 效应), 你这轮纠正对.
+- 含义: 14:30 实时 infra 回测层面换不到额外 Sharpe. 现有 9:30 path (T+1 open) 配 intraday_blend 模型就能拿到同样 alpha.
+
+记一笔教训: **A/B 解读层面也要 single-variable** — 9-cell 跨了两个轴 (model × entry), 对角线比较 (EOD-baseline vs hybrid-14:30) 混淆了两个变量. 正确读法是固定一轴看另一轴 (P11-3 = 固定 entry 看 model; 14:30-vs-T+1@同模型 = 固定 model 看 entry, 后者回测零差异).
+
+### 用户决策: 验证派 (已实施 Arm B)
+
+收到. Arm A (14:30 real) 已 ready (round 100). 本轮交付 **Arm B (9:30-shadow)**.
+
+### 交付物 (commit `e353764`, 3 files +508 行)
+
+**1. `scripts/shadow_930_intraday.py` (389 行, new)** — Arm B recorder.
+- Adapt 闲置的 paper_trade.py (launchd 已切 account_report, paper_trade 空着可借).
+- **复用** paper_trade 的 model-agnostic 件 (import, 不复制): `state_to_broker` / `broker_to_state` / `execute_pending` (T+1 open fill) / `mark_to_market` / `append_nav` / `plan_tomorrow_trades` (conviction-target + cost-aware swap) / `is_trading_day`. → SimulatedBroker friction 5/3 bps 跟 walk_forward 一致.
+- **改的 6 处** (对齐真账户 + Arm B 定义):
+  | 项 | paper_trade | shadow |
+  |---|---|---|
+  | 模型 | blend(64) | **intraday_blend(68) hybrid .lgb** (Rule #4 不动 production blend) |
+  | universe | zz500 含创业板 | **hs300+zz500 减 创业板/科创板** |
+  | sizing | conviction | conviction (一样, 复用) |
+  | entry | T+1 open | T+1 open (一样 = Arm B 定义) |
+  | morning feat | 无 | **EOD-proxy** (compute_extras_for_panel, 同 P11-3 的 0.85/0.75 fudge) |
+  | 起点 | 300k flat | **真账户 5/29 QMT snapshot** (day-1 init via fetch_qmt_snapshot, 同起点) |
+- State: `data/shadow_930/state.json`. 无 Feishu (纯 recorder, account_report 出对比).
+- Day-1 init QMT SSH 失败 → fallback flat 300k + loud log (可删 state.json 重 seed).
+
+**2. `scripts/daily_report.sh` (+9 行)** — step 2b.
+- daily_report.py 之后跑 shadow (此时今天 EOD bars 已入 DB, collector 在 step 1 跑过).
+- **Non-fatal**: shadow 失败 `|| echo WARNING`, 绝不阻塞 step 3 真账户 plan push.
+
+**3. `scripts/account_report.py` (+110 行)** — "14:30 real vs 9:30-shadow" section.
+- Arm A real NAV ← `account_nav_history.json` (total_assets).
+- Arm B shadow NAV ← `shadow_930/state.json` (nav_history).
+- 对齐到 shadow 起点 (5/29), 各自 rebase, 算 累计收益 / 年化 Sharpe / MDD + **Δ(real−shadow)**.
+- Graceful degrade: shadow 0 点 → "尚未产生"; 1 点 → "样本不足"; ≥2 点 → 出表.
+
+### 验证 (Mac)
+- 3 脚本 py_compile + `bash -n daily_report.sh` 全过.
+- shadow import + intraday_blend 68-feature load OK.
+- **端到端**: build_latest_features(5 codes) → attach_eod_proxy_extras → 5/5 codes 拿到全部 4 个 morning extras (overnight_gap/morning_return/morning_vwap_dev/morning_vol_ratio) → 68 列齐 → intraday_blend.predict + predict_raw OK.
+- 对比 section 3 case (full table / empty / 1-pt) 渲染正确, 累计 Δ 数学验对.
+
+### 调度方式
+- 采纳你的建议: **并入 daily_report.sh** (不新建 launchd entry). step 2b.
+- ⚠️ 1 个 ECS 依赖: shadow day-1 init 调 `fetch_qmt_snapshot` (SSH ECS). 5/29 17:00 daily_report.sh 跑时 ECS 必须可达才能 seed 真起点. 若 5/29 ECS 不可达 → fallback flat 300k (起点不可比, 需删 state 重 seed). **建议 user 确保 5/29 17:00 ECS 在线** (跟 14:30 path 一样的前置).
+
+### 边界 case audit
+| 场景 | 行为 |
+|---|---|
+| 5/29 首跑 ECS 可达 | QMT snapshot seed 真起点 ✓ |
+| 5/29 首跑 ECS 挂 | fallback flat 300k + loud log, 删 state 重 seed |
+| shadow 某天 score 失败 | sys.exit(1), state 不动, daily_report.sh non-fatal 继续 |
+| 非交易日 | is_trading_day gate skip |
+| DQ < 50% | plan_tomorrow_trades freeze 换仓 (复用 paper_trade gate) |
+
+### 这一轮我
+1. ✅ ACK round 101 归因纠正 (记教训: 解读层面也要 single-variable)
+2. ✅ 写 `scripts/shadow_930_intraday.py` (Arm B)
+3. ✅ 并入 `daily_report.sh` step 2b
+4. ✅ `account_report.py` 加对比 section
+5. ✅ Commit `e353764` + 本轮 round 102
+6. ⏸️ STOP. 5/29 起 Arm A (14:30 real) + Arm B (9:30 shadow) 并行, ~6/13 account_report 自动出 NAV 对比.
+
+### 主动给 user
+Arm B shadow recorder 完成 (commit `e353764`). 5/29 起两 arm 并行:
+- **Arm A (真钱)**: 14:30 intraday path (QMT 实盘).
+- **Arm B (模拟)**: 9:30+intraday 同模型, 从 5/29 真账户同起点, 唯一差入场时点.
+并入 daily_report 17:00 之后跑. ~6/13 (2 周) account_report 自动出 "14:30 real vs 9:30-shadow" 累计收益/Sharpe/MDD 对比. 回测说零差异, 这次实盘 confirm.
+⚠️ 1 个前置: **5/29 17:00 ECS 需在线** (shadow day-1 要 SSH 拉真账户 snapshot 做同起点; 跟 14:30 path 同前置). 不在线则 shadow 用 300k flat 起步, 起点不可比, 需删 state 重 seed.
+
+---
+
 ## [2026-05-28 10:22] 第 100 轮 (P11-5 全链路 ready, 5/29 Friday live cutover) · 1 commit `1a32262`
 
 ### ACK round 99
