@@ -8096,6 +8096,62 @@ intraday_plan 14:30 跑时, "今天 5/28 的日线" 还没收盘 (不完整). bu
 ### 主动给 user
 5/28 14:30 首跑实操失败已诊断: 不是 14:30 架构问题, 是 perf bug — scoring 时对 615 只股票逐只串行网络拉日线 (DB stale 没先 warm), 花 15min; 加 1m fetch 6 个 chunk timeout 3min = 总 ~20min 赶不上收盘. 修法: scoring 前用 xtdata 一次 bulk warm DB (~1min 替代 15min) + 优化 1m chunk. 目标压到 <5min. 工程方修, 改完 ECS 复跑验证, 5/29 14:30 第二次 live 试. (今天无下单, 5/29 9:25 走 EOD blend 兜底.)
 
+## [2026-05-28 16:40] 第 109 轮 (round 108 perf fix 没解决 → 根因是 download vs read → 改 get_market_data 读缓存)
+
+### round 108 fix 没解决 (ECS 复测真实数据)
+
+advisor 把 round 108 的 `4a310f9` pull 到 ECS 复测 `intraday_plan.py --skip-sleep`, 完整 timing:
+```
+1m fetch (download_history_data2):  6min20s
+EOD 30d (download_history_data2):    9min (chunk25+retry 反而更慢, 6 chunk retry 后仍 timeout)
+warm (download_history_data2 1d):    又一次 xtdata fetch (advisor kill 在此)
+```
+**chunk50→25 + retry-once 把 EOD 从原 47s 拖成 9min** (retry 放大 hang). 而且 warm 是**第三次** xtdata fetch. 三次叠加 15min+. fix 方向错了.
+
+### 真根因: `download_history_data2` (server 拉) vs `get_market_data` (读本地缓存)
+
+advisor 实测 (ECS, XtMiniQmt 整天在跑):
+| 调用 | 615 codes 今日 1m | 说明 |
+|---|---|---|
+| `download_history_data2` (现用) | **6min** | 从 server 拉, hang-prone |
+| `get_market_data` (NO download) | **35s** | 读本地缓存, 10× 快 |
+
+**关键洞察**: XtMiniQmt 整天运行 → 今日 1m + 历史日线**已自动缓存在本地** (`get_market_data` 直接返回 615×211, 35s, 不需 download, 不需订阅). 之前慢是因为代码用 `download_history_data2` 强行从 server 重拉, 而数据本来就在本地.
+
+(用户选了 B "14:30+盘中订阅", 但实测发现**根本不用订阅** — QMT 自己整天缓存. 直接读即可. B 比预想简单.)
+
+### round 109 fix spec
+
+**核心: 把所有 `download_history_data2` 换成 `get_market_data` (读缓存)**:
+
+1. **今日 1m**: `fetch_today_1m_and_eod_history` 里, 删 `download_history_data2` (1m) + `_chunked_download`, 改成单次 `xtdata.get_market_data(field_list=[o/h/l/c/v], stock_list=xt_codes, period="1m", start_time=today_0930, end_time=today_1430, dividend_type="none", fill_data=False)`. 实测 35s. 返回 dict[field→df(code×time)], 用现有 stack pivot (跟 p11_4_fetch 一样).
+
+2. **EOD 30d**: 同样删 download, 改 `get_market_data period="1d"` 读缓存 (QMT 有历史日线). 若读回空 → fall back DB. 
+
+3. **删 round 108 的 warm_daily_bars_via_xtdata**: 不需要了. 64 base 因子走 DB (collector 17:00 保鲜到 T-1; 若 DB 偶尔 stale, build_latest_features 的 per-code get_daily_bars 兜底, 但正常 DB fresh 就秒级命中). 或者保留一个 DB-fresh check, stale 才补 — 但不要再用 download_history_data2.
+
+4. **删 `_chunked_download` helper** (round 108 加的, 是错方向): get_market_data 单次调用不需要 chunk.
+
+**预期**: 1m read 35s + EOD read ~10s + DB 因子命中 + score ~1min = **总 ~2min**, 远低于 5min, 14:30→14:57 窗口宽裕.
+
+### correctness 不变
+- 14:30 读 1m 仍 filter `time < 14:30` (PIT, 排除 14:30 bar)
+- 64 因子仍 T-1 close 对齐 (get_market_data 1d end=T-1, 不含今日不完整 bar)
+
+### 这一轮你
+1. ACK round 109
+2. `intraday_plan.py`: download_history_data2 → get_market_data (1m + EOD 都改), 删 _chunked_download + warm_daily_bars_via_xtdata
+3. 本地 py_compile (Mac 无 xtquant 测不了真 timing, advisor ECS 复测)
+4. commit + push
+5. STOP. advisor ECS 复测确认 <5min, 然后 5/29 14:30 第二次 live
+
+### Rule reminders
+- Rule #11: 1m filter time<14:30, EOD end=T-1 (不变)
+- Rule #4: 只改 fetch 方式, 不动 model
+
+### 主动给 user
+B 路径实测发现根本不用建订阅 infra: XtMiniQmt 整天跑已自动把今日 1m 缓存本地, `get_market_data` 直接读 35s (vs `download_history_data2` 6min). round 108 用 download 强行重拉 + chunk+retry 反而拖成 9min. round 109 fix: 全换成读缓存, 删 warm/chunk. 预期 14:30 总耗时 ~2min. 工程方改, advisor ECS 复测, 5/29 14:30 二次 live. (今天无下单, 5/29 9:25 EOD blend 兜底.)
+
 
 
 
