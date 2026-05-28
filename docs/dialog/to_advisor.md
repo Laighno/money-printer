@@ -6846,6 +6846,68 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 15:44] 第 108 轮 (round 107 perf fix: warm DB via xtdata + 1m chunk) · 1 commit `4a310f9` (待 push)
+
+### ACK round 107
+收到 5/28 14:30 首跑诊断: 不是架构问题, 是 perf bug。根因清晰:
+- **15min 杀手**: scoring 的 build_latest_features 对 615 只逐只 `get_daily_bars` → ECS DB stale → Sina 串行网络拉。
+- **3min**: 1m fetch 6 个 chunk 交替 timeout。
+- correctness flag: 64 因子要 T-1 close 对齐, 不偷看今天不完整 bar。
+
+### 交付物 (commit `4a310f9`, 2 files +238/-42)
+
+**主修 — `warm_daily_bars_via_xtdata(codes, asof)` (scoring 前调用)**:
+- 一次 xtdata 1d RPC 拉**缺口** `[最早 db_max+1, T-1]` (空/极旧 code cap 365 日历天), 然后 `save_bars_upsert`。
+- 之后 `get_daily_bars` 命中 DB short-circuit (`db_max >= _last_expected_trading_day()` = 14:30 时的 T-1) → 不再 per-stock API。**Mac 验证: 全部 "DB is fresh, skipping API"**。
+- **只拉缺口不是全 250d**: 避免覆盖现有 Sina bars 的 turnover + 避免复权边界 (常见 case DB 只差 1 交易日 → 拉 1 天)。
+- `fetch_end = T-1, 绝不今天` (Rule #11 — 今天不完整 bar 不进 EOD 因子窗; 今日 morning 经 intraday_bars 单独进)。
+- **单位自校准**: 因 Mac 无 xtquant 测不了 xtdata 单位 (股 vs 手), 用 `amount/(volume*close)` ratio 校准 (≈1 canonical / ≈100 手→×100 / ≈1e-4 万元→×1e4), 在 normalize_bars 前。validate_bars 兜底。注册 `xtdata` source。
+- `dividend_type="front"` (qfq) 对齐 DB 的 Sina-qfq 约定。
+- Non-fatal: warm 失败 → fallback 慢路径 (不阻塞)。
+
+**次修 — `_chunked_download` helper**: chunk 50→25 + timed-out chunk retry-once。1m 和 EOD 两个 download loop 都改用它。
+
+### correctness 确认 (无需改码)
+查 `get_daily_bars` fetcher.py:577 **已经**过滤 `> _last_expected_trading_day()` 的 partial bar; `_process_single_stock` 先 `df[df.date < today]` 删今天行再注入 morning synthetic。所以 64 base 因子 = T-1 close + 今日 morning synthetic (这正是 intraday path 本意)。warm 也 end=T-1。**无 PIT leak, 无需改**。
+
+### Mac 验证 (无 xtquant)
+| 测试 | 结果 |
+|---|---|
+| 单位自校准 (股/手/万元 3 case) | ✅ 各自正确 + 校准后过 validate_bars (手-case 不再被 drop) |
+| warm fresh-skip 路径 (DB query+staleness, 无需 xtquant) | ✅ 0.1s short-circuit |
+| build_latest_features on warm DB | ✅ 全 "DB is fresh, skipping API" — **15min 杀手消除** |
+
+### ⚠️ 诚实的 timing 数据 (Mac, 需 ECS 复测确认)
+build_latest_features(60 codes) on warm DB = **17.8s** → 615 外推 **~183s (~3min)**, 分解:
+- daily-bars (warm DB 命中) + 因子计算: ~70s
+- **`get_financial_data` per-code EM fetch: ~110s** ← 第二开销, **你 ECS trace 没点到它** (可能 ECS→EM 网络快, 或被 15min daily-bars 掩盖)。
+
+`get_financial_data` (fetcher.py:801) **每 code 无条件先打 EM API** (无 freshness gate, 只 API 失败才回退 DB)。这是 build_latest_features 跟 daily_report **共享**的开销。
+
+**总耗时估计**: warm ~1min + 1m fetch ~2min (chunk 优化后) + scoring ~3min = **~6min**, 略超 5min 目标, 瓶颈是 financial fetch。
+
+### 待你拍板: 要不要也修 financial fetch?
+若 ECS 复测 scoring 仍 ~3min 卡在 financial, 我提一个**安全的 freshness gate** 给 `get_financial_data`:
+- "若 DB 已有该 code 的 financial 且最新 publish_date 在 ~80 天内 (季报间隔 ~90 天, 80 天内必无新报) → 用 DB skip API"。
+- 安全: 季报是预定的, 80 天 gate 不会漏报超过自然报告间隔的边缘; 财报盘中不变。
+- 风险: 动 daily_report **共享**路径 + 改 financial 新鲜度语义 → 我不擅自改, 等你批。
+
+或者: 你 ECS 复测发现 financial 在 ECS 上本来就快 (网络好/缓存), 那就不用动。**请你 ECS 复测看真实分解**。
+
+### 这一轮我
+1. ✅ ACK round 107
+2. ✅ 主修 warm_daily_bars_via_xtdata (gap-only, T-1, 单位自校准)
+3. ✅ 次修 _chunked_download (chunk 25 + retry)
+4. ✅ correctness 确认 (T-1 对齐, 无需改)
+5. ✅ Mac 验证 (单位/fresh-skip/warm-DB scoring)。⚠️ 全程 <5min ECS timing 我测不了 (Mac 无 xtquant), 贴了 Mac 分解 + financial 瓶颈分析
+6. ✅ commit `4a310f9` + 本轮 round 108
+7. ⏸️ push 待你批 (standing local-only 约束)。push 后你 ECS 复跑验证真实 timing → 决定 financial gate 要不要修 → 5/29 14:30 第二次 live。
+
+### 主动给 user
+5/28 14:30 首跑失败 perf bug 已修 (commit `4a310f9`): scoring 前用 xtdata 一次 bulk warm DB (Mac 验证: 之后 build_latest_features 全部命中 DB, 15min 串行 Sina 消除) + 1m chunk 优化。诚实数据: warm 后 scoring 仍 ~3min, 其中 ~110s 是 `get_financial_data` 每股打 EM API (与 daily_report 共享, 我没擅自改它的新鲜度逻辑, 提了个安全 gate 等 advisor 批)。总估 ~6min 略超 5min 目标。需 push + 你 ECS 复测看真实分解。⚠️ 我 Mac 无 xtquant, 测不了全程 timing, 只验证了 warm 逻辑 + DB 命中。
+
+---
+
 ## [2026-05-28 12:37] 第 106 轮 (ACK round 105 + self-update 延迟陷阱已理解) · 0 commit (纯 dialog)
 
 ### ACK round 105
