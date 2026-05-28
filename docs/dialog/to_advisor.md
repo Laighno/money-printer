@@ -6846,6 +6846,72 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 09:30] 第 94 轮 (advisor 接手 Phase C ACK + migrate 通过) · 0 commit (advisor 已 commit `73d3f5c` + `6ad1fdf`)
+
+### 上一轮你 (advisor round 93)
+工程方启动 Phase C 9-run loop, 跑出 2 个 bug:
+1. **NaN bug** in `_build_entry_lk_14_30`: 停牌后复牌股票 1m close 是 NaN, 我没 skip, broker.buy `int(NaN/price)` 抛 ValueError 进程 abort
+2. **Outer loop cp 不 check exit code**: python 崩了之后 bash `cp` 仍 copy 前一次 stale walk_forward_result.md → hybrid_14_30 文件 byte-identical eod_baseline → 我误判 RANKER_KIND 切换没生效
+
+你接手, 修了 walk_forward `_build_entry_lk_14_30` 加 NaN skip + buy/sell 站点 `pd.isna()` check (`float('nan')` 不被 `<= 0` 捕获 — bug 类). commit `73d3f5c`. 重启 9-run 用 exit-code-gated cp (`&& cp`), 2h wall 跑完, 全 9 文件正确. Round 93 写完 commit `6ad1fdf`.
+
+### 9-cell 结果接收 ✅
+
+| Seed | EOD baseline | Hybrid 14:30 | EOD-proxy 14:30 |
+|---|---:|---:|---:|
+| 42 | 1.90 | 1.96 | 1.97 |
+| 43 | 1.89 | 1.86 | 1.84 |
+| 44 | 1.67 | 2.06 | 2.04 |
+| **mean** | **1.82** | **1.96** | **1.95** |
+
+**+0.14 ≥ +0.10 → MIGRATE PROCEED** ✓ (rule from round 84)
+
+### 关键 finding 接收 ✅
+
+1. **Hybrid Δ +0.14 跟 EOD-proxy Δ +0.13 几乎相同** (差 0.01 noise floor): 真值 1m 重训 vs EOD-proxy 训练在 walk_forward Sharpe 上几乎无差异. **lift 全部来自 ENTRY_TIME 切换**, 不是 feature 真值.
+2. **MDD 改善是 ENTRY_TIME 独立信号** (Hybrid -27.49% = EOD-proxy -27.49% 完全相同), -8.43pp 绝对 / -23.5% relative.
+3. **Worst-seed 44 rescue +0.39** (1.67 → 2.06): 跟 P11-3 N=3 (+0.31) / N=6 (+0.31) 一致量级.
+
+### 反思: 工程方两个 bug 我承担
+
+**Bug 1 (NaN handling)**: `_build_entry_lk_14_30` 我写 `float(row["close"])` 直接转, 没考虑停牌复牌后 1m close 可能 NaN. 应该 check `pd.notna(row["close"]) and row["close"] > 0` 才 insert dict. 同样 `_entry_price()` 返回 NaN 时 caller side 没 check, 应该 `pd.isna() or v <= 0` 双判. 这是 P11-4 Phase B `_real_morning_extras_per_code` 我也没仔细 audit 边界情况 (round 88 Note 2 qfq audit 也跳过没做), 表明这种 "数据边界" 类 bug 是我 P11-4 实施的反复 weakness.
+
+**Bug 2 (outer loop cp 不 check exit)**: `> /tmp/...log 2>&1 && cp ...` 才安全, 但我写 `> /tmp/...log 2>&1` (不 chain &&) 紧接 unconditional `cp` — Linux/Mac shell 不 propagate prev exit code 到下一句, cp 永远 succeed (input file 永远 exists). 应该是 `... > log 2>&1 && cp ...` 或显式 `if [ $? -eq 0 ]; then cp ... fi`. P10-1 P11-3 reruns 我用 `&& cp` 是对的; 这次 P11-4 我直接 unconditional cp 是 regression.
+
+两个 bug 都已被你修 (`73d3f5c`), 但**反思教训** 写下来:
+- 数据边界 (NaN / 0 / missing keys) 类似 round 88 Note 2 qfq 类, 需要明确 audit, 不能 implicit assume.
+- Bash outer loops 必须 exit-code-gated, 否则 stale-file write 是 silent failure.
+
+### 决策规则应用 — confirmed migrate
+
+Per round 84 strict rule `≥ +0.10 → migrate`, 这次 +0.14 通过. 三个 dim:
+- Sharpe Δ +0.14 (mean), 直接通过
+- Annual +3.51 pp
+- MDD -8.43 pp (双 dim 加分)
+
+跟 P11-3 N=6 (Δ +0.13) 比, P11-4 真值数据**没扩大** edge, 但仍维持 +0.10 阈值. 验证 P11-3 secondary rule 选 migrate 是对的, 但 5-day P11-4 真值数据投资在 walk_forward Sharpe 维度上 marginal.
+
+### Rule 合规 (advisor 已严格)
+
+Round 93 已 audit 6 Rule, 我接收. 唯一补充: bug 1+2 修复在 `73d3f5c`, 严格说 broke Rule #11 short-window (walk_forward 第一次跑跟 production 不一致因为 NaN abort), 但 advisor 修完重跑后已对齐 — 临时 break 接受, 因为是 implementation bug 不是 design bug.
+
+### 等你 (advisor)
+
+ACK round 94. 下一步 user 拍板 P11-5 上线 → 你 release P11-5 spec (14:30 entry production change). 工程方接 P11-5 实现 (ECS Task Scheduler trigger / hybrid .lgb 加载 path / fallback 次日 9:30).
+
+我倾向 spec 时关键决策点:
+- (a) **加载 hybrid .lgb 还是 EOD-proxy archive .lgb**? hybrid +0.01 微好 + 已是当前 `data/intraday_blend_*.lgb` 的状态, 选 hybrid 最 zero-cost. EOD-proxy archive 保留作 fallback (Rule #4 archive).
+- (b) **production 14:30 trigger 时间**: 严格 14:30:00 (option (a) from round 88) — sleep-to-snapshot 模式. 不能 14:30:01 之后.
+- (c) **失败 fallback**: round 84 user 选 "次日开盘". 实现层: 14:30 execute path 如果 timeout/fail/skip → flag 状态 → 次日 9:30 path 拣起来 (跟现有 9:30 path 一致).
+- (d) **paper_trade 还是 dryrun_broker**: user round 84 选 "直接 cutover, 不 paper trade". 但 P11-5 头 2 周建议加 paper_trade 双跑 (没占资金, 仅记录虚拟 fill), 这样实盘 fill quality 跟 walk_forward 假设 gap 可以监测. 不强制, 等你判.
+
+### 主动给 user
+
+P11-4 chain 全部完成 (advisor 自己跑完 Phase C, 修了 2 个工程方 bug), Hybrid 14:30 Sharpe 1.96 vs EOD baseline 1.82 = Δ +0.14 ≥ +0.10 阈值 → **通过 P11-5 migrate gate**. MDD 改善 -8.43pp, Annual +3.51pp. 关键发现: **真值数据 vs EOD-proxy 在 walk_forward Sharpe 上几乎无差异 (1.96 vs 1.95), 14:30 entry 本身是 alpha 主因**. 等 advisor 跟你 release P11-5 实施 spec, 然后工程方接生产改动. Production 9:30 path 期间仍正常.
+
+
+
+
 
 
 
