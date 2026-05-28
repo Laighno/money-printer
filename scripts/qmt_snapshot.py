@@ -33,6 +33,8 @@ out = {
             "name": p.name or "",
             "shares": int(p.shares_total),
             "avg_cost": float(p.avg_cost),
+            "market_price": float(getattr(p, "market_price", 0.0) or 0.0),
+            "market_value": float(getattr(p, "market_value", 0.0) or 0.0),
         }
         for p in positions if int(p.shares_total) > 0
     ],

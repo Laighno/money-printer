@@ -7562,6 +7562,58 @@ User 已 round 84 选 strict path (P11-4 真值重训再上). Phase C 已 confir
 
 P11-4 Phase C 完成 (9-cell 完整 walk_forward, advisor 直接在 Mac 跑了 2 小时). **Hybrid 14:30 Sharpe 1.96 vs EOD baseline 1.82 = Δ +0.14 ≥ +0.10 阈值 → 通过 P11-5 migrate gate**. MDD 改善 -8.43pp (35.92% → 27.49%), Annual +3.51pp. 唯一 unexpected: **真值 hybrid 跟 EOD-proxy 在 walk_forward Sharpe 上几乎无差异** (1.96 vs 1.95). 14:30 entry 本身是主要 alpha, .lgb 训练数据(真 vs proxy)边际无影响. 等你 confirm migrate 我写 P11-5 spec (14:30 entry 改 ECS Task Scheduler, hybrid .lgb 上线, 失败 fallback 次日 9:30). Production 9:30 仍正常.
 
+## [2026-05-28 09:50] 第 95 轮 (round 94 ACK + P11-5 production spec)
+
+### ACK round 94
+收到工程方对 Phase C 全 ACK + 2 个 bug retro. 现在重要的是把 P11-5 上线干净.
+
+### Round 94 你 4 个决策点 user 已拍板
+
+| 项 | 决策 |
+|---|---|
+| (a) 模型 .lgb | **Hybrid** (data/intraday_blend_*.lgb 已是当前状态, +0.01 微好) |
+| (b) 14:30 trigger 时间 | **严格 14:30:00** (sleep-to-snapshot, 不能 14:30:01 之后) |
+| (c) 失败 fallback | **次日 9:30** (现有 9:30 path 接管) |
+| (d) Paper trade 双跑 | **不做** (user round 84 直接 cutover) |
+
+### P11-5 spec
+
+**Phase A**: 新 `scripts/intraday_plan.py` — 14:30:00 trigger, fetch 9:30~14:29 1m bars (xtdata ECS-side), 算 INTRADAY_FEATURE_COLS (64+4), 加载 hybrid `data/intraday_blend_*.lgb`, Top-K=10 选股, 跟 QMT 实时持仓对比, 输出 `data/orders/intraday_latest.json` (跟 EOD latest.json 分开避免 9:30 fallback 冲突), git push 让 ECS 拉.
+
+**Phase B**: ECS 新 `scripts/ecs_intraday_execute.ps1` + Task Scheduler `MoneyPrinter-IntradayExecute` at 14:30:30 Mon-Fri. 5s buffer 给 Mac push → ECS pull 同步.
+
+**Phase C**: 9:30 path 加 fallback flag check — 14:30 成功 fill 后写 `data/orders/intraday_success_<YYYYMMDD>.flag`, 9:25 path 看到就 skip. 14:30 fail → 9:25 接管 latest.json (现有 EOD path).
+
+**Phase D**: daily_report.sh 17:00 不变. 生成 9:30 fallback plan. 14:30 优先, 9:30 是 safety net.
+
+### 实施顺序
+
+1. Step 1 (1-2天): 工程方实现 `scripts/intraday_plan.py` (Phase A), 跑通 + 输出 JSON
+2. Step 2 (半天): ECS `ecs_intraday_execute.ps1` + Task Scheduler 注册 (Phase B)
+3. Step 3 (半天): 9:30 path flag check (Phase C)
+4. Step 4: 第一个交易日 dry-run + 验证
+5. Step 5: 切 live mode + 监控 1 周
+
+总 ~3-5 工作日.
+
+### 关键约束
+
+- **Rule #11**: 严格 14:30:00 trigger, 不 fetch 14:30 那根 bar (跟 Phase B 训练 PIT 一致)
+- universe 同 daily_report (过滤创业板/科创板)
+- 限价计算保持 buy=close×1.01, sell=close×0.99
+- xtdata 9:30~14:29 1m 拉取需在 ECS (Mac 没 xtquant)
+
+### 这一轮你
+
+1. ACK round 95
+2. Step 1: 写 `scripts/intraday_plan.py` (Phase A), commit + push
+3. 写 round 96 (Phase A 完成报告)
+4. STOP at Phase A. 等 advisor confirm 再上 Phase B/C/D.
+
+### 主动给 user
+
+P11-5 spec 已 release (round 95): 14:30 实盘 production 改动. 4 个 phase. 总工期 ~3-5 工作日. 工程方先做 Phase A. 今天 9:30 真账户 fills 4 单全成功 (+1.5%).
+
 
 
 
