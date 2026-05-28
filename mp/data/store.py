@@ -446,6 +446,26 @@ class DataStore:
                 params[f"c{i}"] = c
         return pd.read_sql(text(query), self.engine, params=params)
 
+    def load_financial_history(self, codes: list[str] | None = None) -> pd.DataFrame:
+        """Load ALL financial report rows (full multi-report history) for the
+        given codes, sorted by (code, report_date).
+
+        Unlike :meth:`load_financial` (latest report only) this preserves the
+        consecutive-report history that downstream quarter-over-quarter diffs
+        (roe_qoq / *_accel in ``_fetch_financial_history``) need. Used by the
+        round-111 freshness gate in ``get_financial_data`` so a DB-fresh skip
+        returns the same shape EM would, not a single degraded row.
+        """
+        query = "SELECT * FROM financial WHERE 1=1"
+        params: dict = {}
+        if codes:
+            placeholders = ",".join(f":c{i}" for i in range(len(codes)))
+            query += f" AND code IN ({placeholders})"
+            for i, c in enumerate(codes):
+                params[f"c{i}"] = c
+        query += " ORDER BY code, report_date"
+        return pd.read_sql(text(query), self.engine, params=params)
+
     def has_financial_data(self) -> bool:
         with self.engine.connect() as conn:
             return conn.execute(text("SELECT COUNT(*) FROM financial")).scalar() > 0

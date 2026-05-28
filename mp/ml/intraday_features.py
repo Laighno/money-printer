@@ -173,6 +173,7 @@ def build_intraday_panel(
     asof_dt: pd.Timestamp,
     intraday_bars: Dict[str, Dict],
     start: str = "20230101",
+    end: Optional[str] = None,
     include_fundamentals: bool = True,
     eod_history_map: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> pd.DataFrame:
@@ -195,6 +196,11 @@ def build_intraday_panel(
         existing midday-report path.
     start : str
         EOD history start date in ``YYYYMMDD`` form.
+    end : str or None
+        EOD history end cap in ``YYYYMMDD`` form. The 14:30 path passes T-1 so
+        the EOD factor window stops before today's not-yet-closed bar and
+        ``get_daily_bars`` short-circuits deterministically (round 111). None
+        → today (the non-intraday default).
     include_fundamentals : bool
         Whether to merge in fundamentals (PE/PB/ROE etc).
     eod_history_map : dict[code → DataFrame] or None
@@ -216,6 +222,7 @@ def build_intraday_panel(
     panel = build_latest_features(
         codes,
         start=start,
+        end=end,
         include_fundamentals=include_fundamentals,
         intraday_bars=intraday_bars,
     )

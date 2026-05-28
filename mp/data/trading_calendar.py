@@ -159,3 +159,33 @@ def calendar_available() -> bool:
     if _CALENDAR_AVAILABLE is None:
         _fetch_trading_dates()
     return _CALENDAR_AVAILABLE is True
+
+
+def previous_trading_day(today: pd.Timestamp) -> pd.Timestamp:
+    """Last A-share trading day strictly before ``today`` (normalized).
+
+    Holiday-aware via the same calendar as :func:`is_trading_day`, with a
+    weekend-only fallback when the calendar API is unreachable.
+
+    Unlike ``fetcher._last_expected_trading_day`` this is **deterministic
+    w.r.t. wall-clock** — it never returns ``today`` even after 16:00. The
+    intraday 14:30 path uses it to anchor the EOD factor window to a fixed
+    T-1 regardless of when the script actually runs (Rule #11 / round 111),
+    so an after-close ``--skip-sleep`` retest reproduces real 14:30 behavior
+    instead of trying to fetch today's not-yet-closed bar.
+    """
+    today = pd.Timestamp(today).normalize()
+    cal_ok = calendar_available()
+    candidate = today - pd.Timedelta(days=1)
+    # Cap the walk-back at 20 calendar days — wider than any A-share holiday
+    # (CNY/National Day ≤ ~9 days) so we never loop unboundedly.
+    for _ in range(20):
+        if not cal_ok:
+            # Calendar unreachable — weekend-only skip (matches the project's
+            # _last_expected_trading_day fallback; avoids slow per-day probes).
+            if candidate.weekday() < 5:
+                return candidate
+        elif is_trading_day(candidate):
+            return candidate
+        candidate -= pd.Timedelta(days=1)
+    return today - pd.Timedelta(days=1)

@@ -1145,6 +1145,7 @@ def filter_universe(df: pd.DataFrame) -> pd.DataFrame:
 def build_latest_features(
     codes: List[str],
     start: str = "20230101",
+    end: Optional[str] = None,
     include_fundamentals: bool = True,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     intraday_bars: Optional[Dict[str, Dict]] = None,
@@ -1155,6 +1156,11 @@ def build_latest_features(
     - No ``fwd_ret`` column (future is unknown).
     - Only the most recent valid row per stock is kept.
     - Fundamentals use latest financial report + today's PE/PB snapshot.
+
+    ``end`` (``YYYYMMDD``) caps the EOD bar window. Defaults to None (→ today
+    inside ``get_daily_bars``). The intraday 14:30 path passes ``end=T-1`` so
+    the EOD factor window is anchored before today's not-yet-closed bar and
+    ``get_daily_bars`` short-circuits on a DB that reaches T-1 (round 111).
     """
     total = len(codes)
     logger.info("build_latest_features: {} codes, start={}", total, start)
@@ -1178,7 +1184,7 @@ def build_latest_features(
             fin_hist = fin_hist_map.get(code) if include_fundamentals else None
             val_row = valuation_map.get(code) if include_fundamentals else None
             bar = intraday_bars.get(code) if intraday_bars else None
-            part = _process_single_stock(code, start, None, horizon=None,
+            part = _process_single_stock(code, start, end, horizon=None,
                                          fin_hist=fin_hist, valuation_row=val_row,
                                          intraday_bar=bar)
             if part is not None:

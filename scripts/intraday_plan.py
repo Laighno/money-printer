@@ -210,7 +210,8 @@ def _canonicalize_xtdata_bars(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def warm_daily_bars_via_xtdata(codes: List[str], asof_date: date,
-                               max_lookback_cal_days: int = 365) -> dict:
+                               max_lookback_cal_days: int = 365,
+                               asof_eod: Optional[date] = None) -> dict:
     """Stale-gated read-cache warm: when the local DB lags T-1, read the
     missing daily-bar tail from XtMiniQmt's local cache (get_market_data,
     no download) and upsert it, so the subsequent build_latest_features
@@ -254,7 +255,11 @@ def warm_daily_bars_via_xtdata(codes: List[str], asof_date: date,
 
     codes = [str(c).zfill(6) for c in codes]
     store = DataStore()
-    expected = _last_expected_trading_day()   # T-1 at 14:30 (pre-16:00)
+    # Anchor the warm target on the caller's explicit asof_eod (T-1) when given
+    # (round 111 — deterministic regardless of wall-clock, so an after-close
+    # retest warms to the same T-1 a real 14:30 run would). Else fall back to
+    # the wall-clock last-expected day.
+    expected = asof_eod or _last_expected_trading_day()
 
     # Per-code max date already in DB (one GROUP BY query).
     db_max_by_code: Dict[str, date] = {}
@@ -526,8 +531,14 @@ def score_universe(
     asof_date: date,
     intraday_bars: Dict[str, Dict],
     eod_history_map: Dict[str, pd.DataFrame],
+    asof_eod: Optional[date] = None,
 ) -> pd.DataFrame:
     """Build the panel, load the hybrid intraday Blend model, predict.
+
+    ``asof_eod`` (T-1) anchors the EOD factor window: it is threaded to
+    build_intraday_panel → build_latest_features → get_daily_bars as ``end``
+    so the 64 base factors stop at T-1 close and never per-code-fetch today's
+    not-yet-closed bar (round 111). None → today (non-intraday default).
 
     Returns DataFrame [code, ml_score, predicted_excess, predicted_return,
     rank_pct, _rank] sorted desc by ml_score with _rank assigned.
@@ -539,10 +550,12 @@ def score_universe(
     from mp.ml.model import BlendRanker
 
     asof_ts = pd.Timestamp(asof_date)
+    end_str = asof_eod.strftime("%Y%m%d") if asof_eod else None
     panel = build_intraday_panel(
         codes=codes,
         asof_dt=asof_ts,
         intraday_bars=intraday_bars,
+        end=end_str,
         eod_history_map=eod_history_map,
     )
     if panel.empty:
@@ -730,6 +743,17 @@ def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
     logger.info("P11-5 intraday plan @ {}", generated_at.isoformat(timespec="seconds"))
     logger.info("=" * 60)
 
+    # Round 111: anchor the EOD factor window to a fixed T-1 (last complete
+    # trading day before today), deterministic regardless of wall-clock. Threaded
+    # as `end` into warm + scoring so get_daily_bars short-circuits on a DB that
+    # reaches T-1 and never per-code-fetches today's not-yet-closed bar (the
+    # 18min killer seen in the after-close retest). PIT (Rule #11): 14:30 EOD
+    # factors = T-1 close; today's morning session enters via intraday_bars.
+    from mp.data.trading_calendar import previous_trading_day
+    asof_eod = previous_trading_day(pd.Timestamp(asof_date)).date()
+    logger.info("asof_date={} → asof_eod (T-1, EOD factor anchor)={}",
+                asof_date, asof_eod)
+
     holdings, account = load_holdings_and_account()
     if account is None:
         logger.error("portfolio.yaml has no `account:` block — abort")
@@ -758,7 +782,8 @@ def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
     # Non-fatal: a warm failure just means scoring falls back to the slow path.
     t_warm = time.time()
     try:
-        warm_stats = warm_daily_bars_via_xtdata(scoring_codes, asof_date)
+        warm_stats = warm_daily_bars_via_xtdata(scoring_codes, asof_date,
+                                                asof_eod=asof_eod)
         logger.info("warm done in {:.1f}s: {}", time.time() - t_warm, warm_stats)
     except Exception as e:
         logger.warning("warm_daily_bars_via_xtdata failed ({}) — scoring will "
@@ -769,6 +794,7 @@ def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
         asof_date=asof_date,
         intraday_bars=intraday_bars,
         eod_history_map=eod_hist,
+        asof_eod=asof_eod,
     )
 
     top_k_df, _name_map = apply_top_k_filters(full_scored, top_k=TOP_K)

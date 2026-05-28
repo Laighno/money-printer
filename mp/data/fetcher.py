@@ -527,6 +527,18 @@ def get_daily_bars(code: str, start: str, end: str | None = None) -> pd.DataFram
 
     store = DataStore()
 
+    # Effective "last day we should have" = the earlier of the caller's
+    # requested `end` and the wall-clock last-expected trading day. Anchoring
+    # on the requested end (not just the wall-clock day) makes freshness
+    # deterministic: a caller asking for end=T-1 short-circuits on a DB that
+    # reaches T-1 regardless of what time the process runs (round 111 — the
+    # intraday 14:30 path passes end=T-1 so an after-close --skip-sleep retest
+    # behaves like real 14:30 and never per-code-fetches today's not-yet-closed
+    # bar). For the common end=None caller this is unchanged: end defaults to
+    # today, so min(today, _last_expected) == _last_expected.
+    end_date = pd.Timestamp(end).date()
+    effective_expected = min(end_date, _last_expected_trading_day())
+
     # Step 1: load from DB
     db_df = store.load_bars(codes=[code], start=start, end=end)
 
@@ -534,9 +546,8 @@ def get_daily_bars(code: str, start: str, end: str | None = None) -> pd.DataFram
     fetch_start: str
     if not db_df.empty:
         db_max = db_df["date"].max().date()
-        expected = _last_expected_trading_day()
-        if db_max >= expected:
-            logger.debug(f"{code}: DB is fresh (last={db_max}), skipping API")
+        if db_max >= effective_expected:
+            logger.debug(f"{code}: DB is fresh (last={db_max} >= {effective_expected}), skipping API")
             return db_df
         fetch_start = (db_max + timedelta(days=1)).strftime("%Y%m%d")
         logger.debug(f"{code}: DB ends {db_max}, fetching {fetch_start}~{end}")
@@ -572,7 +583,11 @@ def get_daily_bars(code: str, start: str, end: str | None = None) -> pd.DataFram
     # and the cause of the "行情: today" header glitch.  Filter out anything
     # past _last_expected_trading_day() before save.
     if api_df is not None and not api_df.empty:
-        last_expected = pd.Timestamp(_last_expected_trading_day())
+        # Cap at effective_expected (round 111): never persist a bar past the
+        # caller's requested end OR past the wall-clock last-expected day —
+        # whichever is earlier. Filters Sina/EM's fake "today" intraday bar
+        # AND a partial T bar when the caller anchored end=T-1.
+        last_expected = pd.Timestamp(effective_expected)
         before = len(api_df)
         api_df = api_df[api_df["date"] <= last_expected]
         if before != len(api_df):
@@ -803,7 +818,30 @@ def get_financial_data(code: str) -> pd.DataFrame:
 
     On success, saves to DB so future calls can survive API outages.
     On failure, falls back to the most recent DB copy.
+
+    Freshness gate (round 111): if the DB already holds a report published
+    within the last 80 days, skip the EM API entirely and serve from DB —
+    quarterly reports are ~90 days apart and never change intraday, so within
+    an 80-day window there is no newer report to fetch. This collapses the
+    intraday 14:30 path's 615 serial EM hits (and daily_report's) to near-zero
+    on warm days. Any miss/stale/error falls through to EM, so EM stays
+    authoritative whenever fresh data is genuinely absent.
     """
+    # --- round-111 freshness gate: serve fresh DB without touching EM ---
+    try:
+        from mp.data.store import DataStore
+        db_hist = DataStore().load_financial_history(codes=[code])
+        if not db_hist.empty:
+            latest_pub = pd.to_datetime(db_hist["publish_date"], errors="coerce").max()
+            cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=80)
+            if pd.notna(latest_pub) and latest_pub >= cutoff:
+                logger.debug(f"{code}: financial DB fresh (latest publish "
+                             f"{latest_pub.date()} >= {cutoff.date()}), skipping EM")
+                return db_hist
+    except Exception as gate_err:
+        logger.debug(f"financial freshness gate for {code} failed "
+                     f"({gate_err}); falling through to EM")
+
     em_code = _code_to_em(code)
     df: pd.DataFrame | None = None
 

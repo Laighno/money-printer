@@ -205,3 +205,63 @@ def test_fetch_dates_is_cached(monkeypatch):
     tc._fetch_trading_dates()
     tc._fetch_trading_dates()
     assert len(calls) == 1
+
+
+# ───────────────────────────────────────────────────────────────────────
+# previous_trading_day (round 111 — deterministic T-1 anchor for the
+# intraday 14:30 EOD factor window). Must be holiday-aware, never return
+# today, and never wall-clock-dependent.
+# ───────────────────────────────────────────────────────────────────────
+
+def _mock_calendar(monkeypatch, dates, available=True):
+    """Pin both the calendar set and calendar_available() so the
+    holiday-aware branch of previous_trading_day is exercised."""
+    monkeypatch.setattr(tc, "_fetch_trading_dates", lambda: {pd.Timestamp(d) for d in dates})
+    monkeypatch.setattr(tc, "calendar_available", lambda: available)
+
+
+def test_previous_trading_day_thursday_to_wednesday(monkeypatch):
+    """Thu → prior Wed when every weekday trades."""
+    _mock_calendar(monkeypatch,
+                   ["2026-05-25", "2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29"])
+    pt = tc.previous_trading_day(pd.Timestamp("2026-05-28"))  # Thu
+    assert pt == pd.Timestamp("2026-05-27")  # Wed
+
+
+def test_previous_trading_day_monday_skips_weekend(monkeypatch):
+    """Mon → prior Fri (Sat/Sun skipped)."""
+    _mock_calendar(monkeypatch, ["2026-05-22", "2026-05-25", "2026-05-26"])
+    pt = tc.previous_trading_day(pd.Timestamp("2026-05-25"))  # Mon
+    assert pt == pd.Timestamp("2026-05-22")  # Fri
+
+
+def test_previous_trading_day_skips_holiday(monkeypatch):
+    """Holiday weekdays before `today` are skipped (calendar-aware)."""
+    # Trading days: Tue 5/19, Wed 5/20, then 5/21+5/22 (mocked) holidays,
+    # weekend, Mon 5/25. previous_trading_day(Mon 5/25) walks back past the
+    # weekend and the two holidays to land on Wed 5/20.
+    _mock_calendar(monkeypatch, ["2026-05-19", "2026-05-20", "2026-05-26"])
+    pt = tc.previous_trading_day(pd.Timestamp("2026-05-25"))  # Mon
+    assert pt == pd.Timestamp("2026-05-20")  # Wed
+
+
+def test_previous_trading_day_never_returns_today(monkeypatch):
+    """Strictly before today even when today itself is a trading day —
+    this is the determinism the 14:30 anchor relies on (an after-close
+    retest must not anchor on today's not-yet-closed bar)."""
+    _mock_calendar(monkeypatch, ["2026-05-27", "2026-05-28", "2026-05-29"])
+    pt = tc.previous_trading_day(pd.Timestamp("2026-05-28"))
+    assert pt < pd.Timestamp("2026-05-28")
+    assert pt == pd.Timestamp("2026-05-27")
+
+
+def test_previous_trading_day_calendar_down_weekend_fallback(monkeypatch):
+    """Calendar unreachable → weekend-only skip, and never per-day probes
+    (which would be slow + network-bound at 14:30)."""
+    def boom(*a, **kw):
+        raise AssertionError("must not probe when falling back to weekday skip")
+    monkeypatch.setattr(tc, "calendar_available", lambda: False)
+    monkeypatch.setattr(tc, "_zz500_eod_probe", boom)
+    monkeypatch.setattr(tc, "_fetch_trading_dates", boom)
+    pt = tc.previous_trading_day(pd.Timestamp("2026-05-25"))  # Mon
+    assert pt == pd.Timestamp("2026-05-22")  # Fri
