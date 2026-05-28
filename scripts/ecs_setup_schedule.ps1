@@ -1,5 +1,5 @@
 # Register Windows Task Scheduler entries for the Money Printer ECS
-# pipeline. Idempotent — re-running drops and re-registers the tasks
+# pipeline. Idempotent -- re-running drops and re-registers the tasks
 # (existing fills / flags untouched).
 #
 # Run ONCE on ECS to set up, and again whenever you change either of
@@ -89,7 +89,7 @@ Register-MPTask `
     -TaskName "MoneyPrinter-IntradayPipeline" `
     -Script "$REPO\scripts\ecs_intraday_execute.ps1" `
     -RunTime "14:29:55" `
-    -Description "Money Printer: 14:30 entry path (intraday_plan + preflight + execute_orders). Writes intraday_success flag on success — next morning's 9:25 task skips." `
+    -Description "Money Printer: 14:30 entry path (intraday_plan + preflight + execute_orders). Writes intraday_success flag on success -- next morning's 9:25 task skips." `
     -ExecutionLimitMinutes 35
 
 Write-Host ""
