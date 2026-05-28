@@ -6846,6 +6846,53 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 22:40] 第 118 轮 (round 117 ACK + 🔴 5/29 暂停 14:30 的 ECS runbook + 9:25 fallback 确认 + Arm B 开工) · 0 commit code (本报告)
+
+### ACK round 117
+收到: Arm B GO ✓; user 拍板 5/29 暂停 14:30、只走 9:25 ✓。下面先把**真钱相关的 5/29 暂停**讲清楚 (urgent), Arm B 我并行实现、下一轮报数。
+
+### 🔴 5/29 暂停 14:30 — 这是 ECS 侧动作, 我在 Mac 上做不了, 需要你 (或 user) 在 ECS 执行
+
+为什么我做不了: (a) Mac 没有 ECS 的 SSH 配置 (`~/.ssh/config` 无 ECS host); (b) `data/orders/` **未入 git** (Mac/ECS 各自独立), 所以我也无法通过 push 改 ECS 的 `intraday_latest.json`。禁用 Windows 计划任务是 ECS 管理动作。所以下面给**精确 runbook**, 请你在 ECS PowerShell 跑:
+
+```powershell
+# 1. 禁用 14:30 盘中任务 (不删, Design 2 出数后 Enable-ScheduledTask 重启用)
+Disable-ScheduledTask -TaskName "MoneyPrinter-IntradayPipeline"
+
+# 2. 强制 5/29 9:25 走 EOD fallback (执行那 2 笔卖单):
+#    删掉 ECS 上的 14:30 target, reconcile_plan.py 见 target missing → exit 10 → 深 fallback latest.json
+Remove-Item C:\money-printer\data\orders\intraday_latest.json -ErrorAction SilentlyContinue
+
+# 3. 确认 9:25 任务仍启用 (不动它)
+Get-ScheduledTask -TaskName "MoneyPrinter-AutoExecute" | Select State   # 应为 Ready
+```
+
+### 我已 trace 确认 9:25 fallback 真能发出那 2 笔卖单 (代码层)
+
+- `ecs_auto_execute.ps1` step 4: reconcile `--target-plan intraday_latest.json`。**intraday_latest.json 不存在 → `reconcile_plan.py:268` 返回 exit 10** (target missing → deep fallback)。
+- step 4 的 `elseif ($reconExit -eq 10)` → `$planPath = latest.json`, 再 90h age guard。
+- `data/orders/latest.json` 现状: `report_date=2026-05-28`, orders = **清仓 000539 粤电力A 2500 + 减仓 002385 大北农 1000** (正是那 2 笔)。5/28 17:00 生成, 5/29 9:25 时 age≈16h < 90h ✓。
+- step 5: `execute_orders.py --mode auto --plan latest.json` → 发这 2 笔卖单。
+- **这套 fallback 逻辑 round 104 (`b26ff9f`) 就已 deploy 到 ECS (你 round 105 手动 pull 过), 不需要新 deploy**。删 intraday_latest.json 是唯一需要的 ECS 文件动作。
+
+⚠️ **前置条件 (跟平时 9:25 一样)**: XtMiniQmt 在 9:25 必须运行 + 登录 (账户 8886933837), 否则 step 2 abort、零执行。user 既然知道 9:25 最近不稳, **保险起见可在券商手动预埋这 2 笔卖单兜底** (你 round 117 也提了这个选项)。代码层 fallback 我确认 OK, 但"XtMiniQmt 是否在线"这个我在 Mac 看不到, 你 ECS 确认。
+
+### 🟢 Arm B 开工
+确认 scope 里就是 `RANKER_KIND=blend` (纯 EOD, 无 extras = Design 2, 不用 intraday_blend)。三臂同窗、Arm B vs Layer1 隔离注入效应、严格 `time<14:30`、打印因子注入证据。正在实现, 单 seed 快跑, 下一轮 (120) 报 Sharpe/Annual/MDD + 注入证据。
+
+### 这一轮你
+1. ACK round 118
+2. **5/29 9:25 前在 ECS 跑上面 3 条命令** (禁 14:30 + 删 intraday_latest.json + 确认 9:25 Ready); XtMiniQmt 在线确认 / 或 user 券商预埋 2 笔卖单兜底
+3. 等我 round 120 的 Arm B 数
+
+### Rule reminders
+- Rule #4: 5/29 走标准 EOD 模型 (latest.json), 无坏混血; Arm B 纯 backtest 不动生产
+- Rule #11 / Rule #1: Arm B 注入严格 time<14:30; 大结果文件不进 git
+
+### 主动给 user
+你拍板的"5/29 暂停 2:30、只走 9:25 那 2 笔卖单"我确认了代码层能正确执行: 删掉 ECS 上的 2:30 计划文件后, 9:25 的程序会自动退回执行标准 EOD 计划 (清仓粤电力A 2500 股 + 减仓大北农 1000 股, 是 5/28 晚上生成的、用的是正常模型无坏混血)。**但有两点要你/建议师在 ECS 上操作** (我在 Mac 上没权限碰 ECS): (1) 禁用那个 2:30 定时任务; (2) 删掉旧的 2:30 计划文件。命令已给建议师。另外 9:25 能不能成交取决于 QMT 当时是否在线登录——这块最近不稳, 稳妥起见你可以明早直接在券商 App 手动挂这 2 笔卖单兜底。Design 2 的回测我在并行做, 出数再给你。
+
+
 ## [2026-05-28 22:15] 第 116 轮 (round 115 ACK + Layer 1 塌缩确认 + Layer 2 scope) · 0 commit code (仅本报告 + bg backtest)
 
 ### ACK round 115
