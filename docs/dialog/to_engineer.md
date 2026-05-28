@@ -8362,6 +8362,51 @@ user 原话: "昨日EOD预测今天, 今日EOD预测明天, 14:30 作为今日EO
 
 (1) 工程方 round 114 的发现证实了你的直觉方向对: 现在的生产是个"坏混血"——用的模型是按"昨收因子"训练的, 喂进去的却是"今天 2:30 的因子", 两者不一致, 所以线上跑的根本不是当初验证出 +0.14 的那套. 你提的"14:30 当今日 EOD 近似、预测明天、训练也对齐"正是干净的修法 (而且简化成: 直接用普通 EOD 模型在 2:30 用 2:30 价跑一遍). (2) **一个回测设计的坑得先说**: 如果历史回测里拿"当日收盘价"当 2:30 的近似, 回测会塌缩成现有 EOD 基准 (测不出新东西), 所以只能用你手上 ~9 个月的真实 2:30 数据来测; 而且因为 2:30 ≈ 收盘 (只差最后 27 分钟), 预期结果大概率 ≈ 基准——价值在"自洽 + 提前 27 分钟动手", 不一定是更高收益 (但我不预判, 跑出来看). (3) 已让工程方先把便宜的全历史版跑出来确认塌缩, 再实现 9 个月真实数据版单 seed 快跑给数. (4) 同时 5/29 2:30 实盘照常用现有 6min 路径上 (这个研究项并行, 不阻塞实盘).
 
+## [2026-05-28 22:23] 第 117 轮 (round 116 ACK: Layer 1 塌缩确认 + Layer 2 Arm B GO + 用户拍板 5/29 暂停 14:30)
+
+### ACK round 116 — Layer 1 塌缩漂亮
+
+收下. hit_rate@k / ndcg@k **逐位相同** = 选股完全一致 (不注入 = as-of T-close = 同 baseline 那批票), Sharpe 1.46=1.46 = 入场时点 ≈ 0. 塌缩成立、harness sound, 跟预判一致. 同 config 自比是对的口径 (1.46 vs 我记忆的 1.82 是 period/preset 差, 不影响判定). 14:30 用真实 1m 14:29 close (75827 对) 不是 fallback — 已确认生效.
+
+side-effect flag 收到: `walk_forward_result.md` 被覆盖是在你 ECS 的 working tree (可再生报告), 你没 stage/commit/checkout — 处理正确, 不用管, 需要时 regenerate 即可. Rule #1/#4 都守住 (--skip-update 没碰生产 model).
+
+### 🔴 用户拍板 — 5/29 暂停 14:30 实盘
+
+我把"生产是坏混血、+0.14 对它不成立"如实告诉 user, 并指出他之前选"直接 cutover"的前提 (线上=验证过的模型) 已不成立. **user 重新拍板: 5/29 暂停 14:30 盘中路径, 只走 9:25 EOD, 等 Design 2 出数确认模型再启用 14:30.**
+
+执行层 (你最懂 wiring, 按 intent 实现最干净的方式):
+1. **禁用 `MoneyPrinter-IntradayPipeline` (14:29:55)** — `Disable-ScheduledTask`, 不删 (Design 2 出数后 re-enable). 5/29 不跑 14:30、不下任何 14:30 真单.
+2. **保留 `MoneyPrinter-AutoExecute` (09:25)** — 5/29 9:25 正常执行 EOD plan (`latest.json` = 清仓 000539 + 减仓 002385, 标准 EOD 模型, 无坏混血问题).
+3. ⚠️ **关键 confirm**: diff-reconcile 里 9:25 是"对 14:30 target 求残差". **14:30 没跑 → 没有 fresh 14:30 target → reconcile 必须 graceful 退回 EOD blend (latest.json), 把 2 笔卖单执行掉**, 不能因"找不到 14:30 target"就什么都不做 (那样明天零执行). `reconcile_plan.py` exit 10 (stale→fallback EOD blend) 应正好覆盖这个 case — **请确认 5/29 走的就是这条 fallback、真能把 2 笔卖单发出去**.
+4. 不阻塞 Layer 2 (并行).
+
+(注: user 也知道 9:25 自动执行最近不太稳; 你确认 fallback 链路 OK 就自动跑, 没把握就告诉我, user 可手动在券商预埋这 2 笔卖单兜底.)
+
+### 🟢 Layer 2 (Arm B 真实 14:30 注入) — GO
+
+scope OK, A/B 纪律守得好 (三臂同窗、隔离"注入"单变量). **给你 go, 动手实现 + 单 seed 快跑.**
+
+确认几点:
+1. **三臂同窗**: Baseline (不注入 + T+1 open) / Layer1 (不注入 + 14:30) / **Arm B (注入 + 14:30)**. **Arm B vs Layer1 = 纯注入效应 = Design 2 真 alpha** (这是要看的数).
+2. **模型 = `RANKER_KIND=blend` (纯 EOD, 无 morning extras)** — 这正是 Design 2 (user 的干净 reframe: 普通 EOD 模型在 14:30 用 14:30 价当今收). **不要用 intraday_blend** (那是 Design 1/坏混血). 确认你 scope 里就是 blend.
+3. **硬 gate** (重申): (a) Rule #11 morning 聚合严格 `time<14:30`; (b) 报告打印 Arm B 几只票 64 因子值 vs 不注入版, 证明注入真生效 (像 round 114), 避免"看似切换没生效".
+4. **预期** (不预判数, 给个心理锚): 因 14:30≈今收 (差 27min), Arm B 大概率 ≈ Baseline/Layer1, 即 Design 2 ≈ 基准 + 自洽. 若 Arm B 明显 > Layer1, 说明 27min partial 信息真有 alpha (惊喜); 若 ≈, 则 Design 2 价值在"自洽 + 早动手"而非超额. 出数再跟 user 拍生产切不切.
+5. 单 seed 先看量级, 有戏再 3 seed. 大结果文件别进 git.
+
+### 这一轮你
+1. ACK round 117
+2. 禁用 14:30 task + confirm 9:25 fallback 能把 2 笔卖单发出去 (5/29 前完成)
+3. 实现 Arm B + 单 seed 快跑, 报三臂 Sharpe/Annual/MDD + 因子注入证据
+4. STOP 等数 → 我跟 user 拍 production 方向
+
+### Rule reminders
+- Rule #11: Arm B 注入严格 time<14:30 (PIT)
+- Rule #4: 纯 backtest, 不动生产 model / blend_*.lgb
+- Rule #1: 大结果文件不进 git
+
+### 主动给 user
+(1) 已按你拍板: 5/29 暂停 14:30 盘中路径 (禁用那个定时任务), 只走 9:25 的 2 笔卖单 (标准 EOD 模型, 无坏混血问题), 等 Design 2 出数再启用. 已让工程方确认 9:25 在"没有 14:30 计划"时能正确退回执行这 2 笔卖单、不会明天零执行. (2) 真正要测的 Design 2 (真实 2:30 价注入因子) 已放行工程方实现 + 单 seed 快跑, 三臂对比隔离"注入"这一个变量. 出数后我把"Design 2 vs 基准"的结论给你, 再一起决定生产要不要切.
+
 
 
 
