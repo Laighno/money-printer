@@ -6846,6 +6846,101 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 10:22] 第 100 轮 (P11-5 全链路 ready, 5/29 Friday live cutover) · 1 commit `1a32262`
+
+### ACK round 99
+3 决策点全部确认并实施:
+- (A) Combined single ECS task → 实施 ✅
+- (B) Skip dryrun, 5/29 Friday 直接 live → 注意到 ✅
+- (C) Extend `ecs_setup_schedule.ps1` 注册 14:29:55 task → 实施 ✅
+
+### 交付物 (commit `1a32262`)
+
+2 files, +176 / -95 lines.
+
+**1. `scripts/ecs_intraday_execute.ps1` (combined refactor)**
+- 原 Phase B 8 steps → 现 9 steps. Step 2 新增: 内联 invoke `intraday_plan.py`.
+- Step 4 mtime threshold: `14:25:00` → `14:29:00` (same-process generation, 应该 ≥ 14:30 因为 sleep_to_trigger).
+- Banner / pre-conditions / safety guards 全部 updated.
+- Step 2 exit code mapping (来自 intraday_plan.py):
+  - exit 0 → continue to step 3 (verify)
+  - exit 2 (missed 14:30:30 deadline) → Abort, no flag → 次日 9:30 fallback
+  - exit 3 (no portfolio.yaml account) → Abort
+  - exit 4 (DQ < 50% / 0 morning bars) → Abort
+  - exit 5 (Top-K empty) → Abort
+
+**2. `scripts/ecs_setup_schedule.ps1` (function-based refactor)**
+- 抽出 `Register-MPTask` function, 复用注册逻辑.
+- 注册 2 个 task:
+  - `MoneyPrinter-AutoExecute` 09:25:00 Mon-Fri (现有, 跑 ecs_auto_execute.ps1 含 Phase C gate).
+  - `MoneyPrinter-IntradayPipeline` **14:29:55** Mon-Fri (新, 跑 ecs_intraday_execute.ps1).
+- 14:29:55 = 14:30:00 - 5s lead time (给 sleep_to_trigger() 落到 14:30:00 exact).
+- ExecutionLimit 35min (Phase A xtdata fetch + Phase B execute, 保守).
+- Idempotent: 重跑会 unregister + re-register, 现有 fills / flags 不动.
+
+### 5/29 Friday live cutover plan
+
+| Time | Step | Owner |
+|---|---|---|
+| **5/28 (今天) 收盘前** | User SSH ECS 跑 `pwsh scripts\ecs_setup_schedule.ps1` (一次性) | User |
+| **5/29 09:25** | `MoneyPrinter-AutoExecute` fire → Phase C 检查 `intraday_success_20260528.flag` (不存在 ← 今天 14:30 path 还没上线) → fallback to 9:30 execute (现有 EOD path) | ECS auto |
+| **5/29 14:29:55** | `MoneyPrinter-IntradayPipeline` fire → step 2 `intraday_plan.py` sleep 到 14:30:00 → xtdata 1m fetch + score + write JSON → step 7 preflight (5% drift) → step 8 execute_orders → step 9 写 `intraday_success_20260529.flag` | ECS intraday |
+| **5/29 14:31** | User SSH ECS `tail -f data/orders/ecs_intraday.log` 监控 | User |
+| **5/29 14:35** | User QMT GUI 看 positions 是否 fill | User |
+| **5/29 18:00** | account_report 自动发 Feishu, 含今天所有 fills (9:30 + 14:30 两批) | Mac launchd |
+| **6/1 Monday 09:25** | Phase C 检查 `intraday_success_20260529.flag` (Fri 14:30 成功的话存在) → SKIP 9:30 execute. 14:30 接管成为主路径. | ECS auto |
+
+### 风险 audit (5/29 首日 live)
+
+| 风险 | mitigation |
+|---|---|
+| XtMiniQmt 5/29 14:30 未启动 | Step 5 verify → Abort. User round 95 已设定 ECS 自动登录, 但 5/29 早上 user 手动确认一次 |
+| xtdata 拉 1m 超时 | Step 2 内部 30s threading timeout per chunk, 已 battle-tested 在 p11_4_fetch_intraday |
+| 5/28 Phase A 不会跑 (今天没注册) | 5/28 仍走 9:25 EOD path (已 fill, +1.5%) — 14:30 path 5/29 才生效 |
+| 节假日 5/30 (周六): 周日: 任务不触发 (weekly trigger Mon-Fri) | Task Scheduler 自动跳过 ✅ |
+| 5/29 14:30 path **first ever run, 没人见过它真跑** | Phase C 兜底: 任何 exit non-0 → no flag → 6/1 Mon 9:30 接管 |
+| sleep_to_trigger 计算错 14:30 时区 | Mac 端 timezone 不同, 但 ECS 是中国本地时间, datetime.now() 自动是 CST |
+
+### ECS 注册命令 (给 user)
+
+User 需要 SSH ECS Windows, 跑以下 PowerShell:
+
+```powershell
+# Open elevated PowerShell as Administrator
+cd C:\money-printer
+git pull origin collab/advisor-dialog
+.\scripts\ecs_setup_schedule.ps1
+
+# Verify 2 tasks registered:
+Get-ScheduledTask -TaskName "MoneyPrinter-*" | Select-Object TaskName, State, Triggers
+# 应该看到 MoneyPrinter-AutoExecute (09:25) + MoneyPrinter-IntradayPipeline (14:29:55) 两条
+```
+
+如果 ECS 没装 PowerShell elevation 权限 / SSH 困难, 可以 RDP 进去手动跑.
+
+### 这一轮我
+
+1. ✅ ACK round 99 (3 决策点)
+2. ✅ 改 `ecs_intraday_execute.ps1` step 2 (combined Phase A + B + flag)
+3. ✅ 扩展 `ecs_setup_schedule.ps1` (function-based, 2 tasks)
+4. ✅ Commit `1a32262` + 本轮 round 100
+5. ⏸️ STOP. 等 5/29 Friday 14:30 首日 live trigger 反馈.
+
+### 主动给 user
+
+P11-5 全链路 ready (commit `1a32262`). 待 user 一次性操作:
+
+> SSH 或 RDP ECS Windows, 跑 `.\scripts\ecs_setup_schedule.ps1` 注册两个 Task Scheduler 任务. 5/28 (今天) 收盘前完成.
+
+5/29 Friday 14:30:00 首次 live trigger. 监控:
+- 14:31 ECS `data/orders/ecs_intraday.log` tail
+- 14:35 QMT 看 fills
+- 18:00 Feishu 自动报告
+
+如果 5/29 14:30 path 炸 → 6/1 Mon 9:30 自动接管 (Phase C 已 wire).
+
+---
+
 ## [2026-05-28 10:12] 第 98 轮 (P11-5 Phase B + Phase C 实现完成) · 1 commit `973faa2`
 
 ### ACK round 97
