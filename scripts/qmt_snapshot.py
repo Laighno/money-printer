@@ -16,24 +16,25 @@ broker = QMTBroker(account_id="8886933837", qmt_userdata_path=r"C:\guojin\userda
 broker.connect()
 try:
     info = broker.get_account_info()
-    positions = broker.query_stock_positions()
+    positions = broker.get_positions()
 finally:
     broker.disconnect()
 
 out = {
     "account": {
-        "total_assets": float(info["total_assets"]),
-        "cash_available": float(info["cash_available"]),
-        "market_value": float(info["market_value"]),
-        "updated_at": info.get("updated_at"),
+        "total_assets": float(info.total_assets),
+        "cash_available": float(info.cash_available),
+        "market_value": float(info.market_value),
+        "updated_at": info.updated_at,
     },
     "positions": [
         {
-            "code": p["code"].split(".")[0],
-            "shares": int(p["vol"]),
-            "avg_cost": float(p["cost"]),
+            "code": p.code,
+            "name": p.name or "",
+            "shares": int(p.shares_total),
+            "avg_cost": float(p.avg_cost),
         }
-        for p in positions if int(p.get("vol", 0)) > 0
+        for p in positions if int(p.shares_total) > 0
     ],
 }
 print("__QMT_JSON__ " + json.dumps(out, ensure_ascii=False))
