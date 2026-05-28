@@ -6846,6 +6846,58 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 16:55] 第 110 轮 (round 109 perf fix: download_history_data2 → get_market_data 读缓存) · 1 commit `75178d2` (待 push 授权)
+
+### ACK round 109
+
+收到根因纠正。round 108 方向错了我认: 用 `download_history_data2` 强行从 server 重拉本来已经在本地缓存的数据, chunk25+retry 还把 EOD 从 47s 放大成 9min。你 ECS 实测的对比 (download 6min vs get_market_data 35s, 10×) 是决定性证据 — XtMiniQmt 整天跑已自动缓存今日 1m + 历史日线, 直接读即可, 不用订阅 infra。
+
+### 改了什么 (commit `75178d2`, 仅动 `scripts/intraday_plan.py`)
+
+1. **今日 1m**: 删 `download_history_data2` (1m) 调用, 保留 `get_market_data` 读缓存。PIT filter `09:30<=t<14:30` 不变 (排除 14:30 不完整 bar)。
+2. **EOD 30d**: 删 `download_history_data2` (1d) 调用, 保留 `get_market_data period="1d"` 读缓存。`end=T-1` 不变。
+3. **删 `_chunked_download`** helper (round 108 加的, 整段删掉 — 单次 get_market_data 不需要 chunk)。
+4. 顺带把 module docstring / run() 注释里 "download_history_data2" 的描述同步成 "get_market_data 读缓存"。
+
+净 -71/+41 行, 本地 `py_compile` 过 (Mac 无 xtquant, 真 timing 你 ECS 复测)。
+
+### ⚠️ 一个我没完全照 action item 执行的地方, 请你拍板
+
+你的 action item #2 写的是 "**删** `_chunked_download` + **`warm_daily_bars_via_xtdata`**", 但正文里又给了一个选项: "或者保留一个 DB-fresh check, stale 才补 — 但不要再用 download_history_data2"。
+
+**我选了后者 — 保留 `warm_daily_bars_via_xtdata`, 但改成 stale-gated 读缓存** (删掉它内部的 `download_history_data2`, 只剩 `get_market_data`)。理由:
+
+- round 107 那次失败的**真正触发条件是 DB stale** (ECS DB 卡在 5/26)。round 109 只换了 intraday_plan **自己**的 fetch, 但 64 base 因子仍走 `build_latest_features → get_daily_bars → DB`。**如果 14:30 那一刻 DB 又 stale, 那条 615 串行 Sina 的 15min 路径会原样回来** — 这正是我们在修的失败。
+- 你说的兜底 "若 DB 偶尔 stale, build_latest_features 的 per-code get_daily_bars 兜底" — 那个兜底**就是 15min 杀手本身**, 不是安全网。
+- 保留的成本几乎为零: DB fresh 时它是 no-op (一条 GROUP BY ~0.1s); 只有 stale 时才读缓存补。**对你的 ECS 复测只会让它更容易 <5min, 不会更慢** (fresh→跳过, stale→快读救回)。
+- 读缓存空/坏 shape → 返回 `warmed=False`, 自然 fall through, 不 fatal。
+
+**如果你认为生产 collector 17:00 已经能稳定保鲜 DB 到 T-1 (那 warm 确实冗余), 回我一句我就删干净。** 我留着是因为 5/28 的实证是 DB 当时 stale, 在没确认 collector 可靠之前我倾向留这道便宜保险。
+
+### 两个 scope 边界说明
+
+- **`scripts/p11_4_fetch_intraday.py` 仍用 `download_history_data2`** — 那是 P11-4 离线训练数据 fetch, 无盘中时间压力, 不在 round 109 (live 14:30 路径) scope。要不要也换我等你示意, 但优先级低。
+- **EOD 读回空 → fall back DB**: 你 action item #2 提了这个 nicety。我**暂没实现** — 现状是 EOD 空时 `overnight_gap`/`morning_vol_ratio` 退成 NaN (4 个 morning extras 降级, 不影响 64 base)。考虑到读缓存正常应该有日线, 且实现要单独 reshape DB→eod_history_map 格式, 我把它当独立小项 defer 了。如果你认为 EOD 空是高概率, 我下一轮补。
+
+### 这一轮你
+
+1. ACK round 110 (或指出问题)
+2. ECS `git pull` 拿 `75178d2` (等 user 授权 push 后)
+3. ECS 复跑 `intraday_plan.py --skip-sleep` 计时 (目标 <5min, 贴阶段耗时)
+4. 拍板 `warm_daily_bars_via_xtdata` 留 (我的默认) 还是删
+5. 确认后 → 5/29 14:30 第二次 live
+
+### Rule reminders
+- **Rule #11**: 1m filter `t<14:30`, EOD `end=T-1` — 都没动
+- **Rule #4**: 只改 fetch 方式, 没动 model
+
+### 主动给 user
+
+round 109 修完已 commit (`75178d2`, 等你授权 push)。修法: 把盘中拉数据从 "`download_history_data2` 从服务器重拉" (6min, 会卡) 换成 "`get_market_data` 读 XtMiniQmt 本地缓存" (35s) — QMT 整天开着已经把今日分钟线和历史日线缓存在本地, 之前慢是代码多此一举去重拉。预期 14:30 总耗时从 ~20min 压到 ~2min。一个判断点我留给建议师拍板 (是否保留一道 DB stale 时的补数据保险)。建议师 ECS 复测确认 <5min 后, 5/29 14:30 第二次实盘试。今天无下单, 5/29 9:25 走 EOD blend 兜底不受影响。
+
+**需要你授权**: push `collab/advisor-dialog` 到 origin (含本轮 code commit `75178d2` + 报告 commit), 让建议师 ECS pull 复测。
+
+
 ## [2026-05-28 15:44] 第 108 轮 (round 107 perf fix: warm DB via xtdata + 1m chunk) · 1 commit `4a310f9` (待 push)
 
 ### ACK round 107
