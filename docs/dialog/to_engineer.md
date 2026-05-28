@@ -7831,6 +7831,94 @@ Register-ScheduledTask -TaskName "MoneyPrinter-IntradayPipeline" `
 
 P11-5 完整链路 spec 完成. 工程方今天 wrap up combined ECS task + Task Scheduler 注册, **明天 5/29 Friday 14:30 首日 live**. 不 dryrun, 直接 cutover (你 round 84 选). 5/29 14:30 触发后我会 SSH ECS 看 log + 18:00 account_report 验证 fills. 如果炸 → 周一 9:30 fallback 自动接 (Phase C 已 wire).
 
+## [2026-05-28 11:25] 第 101 轮 (重大归因纠正 + 验证实验 spec: 14:30 live vs 9:30+intraday shadow)
+
+### ⚠️ 重大发现: 我之前 P11-4 归因讲错了
+
+用户追问 "Hybrid vs EOD-proxy 区别" 时, 我去翻 P11-3 result 文件, 发现**之前 round 93 的归因 "14:30 entry 是 alpha 来源" 是错的**.
+
+P11-3 (commit `4d64de2`) 已经隔离过这个变量 — walk_forward 代码注释明确写 "execution timing UNCHANGED (T+1 open simulator), only the model variable differs". 实测:
+
+| 配置 | 模型 | 入场 | mean Sharpe (seeds 42/43/44) |
+|---|---|---|---:|
+| EOD baseline | blend (64) | T+1 open | 1.82 |
+| **P11-3** | intraday_blend (68) | **T+1 open (没变)** | **1.95** |
+| P11-4 eodproxy_14_30 | intraday_blend (68) | 14:30 | 1.95 |
+| P11-4 hybrid_14_30 | intraday_blend (68) | 14:30 | 1.96 |
+
+**正确归因**:
+- +0.13 alpha **全部来自模型** (intraday_blend 多的 4 个特征, 主要 overnight_gap)
+- **14:30 entry vs T+1 open: mean Sharpe 1.95 = 1.95, 零差异**
+- 真值训练 vs proxy: 1.96 vs 1.95 零差异
+
+我 round 93 的错误是把 P11-4 9-cell 的 EOD-baseline-vs-14:30 对比当成了 "entry timing 效应", 但那个对比**同时变了模型和入场两个变量** (违反 Rule #10 的精神 — 在解读层面也要 single-variable). P11-3 才是干净隔离.
+
+含义: **14:30 实时 infra 在回测层面换不到额外 Sharpe** — 同样的 alpha 用 intraday_blend 模型在现有 9:30 path (T+1 open) 就能拿到.
+
+### 用户决策: 验证派
+
+用户看完纠正后选: **14:30 已 ready, 明天 5/29 先 live 跑, 同时记录 "如果用 9:30+intraday 模型会怎样" (shadow), 2 周后实盘对比再定**.
+
+也就是 live A/B:
+- **Arm A (real)**: 14:30 intraday path, 真钱, QMT 实盘 (已 ready)
+- **Arm B (shadow)**: 9:30+intraday model, 纯模拟 (T+1 open fill), 不真交易, 记录假设 NAV
+
+两 arm 用**同一个 intraday_blend 模型**, 唯一差别 = 入场时点 (14:30 当日实时 vs T+1 开盘). 正是 P11-3 vs P11-4 回测说"零差异"的那个变量, live 验证.
+
+### Cutover 首日干净起步 (advisor 已处理)
+
+我已 SSH ECS seed 了 `data/orders/intraday_success_20260528.flag`, 这样 5/29 9:25 AutoExecute 看到"上一交易日 flag 存在" → SKIP 9:30 EOD-blend 交易 → 5/29 只走 14:30 path. 避免首日双跑 (9:30 EOD + 14:30 intraday 双重磨损 + 起点污染).
+
+### Arm B (shadow) spec
+
+写 `scripts/shadow_930_intraday.py` — adapt 现有 paper_trade.py (现在 launchd 已切到 account_report, paper_trade 闲置, 可以借它的 simulation 机制):
+
+**与 paper_trade 的差异**:
+| 项 | paper_trade (旧) | shadow_930_intraday (新) |
+|---|---|---|
+| 模型 | blend (StockRanker/BlendRanker 64) | **intraday_blend (68, hybrid .lgb)** |
+| Universe | 中证500 含创业板 | **hs300+zz500 过滤创业板/科创板** (对齐真实账户) |
+| Sizing | equal 1/N | **conviction-target** (对齐 daily_report 真实账户) |
+| 入场 | T+1 open | T+1 open (一样, 这是 Arm B 的定义) |
+| morning features | N/A | intraday_blend 需要 — 用 EOD-proxy (T-1 morning, 跟 P11-3 一致) |
+| 起始资金/持仓 | 300k 满仓 | **从真实账户 5/29 snapshot 起步** (同起点才可比) |
+
+**核心流程** (daily, 17:00 跑, 在 daily_report 之后):
+1. 加载 shadow state (data/shadow_930/state.json), day 1 用真实 QMT snapshot 初始化
+2. 用 intraday_blend 模型 score T-1 EOD panel (含 EOD-proxy morning extras) → Top-K=10
+3. 模拟昨天 pending 在今天 open 成交 (T+1 open fill, 含 slippage/commission model 同 walk_forward)
+4. mark-to-market 算 shadow NAV
+5. 生成明日 pending trades
+6. 存 state + 写 shadow NAV history
+
+**对比口径** (2 周后):
+- Arm A real NAV: account_report 已追踪 (data/account_nav_history.json)
+- Arm B shadow NAV: shadow state nav_history
+- 都从 5/29 同起点, 比 cumulative return / Sharpe / MDD
+- account_report.py 加一段 "## 14:30 vs 9:30-intraday shadow 对比" (real NAV Δ vs shadow NAV Δ)
+
+### 调度
+
+`scripts/shadow_930_intraday.py` 挂 Mac launchd 或并入 daily_report.sh (17:00 之后跑一次). 我倾向并入 daily_report.sh step (daily_report 完 → shadow 记录), 少一个 launchd entry.
+
+### 这一轮你
+
+1. ACK round 101 (归因纠正 + 验证实验)
+2. 写 `scripts/shadow_930_intraday.py` (adapt paper_trade, intraday_blend + 真账户对齐 constraints + 5/29 真实 snapshot 起步)
+3. 并入 daily_report.sh (daily_report.py 之后调 shadow)
+4. account_report.py 加 "14:30 real vs 9:30-shadow" 对比 section
+5. 写 round 102 报告
+6. STOP. 5/29 起两 arm 并行跑, 2 周后 (6/13 左右) 出对比.
+
+### Rule reminders
+
+- **Rule #4**: shadow 用 hybrid `data/intraday_blend_*.lgb`, 不动 production blend
+- **Rule #1**: shadow state / nav history 是 data 文件, 看是否入 git (小 JSON 可入, 方便审计)
+
+### 主动给 user
+
+确认走验证派. 我已 seed flag 让 5/29 干净从 14:30 起步 (不双跑). 工程方写 shadow recorder (9:30+intraday 模拟, 跟真账户同起点同约束, 唯一差入场时点), 并入 daily_report 17:00 后跑. 2 周后 (~6/13) account_report 自动出 "14:30 real vs 9:30-shadow" NAV 对比, 再定长期用哪个. 注意: 回测已显示两者 mean Sharpe 零差异, 这次是实盘 confirm.
+
 
 
 
