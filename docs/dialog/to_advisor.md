@@ -6846,6 +6846,58 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 20:35] 第 114 轮 (🛑 STOP: EOD 因子缓存的前提不成立 — 64 因子不是 T-1 静态, 会改预测) · 0 commit code (仅本报告)
+
+### ACK round 113 复测确认
+
+round 112 ECS 复测干净: fetch 20s + 0 次逐只拉日线 (T-1 锚定生效) + 0 次 financial EM (80 天 gate 生效), 总 6min26s, 两大网络杀手彻底消除。收到。
+
+### 🛑 但 EOD 因子缓存这一轮我没实现 — 前提不成立, 会违反"零预测影响"硬要求
+
+round 113 的核心假设: "64 个 EOD 因子在 T-1 17:00 算 vs T 14:30 算, 数学上一致 (都 as-of T-1 close)"。**这个假设是错的。** 我在实现前验证了代码路径 + 实测, 发现:
+
+**生产 14:30 路径把今日 14:30 的盘中 bar 注入进 64 因子里**:
+- `intraday_plan.score_universe` → `build_intraday_panel(intraday_bars=...)` → `build_latest_features(intraday_bars=...)` → `_process_single_stock` 在 [dataset.py:707-722] 把今日 14:30 的 OHLCV **作为合成 bar 接在 T-1 之后**, 然后 64 个技术因子 ([dataset.py:737] `_compute_technical_factors`) 在**含这根 14:30 bar 的序列**上计算。`build_latest_features` 取 `iloc[[-1]]` = 这根 14:30 合成 bar 的因子行。
+- `intraday_features.py` docstring 自己也写明: "FACTOR_COLUMNS (64): ... computed on a synthetic EOD panel where today's T 14:30 OHLCV is appended as a synthetic bar"。
+
+而 daily_report 的 EOD run (`run()`, 不传 intraday_bars) 算的是 **as-of T-1 close 的纯 EOD 因子, 没有这根合成 bar**。所以 **缓存的 EOD 因子 ≠ 生产 14:30 的 64 因子**。
+
+**实测证据** (Mac, codes=600519/000001/600036, asof_eod=5/27, 注入 5/28 bar):
+
+| code | factor | EOD缓存(T-1) | 生产intraday(注入14:30) | 差? |
+|---|---|---|---|---|
+| 600519 | rsi_14 | 34.158 | 29.121 | **YES** |
+| 600519 | close_ma5_dev | +0.00797 | **−0.00755** | **YES (符号翻转)** |
+| 600519 | mom_20d | −0.1066 | −0.0907 | YES |
+| 600519 | boll_pctb | 0.241 | 0.111 | YES |
+| 000001 | close_ma5_dev | +0.00354 | **−0.00504** | **YES (符号翻转)** |
+| 600036 | rsi_14 | 25.05 | 29.34 | YES |
+
+panel 的 `date` 列也证实: EOD 缓存 = **2026-05-27**, 生产 intraday = **2026-05-28**。**所有因子都不同, 短周期因子 (close_ma5_dev) 连符号都翻转。**
+
+→ 如果用 daily_report 的 EOD panel 当缓存, 等于把 64 因子冻结在 T-1, **丢掉 14:30 重算** —— 而 14:30 重算正是 P11 的 alpha 来源 (技术因子在 14:30 重新评估)。这不是 ~0 影响, 是把策略核心改掉。**违反"缓存路径 score == 全量路径 score"的硬 gate。** 所以我停下来没实现, 先报告。
+
+### 顺带发现 (train/inference 时点一致性, 可能更深的问题)
+
+`train_intraday.py:434` 用 `build_dataset` 建训练 64 因子 (纯 EOD 序列, **不注入** 盘中 bar), 然后 `attach_intraday_extras` 单独贴 4 个 morning extras。而生产 inference **注入** 14:30 bar 进 64 因子。也就是说训练的 64 因子 as-of 每日 full close, 推理的 64 因子 as-of 14:30 partial —— 这俩时点语义本就不同。这是**既有的** train/inference 因子时点差异, 不是这轮引入的, 但既然挖到了一并 flag, 你判断要不要单独立项查 (可能影响 P11 模型本身的正确性, 跟缓存优化是两件事)。
+
+### 我的建议
+
+1. **6min 已可行**: 你 round 113 自己说 "6min 落在 14:30→15:00 窗口内, 已可行"。两大网络杀手已除, 6min 是纯 CPU 因子计算。**最简单的路: 不做缓存, 直接用 round 112 的 6min 路径上 5/29 14:30 live。**
+2. **若仍想压到 <2min (零影响版)**: 6min 是 `build_latest_features` 对 615 只**逐只串行**算因子 (每只独立)。用 `multiprocessing.Pool` 按 code 分片到 ECS 4 核 → ~4× → ~1.5min。**因子数学完全不变 → 预测 bit-identical → 真零影响**。这是对的优化方向 (而不是缓存 T-1 因子)。我可以实现这个。
+3. **缓存 EOD 因子的路子放弃** (除非你想改 P11 设计让 64 因子不注入盘中 bar —— 那是改策略, 要重训 + 重跑 walk-forward, 不是性能优化)。
+
+### 这一轮你 (需要你/用户拍板)
+1. 确认放弃 EOD 因子缓存 (前提不成立, 会改预测)
+2. 选: (a) 6min 直接上 live (最简), 还是 (b) 我做 multiprocessing 并行 (零影响, ~1.5min)
+3. (可选) train/inference 因子时点差异是否单独立项
+
+我 STOP 等你决定, 不擅自往下做 (这反转了你 round 113 approved 的方案, 且 user 明确要"零影响")。
+
+### 主动给 user
+建议师 round 113 的"缓存 T-1 因子省 6min"方案, 我在动手前验证发现前提不成立: 系统在 14:30 算因子时, 会把**当天下午 2:30 的盘中价**当成最新一根 K 线接进去再算 64 个技术指标 —— 这正是 P11 在 14:30 重新预测的 alpha 来源。而 daily_report 昨天 17:00 算的因子用的是**昨收**, 没有今天 2:30 的价。实测三只票所有因子都不同, 连短周期均线偏离的**正负号都翻转**。所以"复用昨天的因子"会偷偷把模型看到的数据从"今天 2:30"换成"昨收", 等于改掉策略本身, 不是无影响的提速。建议: (a) 6min 其实已经够用 (落在 2:30-3:00 窗口内), 直接上 5/29 实盘; 或 (b) 我用多核并行把这 6min 的纯计算压到 ~1.5min, 结果跟现在**逐位一致**。已 STOP 等你和建议师定。
+
+
 ## [2026-05-28 17:50] 第 112 轮 (round 111 fix: T-1 锚定消除 wall-clock + financial 80 天 gate) · 1 commit `76c59f0` (已 push)
 
 ### ACK round 111
