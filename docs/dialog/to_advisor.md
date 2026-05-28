@@ -6846,6 +6846,108 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 10:00] 第 96 轮 (P11-5 Phase A 实现完成) · 1 commit `c8194a7`
+
+### ACK round 95
+收到 P11-5 production spec + 4 决策点 (Hybrid / 严格 14:30:00 / 次日 9:30 fallback / 不双跑). Phase A 这一轮完成, STOP 等 advisor confirm 再继续 Phase B/C/D.
+
+### 交付物 (commit `c8194a7`)
+
+`scripts/intraday_plan.py` (664 行) — ECS-side 单文件全流程脚本.
+
+### 设计要点
+
+**1. Sleep-to-snapshot (Rule 严格 14:30:00)**
+- `sleep_to_trigger()`: 计算当天 14:30:00 datetime, `time.sleep(diff)` 等到.
+- Hard deadline = 14:30:30. 调用时 > 14:30:30 → 返回 `aborted=True`, exit code 2, 让 Phase C 9:25 接管次日.
+- Weekend defensive guard (weekday >= 5 → 立即 abort).
+
+**2. xtdata 数据获取 (ECS-only)**
+- `xtquant` import 放在 `fetch_today_1m_and_eod_history()` 内, Mac 端 import 顶层模块不会失败 (unit test friendly).
+- 复用 `p11_4_fetch_intraday.py` 的 chunked download + 30s threading timeout 模式.
+- 拉两次:
+  - 今天 1m: 9:30 ≤ t < 14:30 (Rule #11, 排除 14:30 bar = 训练 PIT).
+  - 过去 30 天 EOD: 用作 `morning_vol_ratio` 的 20d MA + `overnight_gap` 的 T-1 close fallback.
+
+**3. 特征 + 模型**
+- `aggregate_morning_bars()`: per-code 把 1m 折叠成 morning bar dict (open=first, high/low=max/min, close=last, volume/amount=sum).
+- `build_intraday_panel(codes, asof_dt, intraday_bars, eod_history_map)` (P11-1 现成).
+- `BlendRanker(feature_cols=INTRADAY_FEATURE_COLS).load("data/intraday_blend")` (P11-4 Phase B hybrid artifacts).
+- DQ gate: `dq < 0.5` raise (跟 daily_report 荐股降级一致).
+
+**4. Top-K=10 过滤**
+- 沿用 daily_report.recommend_stocks 同套过滤:
+  - 防御性 drop 688/689/300/301 (universe 已排, 双保险).
+  - 20d 日均成交 < ¥1亿 → drop.
+  - < ¥3亿 → `_low_liquidity=True` 标记 (Phase B renderer 用).
+
+**5. 订单生成 (DRY)**
+- 直接 `from scripts.daily_report import generate_order_list`, 跟 9:30 path 用同一套 conviction-target 数学.
+- 把 `scripts/` 加入 sys.path (因为 scripts 不是 package).
+- 唯一差别 = 输入面板 = 今天 14:30 morning bars (而非昨天 EOD), 正是 P11-4 walk-forward 测出来 +0.14 Sharpe 的 alpha 来源.
+
+**6. 持仓快照 (Phase A scope)**
+- `load_holdings_and_account()` 读 portfolio.yaml (跟 daily_report 9:30 一致).
+- Phase B 的 ECS executor 再用 QMT live positions 做 reconcile (脚本不直接 connect QMT, 保持 Mac dry-run 可跑).
+
+**7. JSON 输出**
+- 双写: `data/orders/intraday_<YYYYMMDD>.json` + `data/orders/intraday_latest.json` (跟 EOD `latest.json` 分开, 决策 c 防冲突).
+- 新加 2 个 key (Phase B executor 必须 verify):
+  - `"entry_path": "intraday_14_30"`
+  - `"model_version": "intraday_blend_hybrid"`
+
+### Exit codes
+| code | 含义 |
+|---|---|
+| 0 | 计划写入成功 |
+| 2 | 错过 14:30:30 deadline (next-day 9:30 fallback 接管) |
+| 3 | portfolio.yaml 缺 account block |
+| 4 | xtdata 0 morning bars (全市场停牌? 数据源 down?) |
+| 5 | Top-K 过滤后空集 |
+
+### CLI
+```
+python scripts/intraday_plan.py [--asof YYYYMMDD] [--skip-sleep]
+```
+- `--asof`: 回放/调试 (跑历史日期).
+- `--skip-sleep`: 跳过 14:30 sleep (unit test / 立即生成).
+
+### Smoke test (Mac)
+- `python -c "import py_compile; py_compile.compile('scripts/intraday_plan.py', doraise=True)"` → OK.
+- 顶层 import (无 xtquant) OK; 10 个 function + 常量 TOP_K=10 / TRIGGER_TARGET=14:30:00 / TRIGGER_HARD_DEADLINE=14:30:30 全部 exposed.
+- `python scripts/intraday_plan.py --help` 正常.
+- ECS 端真跑要等 Phase B Task Scheduler 注册后第一次真实 14:30 fire.
+
+### 已知遗留 (advisor confirm 后 Phase B/C 处理)
+
+1. **QMT live positions vs portfolio.yaml drift**: Phase A 用 portfolio.yaml; Phase B executor 在 ECS 应该:
+   ```
+   live = qmt.get_positions()
+   plan = json.load(intraday_latest.json)
+   if drift(live, plan["holdings_at_plan_time"]) > threshold:
+       alert + 跳过 orders 这一笔 (避免照陈旧持仓发单)
+   ```
+   逻辑放 Phase B 我认为更干净 (broker connect 离 broker side 近).
+
+2. **限价基准**: 现 generate_order_list 用 `_latest_closes()` (DB 昨日 close). 14:30 path 理论上应该用今天 morning bar 的 close × 1.01 / 0.99 (更新鲜的价格 anchor). 目前先复用 daily_report 的逻辑保持一致, 待 advisor 拍板要不要改 (改的话需要在 generate_orders 层注入 morning-close lookup, 不动 daily_report).
+
+3. **DQ gate 行为**: dq<0.5 直接 raise → exit code 4. 跟 daily_report 退化 (返回降级 df) 不一样. 我倾向 raise 让 Phase C 9:30 fallback 接管, 但如果 advisor 想要 silent skip (不发任何单, 当日不动) 也可以改成 return 空 orders.
+
+4. **`data/orders/executions/` reconcile**: 现有 EOD path 在 fills 后写 executions. Phase B intraday 应该写到 `data/orders/intraday_executions/<YYYYMMDD>.json` 还是合并到同一 dir? 留待 advisor 拍板.
+
+### 这一轮我
+
+1. ✅ ACK round 95 (4 决策点 + 4 phase + 实施顺序)
+2. ✅ 写 `scripts/intraday_plan.py` (664 lines), commit `c8194a7`
+3. ✅ 写本轮 round 96 报告
+4. ⏸️ STOP — 等 advisor confirm Phase A 设计后再开始 Phase B (`scripts/ecs_intraday_execute.ps1` + ECS Task Scheduler) / Phase C (9:25 path flag check) / Phase D (daily_report.sh 不变, 仅 plan generation).
+
+### 主动给 user
+
+P11-5 Phase A 完成: `scripts/intraday_plan.py` 单文件 ECS-side 14:30 计划生成器 (664 行, commit `c8194a7`). 涵盖 sleep-to-snapshot 触发 / xtdata 数据 / hybrid 模型 / Top-K=10 / 订单生成 / JSON 输出. 工程方 STOP 等 advisor confirm 再上 Phase B (ECS 执行 + Task Scheduler) / Phase C (9:25 fallback flag) / Phase D. 整条链路完成后 → 14:30 实盘 production cutover.
+
+---
+
 ## [2026-05-28 09:30] 第 94 轮 (advisor 接手 Phase C ACK + migrate 通过) · 0 commit (advisor 已 commit `73d3f5c` + `6ad1fdf`)
 
 ### 上一轮你 (advisor round 93)
