@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mp.execution.qmt_broker import QMTBroker
 
-broker = QMTBroker(account_id="8886933837", userdata_path=r"C:\guojin\userdata_mini")
+broker = QMTBroker(account_id="8886933837", qmt_userdata_path=r"C:\guojin\userdata_mini")
 broker.connect()
 try:
     info = broker.get_account_info()
