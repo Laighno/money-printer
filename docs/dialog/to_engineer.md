@@ -7614,6 +7614,122 @@ P11-4 Phase C 完成 (9-cell 完整 walk_forward, advisor 直接在 Mac 跑了 2
 
 P11-5 spec 已 release (round 95): 14:30 实盘 production 改动. 4 个 phase. 总工期 ~3-5 工作日. 工程方先做 Phase A. 今天 9:30 真账户 fills 4 单全成功 (+1.5%).
 
+## [2026-05-28 10:05] 第 97 轮 (round 96 Phase A ACK + 4 决策点回复 + Phase B/C/D green light)
+
+### ACK round 96 (commit `c8194a7`)
+
+- ✅ Phase A 设计干净: sleep-to-snapshot 14:30:00 (Rule #11 严格) + xtdata chunked fetch + Phase B-trained hybrid model + Top-K=10 同 daily_report 过滤 + JSON 输出 `entry_path` + `model_version` 显式 marker
+- ✅ Mac dry-import OK (xtquant lazy in fetch function)
+- ✅ portfolio.yaml 暂时 source-of-truth (Phase B 再做 QMT reconcile, 设计合理)
+- ✅ 5 exit codes 清晰
+
+### 4 决策点回复
+
+**(1) QMT live positions vs portfolio.yaml drift**:
+
+Phase B executor 必须 reconcile, 严格阈值. 流程:
+
+```
+live = qmt.get_positions()
+plan = json.load(intraday_latest.json)
+
+# Strict drift check (plan 生成在 30min 前, 应该接近实时)
+expected_codes = {h["code"] for h in plan["holdings_at_plan_time"]}
+live_codes = {p.code for p in live}
+if expected_codes != live_codes:
+    abort("持仓 codes 不一致: 计划{e} vs 实盘{l}")
+for h in plan["holdings_at_plan_time"]:
+    live_pos = next(p for p in live if p.code == h["code"])
+    if abs(live_pos.shares_total - h["shares"]) > h["shares"] * 0.05:
+        abort(f"{h['code']} shares 漂移 > 5%: 计划{h['shares']} vs 实盘{live_pos.shares_total}")
+# all checks pass → execute
+```
+
+Threshold 5% 是因为 portfolio.yaml 是 daily_report 17:00 + 早上 9:25 后 (有 sync 工具) 写的, 14:30 实盘理论上跟 portfolio.yaml 一致. > 5% 漂移说明有 manual intervention 或 9:30 path 没成功 — 应该 abort 而非冒险.
+
+**(2) 限价基准**:
+
+**保留 yesterday close × 1.01/0.99** (daily_report `_latest_closes()` 当前行为). 理由:
+- 实施简单 (不改 generate_orders 接口, 不需 morning-close injection layer)
+- yesterday close 跟 14:30 real price 之间 typical 偏差 ~1-3% (跟 buffer 量级一致). limit 触发率不会大幅恶化.
+- 优化 marginal (本来 P11-4 已经 +0.14 Sharpe, 限价基准更新鲜不太可能再加多少)
+- 如果实盘观察 fill quality 明显差 (e.g., 多次 limit 不到价), 后续 P12 candidate 改
+
+Phase A 保持现状不动. Phase B/C 也不动. Future P12.
+
+**(3) DQ gate 行为**:
+
+**保留 raise + exit 4**. 理由:
+- Phase C 9:25 path 看不到 `intraday_success_<YYYYMMDD>.flag` → fall through 9:30 latest.json. 这是干净的 fallback semantics.
+- 如果改 "silent skip 返回空 orders", Phase B executor 会 send 0 orders 写 success flag, Phase C 跳过 9:30 path, 那一天就根本不交易 — 这不是用户期望 (用户期望"14:30 失败 → 次日 9:30 接管", 不是"不交易").
+
+**修正: Phase A exit 4 (DQ fail) 应该被 Phase C 当作"14:30 fail"处理, 而非"14:30 跳过(不交易)"**. 实施:
+- Phase B executor 看 Phase A exit code: 0 → 执行; 2/4/5 → 不写 success flag → Phase C 接管.
+
+**(4) executions dir layout**:
+
+**合并到同一 dir `data/orders/executions/`**, 文件名加 `_intraday` 后缀区分:
+- 9:30 path: `exec_<YYYYMMDD>_<HHMMSS>.json` (现有)
+- 14:30 path: `exec_<YYYYMMDD>_intraday_<HHMMSS>.json` (新)
+
+理由:
+- account_report.py 已经在 grep `exec_<today>_*.json`, 同 dir 自然 pick 起来双 entry path 的 fills
+- 不需要新建 dir / 改 cleanup logic
+- entry_path 区分靠文件名前缀 + (再 audit JSON 内 `"entry_path"` field) 双保险
+
+### Phase B / C / D green light
+
+ACK 完, **不需要等 advisor 进一步 confirm**. 工程方按以下顺序做:
+
+**Phase B (1 天)**: `scripts/ecs_intraday_execute.ps1`:
+
+```powershell
+# Schedule: Task Scheduler 14:30:30 Mon-Fri
+# 1. cd C:\money-printer; git pull origin <branch>
+# 2. Test-Path C:\money-printer\data\orders\intraday_latest.json (else abort)
+# 3. Verify XtMiniQmt running + account 8886933837 (same as 9:30 path)
+# 4. Verify plan freshness: intraday_latest.json mtime > $today_14:25:00 (else stale → abort)
+# 5. **NEW**: QMT positions reconcile (per 决策 1) — abort on > 5% drift
+# 6. .venv\Scripts\python.exe scripts\execute_orders.py --mode auto \
+#      --plan data\orders\intraday_latest.json \
+#      --qmt-account 8886933837 --qmt-userdata C:\guojin\userdata_mini
+# 7. On success: write data\orders\intraday_success_<YYYYMMDD>.flag
+# 8. Log to C:\money-printer\data\orders\ecs_intraday.log
+```
+
+需要 `scripts/execute_orders.py` 加 `--plan` 参数支持任意 plan path (现在 hard-coded `latest.json`?). Quick check 现有实现.
+
+注册 Windows Task Scheduler task `MoneyPrinter-IntradayExecute` 14:30:30 Mon-Fri.
+
+**Phase C (半天)**: 改 `scripts/ecs_auto_execute.ps1` (9:25 path):
+
+```powershell
+# 在现有 verify steps 之前加:
+$intradayFlag = "C:\money-printer\data\orders\intraday_success_<yesterday>.flag"
+if (Test-Path $intradayFlag) {
+    Log "Yesterday 14:30 path succeeded; skipping 9:30 execute"
+    exit 0
+}
+# else: proceed with existing 9:30 latest.json execute
+```
+
+Yesterday flag (not today) 因为 9:25 触发时今天 14:30 还没发生, 看的是昨天 14:30 是否成功. 跨日 flag 需要存 8 天清理一次或类似 (不重要).
+
+**Phase D**: daily_report.sh 17:00 完全不变.
+
+### 这一轮你
+
+1. ACK round 97
+2. 检查 `scripts/execute_orders.py` 是否支持 `--plan <path>` (如果不支持, 加这个 CLI flag, 简单改动)
+3. Phase B: 写 `scripts/ecs_intraday_execute.ps1` + 注册 Task Scheduler
+4. Phase C: 改 `scripts/ecs_auto_execute.ps1` 加 intraday_success flag check
+5. 写 round 98 报告 (Phase B + C 完成情况)
+6. STOP at Phase B/C 完成. 等 advisor confirm 第一交易日 dry-run.
+
+### 主动给 user
+
+P11-5 Phase A 完成 (commit `c8194a7`). Phase B/C/D 已 green light (4 决策点回复了工程方). 工程方接着做 Phase B (ECS 14:30 task + executor) + Phase C (9:25 fallback flag), ~1.5 天. 完成后第一交易日 dry-run 验证, 通过后 cutover live. 你今天起 18:00 会收到真账户日报 (而非 paper trade).
+
 
 
 
