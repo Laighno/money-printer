@@ -1,5 +1,5 @@
 # ECS intraday pipeline for QMT live trading (P11-5 Phases A + B
-# combined into a single ECS Task Scheduler entry — per round 99
+# combined into a single ECS Task Scheduler entry -- per round 99
 # decision (A): one process owns the 14:30 path end-to-end, avoiding
 # Mac push → ECS pull race conditions on the plan JSON).
 #
@@ -14,15 +14,15 @@
 #        → xtdata 1m fetch + EOD history
 #        → BlendRanker(intraday_blend) score + Top-K=10
 #        → write data\orders\intraday_latest.json + intraday_<YYYYMMDD>.json
-#      ABORT on exit != 0 (DQ gate, 0 morning bars, etc) — Phase C
+#      ABORT on exit != 0 (DQ gate, 0 morning bars, etc) -- Phase C
 #      9:30 next day will take over.
 #   3. Verify intraday_latest.json present + entry_path = intraday_14_30
-#   4. Verify plan freshness (mtime > today 14:29:00 — should be ≥ 14:30
+#   4. Verify plan freshness (mtime > today 14:29:00 -- should be ≥ 14:30
 #      because same-process generation, threshold catches re-runs of
 #      stale plans from earlier in the day).
 #   5. Verify XtMiniQmt.exe running
 #   6. Verify portfolio.yaml account = 8886933837
-#   7. Run scripts/intraday_preflight.py — abort on > 5% drift
+#   7. Run scripts/intraday_preflight.py -- abort on > 5% drift
 #   8. Run scripts/execute_orders.py --mode auto --plan intraday_latest.json
 #   9. On success: write data\orders\intraday_success_<YYYYMMDD>.flag
 #  10. Log everything to data\orders\ecs_intraday.log
@@ -83,7 +83,7 @@ if ($LASTEXITCODE -ne 0) { Abort "git pull failed (exit $LASTEXITCODE)" }
 $head = (& git rev-parse --short HEAD).Trim()
 Log "Step 1: HEAD = $head"
 
-# Step 2: Phase A — intraday_plan.py generates today's 14:30 plan.
+# Step 2: Phase A -- intraday_plan.py generates today's 14:30 plan.
 # Script blocks via sleep_to_trigger until clock = 14:30:00, then
 # fetches + scores + writes data/orders/intraday_latest.json. Exit
 # codes per scripts/intraday_plan.py: 0=OK, 2=missed 14:30:30 deadline,
@@ -101,10 +101,10 @@ $planOutput.Trim().Split("`n") | ForEach-Object { Log "  plan: $_" }
 $planExit = $LASTEXITCODE
 Log "Step 2: intraday_plan exit = $planExit"
 if ($planExit -ne 0) {
-    Abort "intraday_plan.py failed (exit $planExit) — 9:30 next day will take over"
+    Abort "intraday_plan.py failed (exit $planExit) -- 9:30 next day will take over"
 }
 
-# Step 3: Verify intraday plan present + entry_path tag (defensive —
+# Step 3: Verify intraday plan present + entry_path tag (defensive --
 # intraday_plan.py should have written it in step 2, but verifying
 # costs nothing).
 $planPath = "$REPO\data\orders\intraday_latest.json"
@@ -113,7 +113,7 @@ if (-not (Test-Path $planPath)) {
 }
 $planContent = Get-Content $planPath -Raw -Encoding UTF8
 if ($planContent -notmatch '"entry_path"\s*:\s*"intraday_14_30"') {
-    Abort "intraday_latest.json entry_path != 'intraday_14_30' — refusing to layer 14:30 path onto wrong plan"
+    Abort "intraday_latest.json entry_path != 'intraday_14_30' -- refusing to layer 14:30 path onto wrong plan"
 }
 Log "Step 3: plan present + entry_path = intraday_14_30 verified"
 
@@ -126,7 +126,7 @@ $today1429 = (Get-Date).Date.AddHours(14).AddMinutes(29)
 $planMtime = (Get-Item $planPath).LastWriteTime
 Log "Step 4: plan mtime = $($planMtime.ToString('yyyy-MM-dd HH:mm:ss')); threshold = $($today1429.ToString('yyyy-MM-dd HH:mm:ss'))"
 if ($planMtime -lt $today1429) {
-    Abort "plan mtime $($planMtime.ToString('HH:mm:ss')) older than today 14:29:00 — stale (intraday_plan.py didn't actually write?)"
+    Abort "plan mtime $($planMtime.ToString('HH:mm:ss')) older than today 14:29:00 -- stale (intraday_plan.py didn't actually write?)"
 }
 
 # Step 5: Verify XtMiniQmt is running
@@ -159,7 +159,7 @@ $preflightOutput.Trim().Split("`n") | ForEach-Object { Log "  preflight: $_" }
 $preflightExit = $LASTEXITCODE
 Log "Step 7: preflight exit = $preflightExit"
 if ($preflightExit -ne 0) {
-    Abort "preflight reconcile failed (exit $preflightExit) — 9:30 next day will take over"
+    Abort "preflight reconcile failed (exit $preflightExit) -- 9:30 next day will take over"
 }
 
 # Step 8: Execute orders
@@ -178,7 +178,7 @@ $execExit = $LASTEXITCODE
 Log "Step 8: execute_orders exit = $execExit"
 
 if ($execExit -ne 0) {
-    Abort "execute_orders failed (exit $execExit) — 9:30 next day will take over"
+    Abort "execute_orders failed (exit $execExit) -- 9:30 next day will take over"
 }
 
 # Step 9: Write success flag (consumed by Phase C 9:25 path next morning)
