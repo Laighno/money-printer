@@ -6846,6 +6846,120 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 10:12] 第 98 轮 (P11-5 Phase B + Phase C 实现完成) · 1 commit `973faa2`
+
+### ACK round 97
+收到 Phase A ACK + 4 决策点回复 + Phase B/C/D green light.
+
+### 决策点确认 (round 97 advisor 拍板)
+
+| 决策 | 内容 | 实施 |
+|---|---|---|
+| (1) QMT live drift | > 5% abort | ✅ `scripts/intraday_preflight.py` |
+| (2) 限价基准 | 保持 yesterday close × 1.01/0.99 | ✅ 保持 daily_report._latest_closes() 不动 |
+| (3) DQ gate behavior | Phase A raise → exit 4 → 不写 success flag → Phase C 接管 | ✅ intraday_plan.py 现有 exit 4 + Phase B/C 实现接管 |
+| (4) executions dir | 同 dir, `exec_<YYYYMMDD>_intraday_<HHMMSS>.json` | ✅ execute_orders.py 按 plan.entry_path 自动 tag |
+
+### 交付物 (commit `973faa2`)
+
+**4 files, +328 / -3 lines**:
+
+1. **`scripts/intraday_preflight.py`** (137 行, new): QMT live positions reconcile checker.
+   - CLI: `--plan` `--qmt-account` `--qmt-userdata` `--tolerance` (default 0.05 = 5%).
+   - 检查:
+     - `entry_path == "intraday_14_30"` (拒绝喂错 9:30 latest.json).
+     - `expected_codes != live_codes` → exit 1 (codes 不一致).
+     - `abs(live.shares_total - h["shares"]) > h["shares"] * 0.05` → exit 1 (per-code drift).
+   - Exit codes: 0=OK, 1=drift, 2=QMT connect fail, 3=plan missing/wrong type.
+
+2. **`scripts/ecs_intraday_execute.ps1`** (151 行, new): 14:30:30 Mon-Fri Task Scheduler 目标.
+   - 8-step pipeline:
+     1. git pull (5s buffer for Mac push → ECS pull)
+     2. plan present + entry_path = "intraday_14_30" verify
+     3. plan mtime > today 14:25:00 (catch stale push)
+     4. XtMiniQmt running verify
+     5. portfolio.yaml account = 8886933837 check
+     6. **intraday_preflight.py 5% drift check** (新)
+     7. `execute_orders.py --plan intraday_latest.json --mode auto`
+     8. `intraday_success_<YYYYMMDD>.flag` 写入 (Phase C consumer)
+   - 日志独立到 `data/orders/ecs_intraday.log` (跟 9:30 path `ecs_auto.log` 分开).
+   - Any step fail → Abort, NOT write flag → Phase C 9:30 fallback 自动接管.
+
+3. **`scripts/execute_orders.py`** (+13/-3 行 patch): exec log 命名按 plan.entry_path 自动 tag.
+   - 14:30 plan: `exec_<YYYYMMDD>_intraday_<HHMMSS>.json`
+   - 9:30 plan: `exec_<YYYYMMDD>_<HHMMSS>.json` (原行为, 兼容).
+   - 不需要新 CLI flag (从 plan.entry_path 自动推).
+   - JSON payload 加 `"entry_path"` field for downstream audit.
+
+4. **`scripts/ecs_auto_execute.ps1`** (+27/-0 行 patch): Phase C fallback gate.
+   - 在 step 1 git pull 之前加 check.
+   - **Single-day lookback** (不是 5-day window): 找上一个交易日 (Mon-Fri, skip Sat/Sun).
+     - 那一天 `intraday_success_*.flag` 存在 → SKIP 9:30 (14:30 已入场).
+     - 不存在 → 9:30 fallback 接管 (14:30 fail 或 post-holiday).
+   - 不用 multi-day window 因为会 mask T-1 14:30 failure (T-2 success flag 会让 T 9:30 错过 fallback).
+   - 中国节假日 (e.g. Tomb-Sweeping 3 天): T-1 是 holiday weekday → lookback 找不到 flag → 9:30 fire. 接受 1 天额外交易 (acceptable, 不是 disaster).
+
+### 风险 / 边界 case 已 audit
+
+| 场景 | 行为 | 评价 |
+|---|---|---|
+| T 14:30 success → T+1 9:25 | T flag found → SKIP 9:30 ✅ | 正常 steady-state |
+| T 14:30 fail → T+1 9:25 | T flag absent → 9:30 fire ✅ | fallback 工作 |
+| Fri 14:30 success → Mon 9:25 | 上一个交易日 = Fri, flag found → SKIP ✅ | 周末跳过正确 |
+| T-1 14:30 fail + T-2 14:30 success → T 9:25 | T-1 flag absent → 9:30 fire ✅ | single-day lookback 不被 T-2 误导 |
+| Tomb-Sweeping Tue holiday + Mon 14:30 success → Wed 9:25 | 上一个 weekday = Tue (holiday, no flag) → 9:30 fire | 接受 1 天 redundant trading (中国 holiday calendar 需要 future enhancement) |
+| Spring Festival (7 天) → first day back 9:25 | flag 找不到 → 9:30 fire, 但 latest.json > 30h → abort | 正确 (no fresh plan, 不交易) |
+| Spring Festival → first day back 14:30 | 14:30 path 正常 fire (新生成 intraday_latest.json) → flag 写入 → 次日 9:30 skip | 正确 |
+
+### Phase D 状态
+
+Phase D 不需要任何代码改动: `daily_report.sh` 17:00 继续生成 `data/orders/latest.json` (EOD path), 这是 9:30 fallback plan. Phase C 决定是否 fire executor.
+
+### 完整链路 (P11-5 上线时)
+
+```
+[ECS 14:30:30 task]              [Mac 17:00 daily_report]            [ECS 9:25 task]
+   ↓                                  ↓                                   ↓
+ecs_intraday_execute.ps1          daily_report.py                    ecs_auto_execute.ps1
+   ↓                                  ↓                                   ↓
+git pull                          generate orders                    check intraday_success_<yesterday>.flag
+   ↓                                  ↓                                   ↓
+[T+0 Mac 14:30:00 intraday_plan.py    ↓                                   ↓
+ writes intraday_latest.json + push]  ↓                                   ↓
+   ↓                              latest.json                          ↓
+verify intraday_latest.json           ↓                              [flag found] → exit 0 (skip)
+   ↓                              git push                              ↓
+intraday_preflight (5% drift)         ↓                              [flag absent] ↓
+   ↓                              [Mac → ECS sync 18:30]              git pull
+execute_orders.py --plan intraday_latest.json                            ↓
+   ↓                                                                  execute_orders.py --plan latest.json
+write intraday_success_<today>.flag
+```
+
+> 注: 上图把 Mac 端 14:30 plan generation 放在 Phase B 流程图右侧的 ECS task 里, 因为 advisor round 95 说 "fetch 9:30~14:29 1m bars (xtdata ECS-side)" — xtdata 在 ECS. **现在 Phase A 的 intraday_plan.py 设计是 ECS 端跑** (而非 Mac 跑). Phase B ecs_intraday_execute.ps1 是 step 7 时调用 execute_orders, 但 step 7 之前 (14:30:00) 应该已经有人跑 intraday_plan.py 把 JSON 写好. 是否要把 intraday_plan.py 也 invoke 到 Phase B PS1 里 (single ECS task at 14:30:00, sleep, fetch, plan, execute)? 我现在的实现是分离的, 假设 cron / Task Scheduler 在 14:29 触发 `python intraday_plan.py` (Mac 或 ECS 都可), 然后 ECS Task Scheduler 14:30:30 触发 `ecs_intraday_execute.ps1`. **请 advisor 确认调度方式 — 是 1 个 ECS task (combined) 还是 2 个 task (split)?**
+
+### 这一轮我
+
+1. ✅ ACK round 97
+2. ✅ 写 `scripts/intraday_preflight.py` (Phase B)
+3. ✅ 写 `scripts/ecs_intraday_execute.ps1` (Phase B)
+4. ✅ 改 `scripts/execute_orders.py` (entry_path 自动 tag exec filename)
+5. ✅ 改 `scripts/ecs_auto_execute.ps1` (Phase C fallback gate)
+6. ✅ Commit `973faa2` + round 98 报告
+7. ⏸️ STOP at Phase B + C 完成. 等 advisor confirm:
+   - (A) 调度方式 (combined 1 task vs split 2 tasks) — 影响 ecs_intraday_execute.ps1 是否要 invoke intraday_plan.py
+   - (B) 第一个交易日 dry-run 计划 (ecs_intraday_execute.ps1 with `--mode dryrun` 跑一次, 检查 fills logic 不真发单)
+   - (C) Task Scheduler 注册 PowerShell 脚本 (类似 `scripts/ecs_setup_schedule.ps1` 现有 9:25 task 的注册逻辑, 我可以扩展支持 14:30:30)
+
+### 主动给 user
+
+P11-5 Phase B + C 完成 (commit `973faa2`, 4 files +328 行).
+- Phase B: ECS 14:30 执行器 (5% QMT drift reconcile + execute_orders + success flag).
+- Phase C: 9:25 fallback gate (single-day lookback, 上一个交易日 flag 存在 → skip 9:30).
+- 唯一遗留 1 个澄清点: intraday_plan.py 是 1 个 task (combined with execute) 还是 2 个 task (split, plan first then execute). 等 advisor 拍板. 然后是第一交易日 dry-run 验证, 通过后 live cutover.
+
+---
+
 ## [2026-05-28 10:00] 第 96 轮 (P11-5 Phase A 实现完成) · 1 commit `c8194a7`
 
 ### ACK round 95
