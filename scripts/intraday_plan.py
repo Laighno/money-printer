@@ -172,6 +172,218 @@ def _xtquant_to_code(xt_code: str) -> str:
     return xt_code.split(".")[0]
 
 
+def _chunked_download(xtdata, xt_codes: List[str], period: str,
+                      start_str: str, end_str: str, *,
+                      chunk_size: int = 25, timeout: float = 30.0,
+                      retry: int = 1) -> int:
+    """Drive xtdata.download_history_data2 in thread-timed chunks with retry.
+
+    Round 107: chunk 50→25 + retry-once for timed-out chunks. The 5/28 run
+    had 6 of 13 50-code chunks alternately time out (~3min wasted), which
+    looks like an xtquant rate-limit / chunked-download hiccup; smaller
+    chunks + a retry pass recover most stragglers. Returns the count of
+    chunks still timed-out after retries (0 = all cached).
+    """
+    import threading
+
+    def _worker(stock_list, done_event):
+        try:
+            xtdata.download_history_data2(
+                stock_list=stock_list, period=period,
+                start_time=start_str, end_time=end_str,
+                callback=lambda d: None,
+            )
+        except Exception as e:
+            logger.warning("download chunk inner exception: {}", e)
+        finally:
+            done_event.set()
+
+    def _run_chunk(chunk) -> bool:
+        ev = threading.Event()
+        t = threading.Thread(target=_worker, args=(chunk, ev), daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        return ev.is_set()
+
+    pending = [xt_codes[i:i + chunk_size] for i in range(0, len(xt_codes), chunk_size)]
+    timed_out = [c for c in pending if not _run_chunk(c)]
+    for _ in range(retry):
+        if not timed_out:
+            break
+        timed_out = [c for c in timed_out if not _run_chunk(c)]
+    if timed_out:
+        logger.warning("{} chunk(s) still timed out after {} retr(ies)",
+                       len(timed_out), retry)
+    return len(timed_out)
+
+
+def _canonicalize_xtdata_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """Self-calibrate xtdata volume/amount to canonical 股/元.
+
+    xtdata's daily volume unit (股 vs 手) is version/config dependent and
+    cannot be verified off-ECS (no xtquant on Mac). Rather than guess, we
+    derive it from the amount/(volume*close) ratio, which is ≈1 only when
+    both are canonical (amount 元, volume 股, close 元/share):
+      - ratio ≈ 1      → canonical, no change
+      - ratio ≈ 100    → volume is 手 → ×100 to 股
+      - ratio ≈ 1e-4   → amount is 万元 → ×1e4 to 元
+    This makes the warm correct regardless of xtdata's convention and
+    survives future xtquant changes. validate_bars (in save_bars_upsert)
+    is the final backstop.
+    """
+    v = pd.to_numeric(df["volume"], errors="coerce")
+    a = pd.to_numeric(df["amount"], errors="coerce")
+    c = pd.to_numeric(df["close"], errors="coerce")
+    valid = v.notna() & a.notna() & c.notna() & (v > 0) & (c > 0)
+    if not valid.any():
+        logger.warning("warm: no valid rows to calibrate xtdata units")
+        return df
+    ratio = float((a[valid] / (v[valid] * c[valid])).median())
+    df = df.copy()
+    if 30.0 <= ratio <= 300.0:
+        df["volume"] = v * 100.0
+        logger.warning("warm: xtdata volume looks like 手 (amount/(vol*close) "
+                       "median={:.1f}); ×100 → 股", ratio)
+    elif ratio < 0.01:
+        df["amount"] = a * 1e4
+        logger.warning("warm: xtdata amount looks like 万元 (ratio={:.5f}); "
+                       "×1e4 → 元", ratio)
+    else:
+        logger.info("warm: xtdata units canonical (amount/(vol*close) "
+                    "median={:.3f})", ratio)
+    return df
+
+
+def warm_daily_bars_via_xtdata(codes: List[str], asof_date: date,
+                               max_lookback_cal_days: int = 365) -> dict:
+    """Bulk-fetch daily bars via xtdata and upsert into the local DB so the
+    subsequent build_latest_features hits warm DB instead of fetching from
+    Sina serially per stock (round 107 root cause — that serial path took
+    ~15min for 615 codes when the DB was stale).
+
+    Mechanism: get_daily_bars short-circuits to the DB when
+    ``db_max >= _last_expected_trading_day()``. At 14:30 (before 16:00)
+    that threshold is T-1, so warming the DB to T-1 makes every per-stock
+    get_daily_bars return instantly (no API).
+
+    Scope: only the MISSING tail [earliest db_max + 1, T-1] is fetched
+    (capped at ``max_lookback_cal_days`` for empty/very-stale codes). The
+    common case (DB stale by 1 trading day) fetches a single day in one
+    bulk RPC — fast, and it avoids overwriting existing turnover-bearing
+    Sina rows wholesale.
+
+    Correctness (Rule #11): fetch_end = T-1, NEVER today. Today's 14:30
+    bar is incomplete; it must not enter the EOD factor window. Today's
+    morning session enters separately via intraday_bars in build_intraday_panel.
+
+    Returns a stats dict for the round report.
+    """
+    from datetime import timedelta
+
+    from mp.data.store import DataStore
+    from mp.data.schema import normalize_bars
+    from mp.data.fetcher import _last_expected_trading_day
+
+    codes = [str(c).zfill(6) for c in codes]
+    store = DataStore()
+    expected = _last_expected_trading_day()   # T-1 at 14:30 (pre-16:00)
+
+    # Per-code max date already in DB (one GROUP BY query).
+    db_max_by_code: Dict[str, date] = {}
+    if codes:
+        placeholders = ",".join(["?"] * len(codes))
+        with store.engine.connect() as conn:
+            rows = conn.exec_driver_sql(
+                f"SELECT code, MAX(date) FROM daily_bars "
+                f"WHERE code IN ({placeholders}) GROUP BY code",
+                tuple(codes),
+            ).fetchall()
+        for code, mx in rows:
+            if mx:
+                db_max_by_code[str(code).zfill(6)] = pd.Timestamp(mx).date()
+
+    stale = [c for c in codes
+             if db_max_by_code.get(c) is None or db_max_by_code[c] < expected]
+    if not stale:
+        logger.info("warm: DB already fresh for all {} codes (>= {}), skip warm",
+                    len(codes), expected)
+        return {"warmed": False, "reason": "fresh", "expected": str(expected)}
+
+    # Only now do we need xtquant (ECS-only) — the fresh-skip path above
+    # stays importable on Mac for unit tests.
+    from xtquant import xtdata  # noqa: WPS433
+
+    have_dates = [db_max_by_code[c] for c in codes if c in db_max_by_code]
+    gap_start = (min(have_dates) + timedelta(days=1)) if have_dates else \
+                (expected - timedelta(days=max_lookback_cal_days))
+    floor_start = expected - timedelta(days=max_lookback_cal_days)
+    fetch_start = max(gap_start, floor_start)
+    fetch_end = expected   # T-1, NOT today
+
+    start_str = fetch_start.strftime("%Y%m%d000000")
+    end_str = fetch_end.strftime("%Y%m%d235959")
+    xt_codes = [_code_to_xtquant(c) for c in codes]
+
+    logger.info("warm: {}/{} codes stale; xtdata 1d fetch {}~{} ({} codes)",
+                len(stale), len(codes), fetch_start, fetch_end, len(xt_codes))
+
+    _chunked_download(xtdata, xt_codes, "1d", start_str, end_str)
+
+    field_list = ["open", "high", "low", "close", "volume", "amount"]
+    raw = xtdata.get_market_data(
+        field_list=field_list, stock_list=xt_codes, period="1d",
+        start_time=start_str, end_time=end_str, count=-1,
+        dividend_type="front",   # 前复权 (qfq) — match the Sina-qfq DB convention
+        fill_data=False,
+    )
+    if not raw or not all(isinstance(v, pd.DataFrame) for v in raw.values()):
+        logger.warning("warm: xtdata 1d returned unexpected shape — skip (scoring "
+                       "will fall back to per-stock fetch)")
+        return {"warmed": False, "reason": "bad_shape"}
+
+    frames = []
+    for field, fdf in raw.items():
+        if fdf.empty:
+            continue
+        s = fdf.stack()
+        s.name = field
+        s.index.names = ["code_xt", "date"]
+        frames.append(s.to_frame())
+    if not frames:
+        logger.warning("warm: xtdata 1d returned 0 rows — skip")
+        return {"warmed": False, "reason": "empty"}
+
+    long = pd.concat(frames, axis=1).reset_index()
+    long["code"] = long["code_xt"].apply(_xtquant_to_code)
+    long.drop(columns=["code_xt"], inplace=True)
+    long["date"] = pd.to_datetime(long["date"]).dt.normalize()
+    # Drop any row at/after today (defensive — fetch_end is already T-1).
+    long = long[long["date"] <= pd.Timestamp(expected)].copy()
+    for col in ("open", "high", "low", "close", "amount"):
+        long[col] = pd.to_numeric(long[col], errors="coerce")
+    long["volume"] = pd.to_numeric(long["volume"], errors="coerce")
+    long = long.dropna(subset=["open", "high", "low", "close"])
+    rows_fetched = len(long)
+    if rows_fetched == 0:
+        logger.warning("warm: 0 usable rows after cleaning — skip")
+        return {"warmed": False, "reason": "no_usable_rows"}
+
+    long = _canonicalize_xtdata_bars(long)
+    long = normalize_bars(long, source="xtdata")
+
+    written = store.save_bars_upsert(long)
+    logger.info("warm: fetched {} rows, upserted {} after validation "
+                "(gap {}~{})", rows_fetched, written, fetch_start, fetch_end)
+    return {
+        "warmed": True,
+        "rows_fetched": rows_fetched,
+        "rows_written": int(written),
+        "fetch_start": str(fetch_start),
+        "fetch_end": str(fetch_end),
+        "stale_codes": len(stale),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # xtdata fetch — today 1m + 20d EOD
 # ─────────────────────────────────────────────────────────────────────
@@ -203,38 +415,7 @@ def fetch_today_1m_and_eod_history(
     # ── 1) today's 1m bars ──────────────────────────────────────────
     logger.info("download_history_data2 (1m) for {} codes, asof={}",
                 len(xt_codes), today_str)
-    import threading
-
-    def _chunk_worker(stock_list, done_event, period, start_str, end_str):
-        try:
-            xtdata.download_history_data2(
-                stock_list=stock_list,
-                period=period,
-                start_time=start_str,
-                end_time=end_str,
-                callback=lambda d: None,
-            )
-        except Exception as e:
-            logger.warning("download chunk inner exception: {}", e)
-        finally:
-            done_event.set()
-
-    chunk_size = 50
-    chunk_timeout = 30.0
-    timed_out = 0
-    for i in range(0, len(xt_codes), chunk_size):
-        chunk = xt_codes[i:i + chunk_size]
-        done_event = threading.Event()
-        worker = threading.Thread(
-            target=_chunk_worker,
-            args=(chunk, done_event, "1m", today_start, today_end),
-            daemon=True,
-        )
-        worker.start()
-        worker.join(timeout=chunk_timeout)
-        if not done_event.is_set():
-            timed_out += 1
-            logger.warning("1m chunk {}-{} timed out", i, i + len(chunk))
+    timed_out = _chunked_download(xtdata, xt_codes, "1m", today_start, today_end)
 
     field_list = ["open", "high", "low", "close", "volume", "amount"]
     raw = xtdata.get_market_data(
@@ -286,16 +467,7 @@ def fetch_today_1m_and_eod_history(
                 eod_start_dt.strftime("%Y%m%d"),
                 (pd.Timestamp(asof_date) - pd.Timedelta(days=1)).strftime("%Y%m%d"),
                 len(xt_codes))
-    for i in range(0, len(xt_codes), chunk_size):
-        chunk = xt_codes[i:i + chunk_size]
-        done_event = threading.Event()
-        worker = threading.Thread(
-            target=_chunk_worker,
-            args=(chunk, done_event, "1d", eod_start_str, eod_end_str),
-            daemon=True,
-        )
-        worker.start()
-        worker.join(timeout=chunk_timeout)
+    _chunked_download(xtdata, xt_codes, "1d", eod_start_str, eod_end_str)
 
     eod_raw = xtdata.get_market_data(
         field_list=field_list,
@@ -609,6 +781,18 @@ def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
     scoring_codes = sorted(intraday_bars.keys())
     logger.info("Scoring {} codes (universe {} → bars present {})",
                 len(scoring_codes), len(codes), len(intraday_bars))
+
+    # Round 107 perf fix: bulk-warm the DB to T-1 via xtdata BEFORE scoring,
+    # so build_latest_features hits warm DB (seconds) instead of fetching
+    # from Sina serially per stock (~15min for 615 codes). Non-fatal: a warm
+    # failure just means scoring falls back to the slow path.
+    t_warm = time.time()
+    try:
+        warm_stats = warm_daily_bars_via_xtdata(scoring_codes, asof_date)
+        logger.info("warm done in {:.1f}s: {}", time.time() - t_warm, warm_stats)
+    except Exception as e:
+        logger.warning("warm_daily_bars_via_xtdata failed ({}) — scoring will "
+                       "use slow per-stock fetch path", e)
 
     full_scored = score_universe(
         codes=scoring_codes,
