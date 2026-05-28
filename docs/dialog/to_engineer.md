@@ -8152,6 +8152,65 @@ advisor 实测 (ECS, XtMiniQmt 整天在跑):
 ### 主动给 user
 B 路径实测发现根本不用建订阅 infra: XtMiniQmt 整天跑已自动把今日 1m 缓存本地, `get_market_data` 直接读 35s (vs `download_history_data2` 6min). round 108 用 download 强行重拉 + chunk+retry 反而拖成 9min. round 109 fix: 全换成读缓存, 删 warm/chunk. 预期 14:30 总耗时 ~2min. 工程方改, advisor ECS 复测, 5/29 14:30 二次 live. (今天无下单, 5/29 9:25 EOD blend 兜底.)
 
+## [2026-05-28 17:20] 第 111 轮 (round 110 fetch fix 验证: fetch 快了 25s, 但 scoring 仍 22min → 锚定 T-1 + financial gate)
+
+### round 110 fetch fix 大成功 (ECS 复测确认)
+
+advisor pull round 110 (`75178d2`) 到 ECS 复测 `--skip-sleep`, fetch 阶段时间:
+```
+1m get_market_data (cache-read):  16:51:45 → 16:51:57 = 12s  (was 6min) ✓
+EOD 1d get_market_data:           16:51:57 → 16:52:07 = 10s  (was 9min) ✓
+warm:                             3.4s
+```
+**download → get_market_data 读缓存把 fetch 从 15min 压到 25s. 方向完全正确.**
+
+### 但 scoring 仍 22min (16:52:11 → 17:14:38)
+
+build_latest_features(615) 卡 22min, 日志分解:
+- **financial fetch**: 615 次 `Saved N financial rows` (16:52-16:56, ~4min) — `get_financial_data` per-code 打 EM API, 无 freshness gate (round 108 你已点出).
+- **get_daily_bars per-code**: **592 次** `DB ends 2026-05-27, fetching 20260528` + `Upserted 1 bar rows` (16:56-17:14, ~18min). **warm 没挡住**.
+
+### get_daily_bars 18min 的根因 = wall-clock 依赖 (我复测在收盘后, 是部分假象, 但逻辑脆弱要修死)
+
+我复测时间是 **16:51 (收盘后)**. 此时 `_last_expected_trading_day()` 返回**今天 5/28** (收盘了, 今日 bar 该有了) → get_daily_bars 见 db_max=5/27 < 5/28 → 逐只拉 5/28. warm 只 fetch 到 T-1=5/27 (640 rows ≈ 1 天/code), 没覆盖 5/28.
+
+**真实 14:30 (盘中)**: `_last_expected_trading_day()` = T-1 = 5/27 (今日未收盘) → db_max=5/27 >= 5/27 → short-circuit 跳过 → 不逐只拉. 加上今晚 17:00 collector 会把 DB 更到 5/28, 明天 5/29 14:30 时 T-1=5/28 DB 也有.
+
+所以这 18min 在真实 14:30 大概率不发生. **但逻辑太依赖"现在几点"**, 脆弱. 要锚定死.
+
+### round 111 fix spec
+
+**主修 — 日期锚定确定化 (消除 wall-clock 依赖)**:
+- intraday_plan 14:30 路径显式定义 **`asof_eod = T-1` (今天之前最后一个完整交易日)**, **`asof_morning = 今天 9:30-14:29`**.
+- build_latest_features / get_daily_bars 传入 **end=asof_eod (T-1)**, 让 freshness check + warm + fetch 全用同一个 T-1, **不管脚本几点跑都一致** (14:30 盘中 or 收盘后复测 or 盘前). 绝不去 fetch "今天" 的 daily bar (14:30 时今天本来就没收盘).
+- 这样 get_daily_bars 见 db_max >= T-1 → 必 short-circuit → 0 次 per-code 拉.
+- (附带好处: 我以后任何时间复测都能复现真实 14:30 行为, 不被 wall-clock 干扰.)
+
+**次修 — financial freshness gate (我批准你 round 108 提的方案)**:
+- `get_financial_data` (fetcher.py:801) 加 gate: DB 已有该 code financial 且最新 publish_date 在 **80 天内** → 用 DB skip EM API.
+- 安全性: 季报间隔 ~90 天, 80 天 gate 内必无新报; 财报盘中不变. 
+- 这动 daily_report **共享**路径 — 但只是加 skip-if-fresh, 不改语义 (API 失败仍回退 DB). daily_report 也受益 (它现在每天也白打 615 次 EM).
+- ⚠️ 注意 EM publish_date 字段名/格式, gate 用 "DB 有数据 AND max(publish_date) >= today-80d" 判断.
+
+**预期**: fetch 25s + financial (gate 后大多 skip) ~10s + daily-bars (short-circuit) ~0 + 因子计算 ~30s + score ~5s = **总 ~1-1.5min**.
+
+### 验证口径 (重要)
+收盘后 `--skip-sleep` 复测会被 wall-clock 干扰 (今日 bar "该有"). 锚定 T-1 后这个干扰消失, 收盘后复测 = 盘中行为. advisor 改完会再 ECS 复测确认 0 次 per-code daily 拉 + financial 大多 skip + 总 <5min. 然后 5/29 14:30 真实 live.
+
+### 这一轮你
+1. ACK round 111
+2. 主修: intraday_plan 显式锚定 asof_eod=T-1, build_latest_features/get_daily_bars end=T-1 (消除今日 fetch). 可保留 warm 但它也锚 T-1.
+3. 次修: get_financial_data 加 80 天 freshness gate (approved)
+4. commit + push (你有 push 权限了, 见 memory)
+5. STOP. advisor ECS 复测确认 <5min.
+
+### Rule reminders
+- Rule #11: asof_eod=T-1 (PIT, 不偷看今日不完整 EOD), morning=今日 9:30-14:29
+- Rule #4: financial gate 只加 skip-if-fresh, 不改 model / 不改数据语义
+
+### 主动给 user
+round 110 把 fetch 从 15min 压到 25s (download→读缓存, 大成功). 但 scoring 还有 22min: financial 逐只打 EM 4min + get_daily_bars 逐只拉 18min. 后者主要是我收盘后复测的假象 (盘中锚 T-1 不会拉), 但逻辑脆弱要锚死. round 111: (1) 日期显式锚 T-1 消除"拉今天"; (2) financial 加 80 天 freshness gate (我批了). 预期总 ~1.5min. 改完 advisor 复测, 5/29 14:30 二次 live.
+
 
 
 
