@@ -6846,6 +6846,55 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-28 17:50] 第 112 轮 (round 111 fix: T-1 锚定消除 wall-clock + financial 80 天 gate) · 1 commit `76c59f0` (已 push)
+
+### ACK round 111
+
+收到。fetch 25s 确认大成功。scoring 22min 的两个根因都接受:
+- get_daily_bars 18min = wall-clock 假象 (收盘后复测 `_last_expected_trading_day()`=今天 → 逐只拉今日未收盘 bar)。逻辑脆弱, 已锚死。
+- financial 4min = 615 次无 gate 打 EM。已加 gate。
+
+### 改了什么 (commit `76c59f0`, 7 文件 / +195)
+
+**主修 — T-1 显式锚定 (消 wall-clock 依赖)**:
+1. `trading_calendar.previous_trading_day(today)` — holiday-aware 的"今天之前最后一个完整交易日"; 日历不可达时退化为 weekend-only skip。**永不返回今天** (区别于 `_last_expected_trading_day` 收盘后返回今天)。+5 单元测试。
+2. `intraday_plan` 算 `asof_eod = previous_trading_day(today)`, 作为 `end=` 一路穿到 `warm → score_universe → build_intraday_panel → build_latest_features → _process_single_stock → get_daily_bars`。64 base 因子 end=T-1, **绝不拉今日不完整 bar**; 今日盘中走 intraday_bars (Rule #11 不变)。
+3. `get_daily_bars` 的 freshness check + partial-bar filter 改用 `min(end, _last_expected_trading_day())`。这样 `end=T-1` 在 DB 到 T-1 时**必 short-circuit, 不管几点跑**。`end=None` 老调用方 (daily_report) 行为不变: `min(today, _last_expected)==_last_expected`。
+
+**次修 — financial 80 天 freshness gate (你批的)**:
+4. `get_financial_data` 顶部加 gate: DB 最新 publish_date 在 80 天内 → 直接返回 DB, 不打 EM。miss/stale/error 全 fall through 到 EM (语义不变)。daily_report 共享路径同样受益。
+5. `store.load_financial_history(codes)` — 返回**全历史多行** (不是 load_financial 的 latest-only)。**关键**: `_fetch_financial_history` 要靠连续多季报算 `roe_qoq/*_accel` (这 3 个在 FACTOR_COLUMNS 里); 若 gate 只返回 1 行, 这 3/64 因子会全 NaN。所以 gate 返回全历史, 跟 EM 路径**等价**。
+
+### Mac 实测验证 (虽然 xtquant 测不了真 timing, 这两块是纯逻辑/DB 可测)
+
+- `previous_trading_day`: 5/28(四)→5/27, 5/25(一)→5/22, 5/18(一)→5/15 ✓; 17 个 trading_calendar 测试全过。
+- **关键 determinism 验证** (现在 17:43 收盘后跑): `get_daily_bars("600519", end="20260527")` → 日志 `DB is fresh (last=2026-05-27 >= 2026-05-27), skipping API`, 返回 max=**5/27** (今日 5/28 bar 被排除), **0 网络, 0.00s**。旧逻辑这里会逐只拉 5/28。锚定生效 ✓。
+- financial gate: `get_financial_data("600519")` → `financial DB fresh (latest publish 2026-04-25 >= 2026-03-09), skipping EM`, 102 行全历史, 0 EM call ✓。
+- 81 个相关单元测试 (fetch/financial/calendar/intraday/store) 全过, 无回归。
+
+### ⚠️ 两点要告诉你
+
+1. **warm 保留并也锚 T-1** (你 round 111 说"可保留 warm 但它也锚 T-1")。现在 warm 用传入的 `asof_eod` 当 expected, 不再用 wall-clock。DB stale 时它仍是那道便宜保险 (cache-read 补到 T-1 → get_daily_bars short-circuit)。fresh 时 no-op。
+2. **有一处 pre-existing 改动我没提交**: `fetcher.py` 工作区里还有一个**不是我这轮**的改动 —— `get_industry_history` 的 SW (申万) cert-chain patch (`verify=False` for swsresearch.com)。那是之前 session 留下的 uncommitted WIP, 我只 stage 了我 round 111 的 4 个 hunk (get_daily_bars ×3 + get_financial_data gate), **没动那个 SW hunk**, 它仍在工作区未提交。你如果知道它的来历、确认要提交, 告诉我或你自己 commit。我不擅自提交不属于本轮的改动。(同理 collector.py / model.py / paper_trade.py / config / data 的 working-tree 改动我也没碰。)
+
+### 预期 & 下一步
+fetch 25s + financial (gate 后大多 skip) + daily-bars (short-circuit, 0 逐只拉) + 因子计算 + score ≈ **总 ~1.5min**。Mac 测不了真 xtquant timing, 等你 ECS 复测确认: (a) 0 次 per-code daily 拉, (b) financial 大多 skip, (c) 总 <5min。确认后 5/29 14:30 第二次 live。
+
+### 这一轮你
+1. ACK round 112 (或指出问题)
+2. ECS `git pull` (已 push `76c59f0`)
+3. ECS 复跑 `intraday_plan.py --skip-sleep` 计时, 贴阶段耗时, 确认 0 per-code daily 拉 + financial skip + 总 <5min
+4. (可选) 处理 fetcher.py 里那个 SW cert WIP hunk
+5. 确认后 → 5/29 14:30 第二次 live
+
+### Rule reminders
+- Rule #11: EOD 因子 end=T-1 (PIT, 不偷看今日不完整 bar), morning=今日 9:30-14:29 — 不变
+- Rule #4: 只改 fetch 锚定 + 加 financial skip-if-fresh, 不动 model / 不改数据语义
+
+### 主动给 user
+round 110 把盘中拉数据从 6min 压到 25s 后, 发现 scoring 还有 22min 的两个慢点: 算因子时逐只查日线 (18min) + 逐只查财报 (4min)。其中 18min 主要是"收盘后复测"的假象 (盘中本不会发生), 但代码太依赖"现在几点", 脆弱。round 111 修法: (1) 把"用哪天的日线"显式钉死成 T-1 (上一个完整交易日), 不管脚本几点跑都一致, 再也不会去拉今天还没收盘的数据; (2) 财报加"80 天内不重复拉"的缓存 gate (季报 90 天才更新一次, 顺带 daily_report 也提速)。Mac 上已验证锚定 + gate 都生效 (0 网络命中)。预期盘中总耗时压到 ~1.5min。已 push, 等建议师 ECS 复测确认 <5min, 5/29 14:30 第二次实盘。今天无下单不受影响。
+
+
 ## [2026-05-28 16:55] 第 110 轮 (round 109 perf fix: download_history_data2 → get_market_data 读缓存) · 1 commit `75178d2` (待 push 授权)
 
 ### ACK round 109
