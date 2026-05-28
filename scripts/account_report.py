@@ -35,6 +35,7 @@ NAV_HISTORY_PATH = ROOT / "data" / "account_nav_history.json"
 REPORT_DIR = ROOT / "data" / "reports"
 PLAN_PATH = ROOT / "data" / "orders" / "latest.json"
 EXEC_DIR = ROOT / "data" / "orders" / "executions"
+SHADOW_STATE_PATH = ROOT / "data" / "shadow_930" / "state.json"
 
 
 def fetch_qmt_snapshot() -> Dict[str, Any]:
@@ -121,6 +122,112 @@ def fmt_money(v: float) -> str:
 def fmt_pct(v: float) -> str:
     sign = "+" if v > 0 else ""
     return f"{sign}{v:.2f}%"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# P11-5 round 101: 14:30 real (Arm A) vs 9:30-shadow (Arm B) comparison
+# ──────────────────────────────────────────────────────────────────────
+
+def load_shadow_navs() -> List[Tuple[str, float]]:
+    """Return Arm B shadow NAV series as [(date, nav), ...] sorted by date.
+
+    Empty list if the shadow recorder hasn't produced state yet (e.g.
+    before its first 17:00 run).
+    """
+    if not SHADOW_STATE_PATH.exists():
+        return []
+    try:
+        state = json.loads(SHADOW_STATE_PATH.read_text(encoding="utf-8"))
+        hist = state.get("nav_history", [])
+        return sorted(((h["date"], float(h["nav"])) for h in hist), key=lambda x: x[0])
+    except Exception as e:
+        print(f"[warn] shadow state read failed: {e}")
+        return []
+
+
+def _arm_stats(navs: List[Tuple[str, float]]) -> Optional[Dict[str, float]]:
+    """cumulative return / annualized Sharpe / max drawdown from a NAV series.
+
+    Returns None if < 2 points. Sharpe over ~10 trading days is noisy by
+    construction — this is a 2-week read, not a verdict (advisor round 101).
+    """
+    if len(navs) < 2:
+        return None
+    vals = [v for _, v in navs]
+    start, last = vals[0], vals[-1]
+    cum = last / start - 1 if start > 0 else 0.0
+
+    # daily simple returns
+    rets = [vals[i] / vals[i - 1] - 1 for i in range(1, len(vals)) if vals[i - 1] > 0]
+    sharpe = 0.0
+    if len(rets) >= 2:
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        std = var ** 0.5
+        sharpe = (mean / std * (252 ** 0.5)) if std > 0 else 0.0
+
+    # max drawdown
+    peak = vals[0]
+    mdd = 0.0
+    for v in vals:
+        peak = max(peak, v)
+        if peak > 0:
+            mdd = min(mdd, v / peak - 1)
+
+    return {"cum": cum, "sharpe": sharpe, "mdd": mdd, "n": len(navs)}
+
+
+def build_shadow_comparison(real_history: List[Dict[str, Any]]) -> List[str]:
+    """Render the "14:30 real vs 9:30-shadow" section.
+
+    Aligns both arms to the shadow's start date (the common 5/29 origin)
+    and rebases each to its own first NAV so cumulative returns are
+    comparable regardless of differing absolute capital.
+    """
+    shadow_navs = load_shadow_navs()
+    if not shadow_navs:
+        return [
+            "## 14:30 real vs 9:30-shadow 对比",
+            "",
+            "_(shadow 尚未产生 NAV — Arm B 第一次 17:00 运行后出现)_",
+            "",
+        ]
+
+    shadow_start = shadow_navs[0][0]
+    # Arm A real NAV = total_assets, filtered to dates ≥ shadow start.
+    real_navs = sorted(
+        ((h["date"], float(h["total_assets"])) for h in real_history
+         if h.get("date", "") >= shadow_start),
+        key=lambda x: x[0],
+    )
+
+    real_stats = _arm_stats(real_navs)
+    shadow_stats = _arm_stats(shadow_navs)
+
+    lines = ["## 14:30 real vs 9:30-shadow 对比", ""]
+    lines.append(f"共同起点 **{shadow_start}** · 同 intraday_blend 模型 · 唯一差别 = 入场时点")
+    lines.append("")
+    if real_stats is None or shadow_stats is None:
+        n_r = real_stats["n"] if real_stats else len(real_navs)
+        n_s = shadow_stats["n"] if shadow_stats else len(shadow_navs)
+        lines.append(f"_(样本不足：real {n_r} 点 / shadow {n_s} 点，≥2 点后出对比)_")
+        lines.append("")
+        return lines
+
+    lines.append("| Arm | 入场 | 累计收益 | Sharpe(年化) | 最大回撤 | 样本 |")
+    lines.append("|---|---|---:|---:|---:|---:|")
+    lines.append(f"| A (real) | 14:30 当日 | {fmt_pct(real_stats['cum']*100)} | "
+                 f"{real_stats['sharpe']:.2f} | {fmt_pct(real_stats['mdd']*100)} | {real_stats['n']}d |")
+    lines.append(f"| B (shadow) | T+1 9:30 | {fmt_pct(shadow_stats['cum']*100)} | "
+                 f"{shadow_stats['sharpe']:.2f} | {fmt_pct(shadow_stats['mdd']*100)} | {shadow_stats['n']}d |")
+    lines.append("")
+    gap = (real_stats["cum"] - shadow_stats["cum"]) * 100
+    lines.append(f"**Δ 累计 (real − shadow): {fmt_pct(gap)}**")
+    lines.append("")
+    lines.append("> 回测 (P11-3) 已显示两者 mean Sharpe 零差异 (1.95=1.95)；这是实盘 confirm。"
+                 "样本 <~10d 时 Sharpe/MDD 噪声大，看累计 Δ 趋势为主。")
+    lines.append("")
+    return lines
 
 
 def build_report(snapshot: Dict[str, Any], history: List[Dict[str, Any]],
@@ -219,6 +326,9 @@ def build_report(snapshot: Dict[str, Any], history: List[Dict[str, Any]],
         lines.append(f"## 明日开盘待执行")
         lines.append("（暂无 plan — daily_report 可能尚未运行，或当前持仓与 Top-K 匹配无需调整）")
         lines.append("")
+
+    # P11-5 live A/B: 14:30 real vs 9:30-shadow (round 101)
+    lines.extend(build_shadow_comparison(history))
 
     lines.append("---")
     lines.append("_Money Printer 真实账户日报 (account_report.py)_")
