@@ -503,14 +503,24 @@ def main() -> int:
     summary_md = _format_summary(results)
     print("\n" + summary_md)
 
-    # Persist execution log
+    # Persist execution log. Per P11-5 round 97 decision (4): co-locate
+    # 14:30 + 9:30 fills under data/orders/executions/ but tag the
+    # intraday filename so account_report grep and dir cleanup stay
+    # uniform. Detection comes from the plan's own entry_path marker
+    # (set by scripts/intraday_plan.py) so the executor doesn't need a
+    # new CLI flag.
     log_dir = ROOT / "data" / "orders" / "executions"
     log_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    out = log_dir / f"exec_{stamp}.json"
+    date_part = time.strftime("%Y%m%d")
+    time_part = time.strftime("%H%M%S")
+    if plan.get("entry_path") == "intraday_14_30":
+        out = log_dir / f"exec_{date_part}_intraday_{time_part}.json"
+    else:
+        out = log_dir / f"exec_{date_part}_{time_part}.json"
     out.write_text(json.dumps({
         "executed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "mode": args.mode,
+        "entry_path": plan.get("entry_path"),
         "plan_generated_at": plan.get("generated_at"),
         "results": results,
     }, ensure_ascii=False, indent=2), encoding="utf-8")

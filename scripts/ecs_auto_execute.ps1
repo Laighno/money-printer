@@ -47,6 +47,33 @@ Log "==================== ECS auto-execute start ===================="
 $LogDir = Split-Path $LogPath
 if (-not (Test-Path $LogDir)) { New-Item -Type Directory -Path $LogDir -Force | Out-Null }
 
+# Phase C fallback gate: skip 9:30 execute iff the IMMEDIATELY-PRECEDING
+# trading day's 14:30 path succeeded. Semantics:
+#   - Mon→Fri (skip Sat/Sun): check that single preceding weekday's flag.
+#   - If flag present → 14:30 already entered positions yesterday on
+#     fresher features (P11-4 walk-forward: +0.14 Sharpe vs 9:30); the
+#     9:30 plan would be redundant churn → SKIP.
+#   - If flag absent (14:30 failed yesterday OR is the first day after
+#     a Chinese holiday) → proceed with 9:30 fallback (existing 30h
+#     stale guard catches stale-plan post-holiday cases).
+# NOT using a 5-day sliding window: a multi-day window would mask a
+# legitimate 14:30 failure (e.g. T-1 14:30 fails, T-2 14:30 succeeded
+# → window finds T-2 flag → wrongly skips T 9:30 fallback for T-1 fail).
+$daysBack = 1
+$checkDate = (Get-Date).AddDays(-$daysBack)
+while ($checkDate.DayOfWeek -eq [DayOfWeek]::Saturday -or `
+       $checkDate.DayOfWeek -eq [DayOfWeek]::Sunday) {
+    $daysBack++
+    $checkDate = (Get-Date).AddDays(-$daysBack)
+}
+$checkFlag = "$REPO\data\orders\intraday_success_$($checkDate.ToString('yyyyMMdd')).flag"
+if (Test-Path $checkFlag) {
+    Log "Phase C: previous trading day ($($checkDate.ToString('yyyy-MM-dd'))) 14:30 succeeded; SKIP 9:30 execute"
+    Log "==================== ECS auto-execute SKIPPED (14:30 fallback gate) ===================="
+    exit 0
+}
+Log "Phase C: no intraday_success flag for $($checkDate.ToString('yyyy-MM-dd')) (14:30 failed or post-holiday); proceeding with 9:30 fallback"
+
 # Step 1: git pull
 Set-Location $REPO
 Log "Step 1: git pull origin $BRANCH"
