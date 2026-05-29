@@ -94,6 +94,13 @@ sys.path.insert(0, str(ROOT))
 # the 14:30 bar in training data would leak the prediction-time price.
 MORNING_OPEN = dt_time(9, 30)
 AFTERNOON_CUTOFF = dt_time(14, 30)
+# Phase 3a (round 129): --exec-window fetches the EXECUTION window instead of
+# the morning factor window. 14:30 = the first post-decision tradeable bar
+# (its open = a 14:30 market-order fill); 14:30–15:00 lets us compute a
+# realistic VWAP fill + a per-stock spread/impact proxy from the 1m bars.
+EXEC_START = dt_time(14, 30)
+EXEC_END = dt_time(15, 0)
+_FILTER_MODE = "morning"   # set to "exec" by --exec-window
 
 
 def _code_to_xtquant(code: str) -> str:
@@ -243,10 +250,14 @@ def _fetch_one_month(
     merged["code"] = merged["code_xt"].apply(_xtquant_to_code)
     merged.drop(columns=["code_xt"], inplace=True)
 
-    # Step c — filter to MORNING_OPEN ≤ t < AFTERNOON_CUTOFF (9:30-14:30 exclusive).
+    # Step c — time filter. Default: morning factor window (9:30 ≤ t < 14:30).
+    # --exec-window: execution window (14:30 ≤ t ≤ 15:00) for Phase-3 real fill.
     merged["datetime"] = pd.to_datetime(merged["datetime"])
     times = merged["datetime"].dt.time
-    mask = (times >= MORNING_OPEN) & (times < AFTERNOON_CUTOFF)
+    if _FILTER_MODE == "exec":
+        mask = (times >= EXEC_START) & (times <= EXEC_END)
+    else:
+        mask = (times >= MORNING_OPEN) & (times < AFTERNOON_CUTOFF)
     merged = merged.loc[mask].copy()
 
     if merged.empty:
@@ -279,11 +290,23 @@ def main() -> int:
     ap.add_argument("--end", default="20260430", help="YYYYMMDD end date (inclusive)")
     ap.add_argument("--out-dir", default="data/intraday_1m",
                     help="Output parquet directory (default: data/intraday_1m)")
+    ap.add_argument("--exec-window", action="store_true",
+                    help="Phase 3a: fetch the 14:30–15:00 EXECUTION window (real "
+                         "14:30 fill) instead of the 9:30–14:30 morning factor "
+                         "window. Implies out-dir data/intraday_1430_exec unless "
+                         "--out-dir is given explicitly.")
     ap.add_argument("--force", action="store_true",
                     help="Re-fetch even if monthly parquet already exists")
     ap.add_argument("--limit-codes", type=int, default=0,
                     help="If > 0, only fetch first N codes (for smoke testing on ECS)")
     args = ap.parse_args()
+
+    if args.exec_window:
+        global _FILTER_MODE
+        _FILTER_MODE = "exec"
+        if args.out_dir == "data/intraday_1m":
+            args.out_dir = "data/intraday_1430_exec"
+        logger.info("--exec-window: fetching 14:30–15:00 execution bars → {}", args.out_dir)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
