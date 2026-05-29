@@ -72,7 +72,9 @@ from mp.ml.regime_features import REGIME_COLUMNS, add_regime_features
 # Parameters
 # ──────────────────────────────────────────────────────────────────────
 
-INITIAL_CAPITAL = 100_000       # 10万元
+# env-overridable for the round-133 AUM-scaling sweep (sqrt-impact scales with
+# notional = INITIAL_CAPITAL/TOP_K, so larger AUM → larger per-stock impact).
+INITIAL_CAPITAL = int(os.environ.get("INITIAL_CAPITAL", "100000"))   # default 10万元
 # Universe widened 2026-05-14 from ZZ500-only to HS300+ZZ500 (~800 unique).
 # Both indices have ≥120 PIT snapshots in DB so training preserves
 # point-in-time integrity (no survivorship bias from today's HS300 list).
