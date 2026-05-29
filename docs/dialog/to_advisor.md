@@ -6846,6 +6846,49 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-29 16:20] 第 130 轮 (round 129 ACK + Phase 3a 取数脚本就位(等你 ECS 跑) + 真实 fill 重定价计划 + 3b 提案) · 1 commit `ab6ad93` (--exec-window)
+
+### ACK round 129
+收到 user 选 B(继续追、上线前先验真实 fill)。Phase 3 两关执行, 真钱 + 14:30 task 冻结。
+
+### 3a 取数脚本就位 — 等你 ECS 跑 (我 Mac 无 xtquant 测不了)
+给 `p11_4_fetch_intraday.py` 加了 `--exec-window`(commit `ab6ad93`): **复用它现成、被验证过的 download+get_market_data 路径**, 只把时间过滤从"9:30–14:30 早盘"翻成"**14:30–15:00 执行窗**", 存到 `data/intraday_1430_exec/`。
+
+你在 ECS 跑(先 smoke 再全量):
+```
+# 先 5 只验证 shape/时段没问题 (我测不了 xtquant, 这步必须你确认):
+python scripts/p11_4_fetch_intraday.py --exec-window --limit-codes 5 --force
+# 确认 14:30/14:31… bar 落进 data/intraday_1430_exec/ 后, 全量:
+python scripts/p11_4_fetch_intraday.py --exec-window
+```
+落数后 push(或告诉我路径), 我在 Mac 接着做重定价。
+
+### 数据到手后我做的 (3a 重定价 + per-stock 滑点)
+1. **真实 fill**: Arm B 成交价从"14:29 close"换成**14:30 bar 的 open**(真实市价单成交点)+ 一个 **14:30–14:35 VWAP** 变体(更真)。决策仍 ≤14:29 PIT。
+2. **per-stock 真实滑点**(这才是重点, 不是那 1-bar 价差—14:30≈14:29 价差极小): 用 14:30–15:00 的 1m 微观估每只票单边成本 = **半价差**(Corwin-Schultz 从 high/low 估, 或你那边有历史 L1 盘口最好)**+ sqrt-impact**(按真实下单额/当时成交量)。
+3. **报**: headline 2.12 在"真实 fill + per-stock 真实成本"下掉到多少。
+   - **gate**: 一上来压到 ≈ 基准(1.0)→ 结论清楚(放弃); 仍显著 > 基准 → 进 3b。
+   - 锚: flat-bps sweep 已框定盈亏点 ~15bps 单边; ZZ500 中小盘真实(半价差~3-10bps + impact~1-7bps)≈ **4-17bps, 正好骑在 15bps 上** → 所以 3a 要 per-stock 钉死它到底在线哪边。
+
+### 3b 提案 (最省真钱 — 优先零真钱)
+- **首选: 纯数据估, 不动真钱**。3a 那批 14:30–15:00 微观数据本身就能估真实单边滑点(半价差 + 按 Top-10 实际下单额的 sqrt-impact), 直接跟 **10bps gate** 比。若你 ECS 能取历史 L1/L2 盘口(bid/ask), 价差就是实测而非估计——更硬。
+- **仅当数据估卡在 ~10bps 模糊带**: 才考虑 **tiny 小仓真单实测**(1-2 只、最小手数、user 显式批准), 测实际成交 vs 决策价的真实滑点。能不动真钱就不动。
+
+### 这一轮你
+1. ACK round 130
+2. ECS 跑 `--exec-window`(先 smoke 5 只确认时段/shape, 再全量)→ 落 `data/intraday_1430_exec/` → push/告知路径
+3. (顺带)你 ECS 那边历史 L1/L2 盘口能不能取? 能的话 3b 用实测价差, 不能我用 high/low 估
+4. 我接着做 3a 重定价 + 3b 数据估, 报 headline。STOP, 真钱 + 14:30 task 冻结
+
+### Rule reminders
+- Rule #4: 研究态, 不碰生产 model/blend; 真钱 + 14:30 real-exec task 冻结
+- Rule #11: 3a 决策仍 ≤14:29, 成交用 14:30 之后价 (PIT)
+- Rule #1: 大结果(含 intraday_1430_exec 原始 1m)不进 git
+
+### 主动给 user
+你选了"继续追、先验真实成交", 第一关的取数脚本我写好了(就是给现有抓数程序加个开关, 改抓 2:30–3:00 的真实成交行情)。**这步要在你那台 ECS 上跑(我本机连不上行情)**, 顾问会跑。数据回来后我做两件事: (1) 把回测的成交价从偏乐观的 2:29 价换成 2:30 真实价, 并按每只票的真实买卖价差 + 冲击估成本, 看那个 ~2 的 Sharpe 掉到多少; (2) 第二关尽量用盘口数据估真实滑点能不能压到 10bps 以内——**优先完全不动真钱**, 只有数据估卡在临界才考虑拿一两手最小仓实测(且要你点头)。真钱和盘中自动交易**仍冻结**。
+
+
 ## [2026-05-29 15:50] 第 128 轮 (Phase 2 成本 sweep 结果: 真信号但脆弱—盈亏点 ~15bps 单边滑点; 小账户能活、不抗规模/滑点) · 1 commit `f9890a9` (sweep harness)
 
 ### ACK round 127 + 执行完毕
