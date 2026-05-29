@@ -493,3 +493,32 @@ require user choice (round 83 outline):
 | 82 | (engineer) | P11-3 N=6 `2574a85`, delta +0.132, 5/6 directional → MIGRATE per secondary rule |
 | 83 | Advisor "MIGRATE confirmed + hold for user" | (engineer reply only — this commit) |
 
+---
+
+## Design 2 / 14:30 intraday re-prediction — investigation closeout (rounds ~115–143)
+
+**Decision (user, round 143, 2026-05-29): keep the EOD / 9:25 strategy, SHELVE Arm B (Design 2), move on. Real money + the `MoneyPrinter-IntradayPipeline` 14:30 ECS task stay frozen/disabled.**
+
+**What Design 2 was**: feed the *real 14:30 bar* into the plain EOD `BlendRanker` as "today's close" at inference (Arm B), instead of the failed `intraday_blend` hybrid model. Hypothesis: 14:30 ≈ close, so selection ≈ EOD but acted on a day earlier.
+
+**Why shelved** — the decisive three-line full-cycle absolute account (round 142, `389a300`), 2022-01→2026-04, 1044 trading days, all same-method (real EOD daily returns; Arm B = real-EOD-daily + synthetic excess `a + 0.45×ZZ500ret`):
+
+| line | annual | vs ZZ500 | Sharpe | MaxDD |
+|---|---|---|---|---|
+| ZZ500 (market) | +2.7% | — | 0.23 | −39% |
+| **EOD (real backtest)** | **+24.8%** | **+22.1pp** | **0.89** | −31% |
+| Arm B a=14.8 (alpha real, synthetic) | +80.5% | +77.8pp | 1.76 | −34% |
+| Arm B a=0 (pure amplifier, synthetic) | +24.3% | +21.7pp | 0.77 | **−40%** |
+
+Two reversals: (1) **EOD genuinely beats the market full-cycle** (+22pp/yr, Sharpe 0.89) — the in-sample "EOD < market" was a bull-window artifact (diversified selection lags a strong-beta index in a bull, protects in the bear). (2) **Pure-amplifier Arm B is strictly *worse* than EOD** (same ~24% return, Sharpe 0.77<0.89, MDD −40%<−31%): the amplifier adds market beta/volatility whose vol-drag eats the small positive daily excess. Arm B only wins if the **+14.8 bps flat-day alpha is real** — which is unverifiable (no real-bear 1m data) and implausibly large (+45%/yr flat-day intercept). Lose the bet → strictly dominated by EOD. So: keep EOD, shelve Arm B.
+
+### Caveats / known issues found during the investigation (all now moot — Arm B shelved)
+
+| # | Issue | Verdict |
+|---|---|---|
+| ① | **复权尺度混用** — backtest & production both feed the *un-adjusted* 14:30 1m bar (`p11_4_fetch_intraday.py:229` / `intraday_plan.py:402`, `dividend_type="none"`) onto *qfq* daily history (`fetcher.py:651/676/703`, `walk_forward_backtest.py:880`). Perturbs momentum/MA factors for names that go ex-dividend inside the lookback window. | **Real, but shared by backtest AND production** (not a backtest-only artifact). Magnitude bounded — qfq current price ≈ raw price, so only names ex-div'd inside the recent window are affected. |
+| ② | **14:30 隔日成交对齐** — under the shared pending mechanism, ENTRY_TIME=14_30 scores day D's (injected-14:30) panel at Step B (`:1209`) and executes the pending at day **D+1**'s 14:30 (`:1132`, `_entry_price`). The 14_30 branch (`:886-896`) only swaps the *price source*, not the day-offset, so the `:888-890` "same-day decision+execution" comment describes the price, not the timing. | **[E] confirmed: a one-day-lagged misalignment vs Design 2's same-day intent, but a *conservative* one** — it adds staleness that understates (not inflates) a same-day intraday edge, so it does not flatter Arm B. Shelved → not fixed. |
+| ③ | **14:29-close-as-fill optimistic** | Re-tested with the **real 14:30–15:00 fill** + per-stock realistic cost (Phase 3a/3b, `a4f66a5`): Arm B drops to ~1.4–1.9 Sharpe at small AUM — still > baseline, but small and not scale-robust. |
+| ④ | **regime not validated** | The open risk (bull-window artifact) needs real-*bear* 1m data, which no free source reaches (xtquant ~9mo, Sina ~21d, system is daily-only). Only daily-synthetic was possible → cannot falsify the regime risk. |
+| ⑤ | **终局 / verdict** | EOD full-cycle **+24.8%/yr, +22pp vs market, Sharpe 0.89** is a clean real backtest, unaffected by ①–④ (EOD path: `INTRADAY_INJECT=0` + `t_plus_1_open`, no intraday_1m, all-qfq daily). Arm B wins only on an unverifiable + implausible assumption and loses to EOD otherwise → **keep EOD/9:25, shelve Arm B.** |
+

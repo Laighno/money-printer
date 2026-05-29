@@ -6846,6 +6846,28 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-29 23:00] 第 144 轮 (round 143 ACK: user 拍板收尾——保留 EOD/封存 Arm B/move on 收下 + [E] 时序对齐确认: score-D / fill-D+1-14:30 = 隔日, 是相对同日意图的"错位"但保守(低估非抬高) + decision_log 已记 Design 2 终局 ①-⑤) · 1 commit (decision_log)
+
+### ACK round 143 — Design 2 调查正式封存
+user 拍板收下: **保留 EOD/9:25、封存 Arm B、move on。** 你的代码审计三条我也收下: ① 复权尺度混用属实但回测+生产共有(非回测特有); ② 你纠正"回测≠生产"是对的(生产 14:30 也是 `intraday_plan.py:402 none`-1m + qfq 历史, 回测忠实复刻); ③ EOD 路径干净, round 142 的 +24.8% 不受任何缺陷影响。真钱 + 14:30 task 维持冻结/封存。
+
+### [E] 时序对齐确认 (读了主循环)
+**结论(一句话): 是相对 Design 2"同日 14:30 决策+执行"意图的「错位」, 但属保守错位——不用修。**
+机制: ENTRY_TIME=14_30 时, Step B(`:1209`)在 **D 日**用注入了 D 日 14:30 bar 的面板打分 → 存 pending; Step A(`:1132`)在**下一交易日 D+1** 以 `_entry_price(code, D+1)` = **D+1 的 14:30 收盘**成交。即 **打分 D / 成交 D+1 14:30 = 隔日**。`14_30` 分支(`:886-896`)只换了**价源**(14:30 收盘 ≠ T+1 open), **没动 pending 的日偏移**, 所以 `:888-890` 那句"同日决策+执行"描述的是价源、不是时序。
+为什么是保守: 相对"同日 D 14:30 买入"的本意, 回测多压了整整一天 staleness(漏掉 D 14:30→D+1 14:30 的那段), 对一个短线 14:30 信号只会**低估**、不会抬高 Arm B——所以它没给 Arm B 注水, Arm B 那些好看数字是"扛着隔日滞后还能出"的(也意味着测到的边际偏多日持续性、非纯同日 intraday alpha)。已封存, 不改。
+
+### decision_log 已记 (1 commit)
+`docs/decision_log.md` 末尾新增 "Design 2 / 14:30 intraday re-prediction — investigation closeout (rounds ~115–143)" 一节: 三线全周期绝对表 + 两翻盘 + 缺陷表 ①-⑤(①复权混用回测+生产共有 / ②[E]隔日保守错位 / ③14:29-fill 偏乐观→真实 14:30 复测 1.4-1.9 / ④regime 真熊 1m 够不到 / ⑤终局: EOD +24.8%/+22pp/Sharpe 0.89 干净, Arm B 仅靠不可验证+离谱假设才赢, 赌输严格劣于 EOD → 保留 EOD、封存 Arm B)。Rule #1: 审计/回测原始结果未进 git, 只进了结论文档 decision_log。
+
+### 这一轮你
+- 无需再派活, Design 2 这条线收尾。若 user 后续要起新方向(或想推进小仓实盘当 OOS), 我再接。
+- 真钱 + 14:30 task 保持冻结/封存。
+
+### 主动给 user
+都办完了: (1)时序那条我读了主循环——确认是「隔日成交」(打分当天、下一交易日 2:30 成交), 相对你"当天 2:30 就买"的本意算错位, 但是个**保守**错位(回测等于多等了一天才买, 只会让 2:30 策略显得更差不是更好), 所以不影响"封存"的判断, 也不用改; (2)整个 2:30 调查的终局连同几条数据瑕疵都记进了决策日志 `docs/decision_log.md`, 这条线正式封存。一句话收尾: **你每天在跑的 9:25 EOD 策略本身就很好(全周期 +24.8%/年、比大盘多赚 22 个点、夏普 0.89、回撤更小); 2:30 那套不值得为它担额外风险, 封存。** 真钱和 2:30 自动交易维持冻结, 后面要起新东西你说。
+
+---
+
 ## [2026-05-29 22:00] 第 142 轮 (三线全周期绝对账: EOD 真回测 +24.8%/年 (+22pp vs 大盘)——user 隐含前提"EOD 有超额"全周期成立(in-sample 跑输是牛市假象); 纯放大器 Arm B 严格劣于 EOD(同收益/更大回撤/更低 Sharpe)→ 决策收敛: 保留 EOD、封存 Arm B) · 0 commit code (本报告)
 
 ### ACK round 141 + 三线全周期绝对账出炉
