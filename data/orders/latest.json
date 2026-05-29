@@ -1,10 +1,10 @@
 {
-  "generated_at": "2026-05-28T17:31:43",
-  "report_date": "2026-05-28",
+  "generated_at": "2026-05-29T17:06:20",
+  "report_date": "2026-05-29",
   "account_snapshot": {
-    "total_assets": 106206.54,
-    "cash_available": 8425.54,
-    "market_value": 97781.0
+    "total_assets": 287261.49,
+    "cash_available": 216502.49,
+    "market_value": 70759.0
   },
   "holdings_at_plan_time": [
     {
@@ -18,18 +18,6 @@
       "name": "马钢股份",
       "shares": 5700,
       "avg_cost": 3.119
-    },
-    {
-      "code": "000539",
-      "name": "粤电力Ａ",
-      "shares": 2500,
-      "avg_cost": 6.622
-    },
-    {
-      "code": "002385",
-      "name": "大北农",
-      "shares": 2000,
-      "avg_cost": 3.781
     },
     {
       "code": "002439",
@@ -52,22 +40,49 @@
   ],
   "orders": [
     {
-      "code": "000539",
-      "name": "粤电力Ａ",
-      "action": "清仓",
-      "shares": 2500,
-      "limit_price": 7.99,
-      "cost": -19975.0,
-      "reason": "模型排名 #299/800（已不在 Top 100）"
+      "code": "002439",
+      "name": "启明星辰",
+      "action": "加仓",
+      "shares": 2600,
+      "limit_price": 14.21,
+      "cost": 36946.0,
+      "reason": "模型 #1/781, 超额 +2.68%，目标仓位 18.0% (现 4.9%)"
     },
     {
-      "code": "002385",
-      "name": "大北农",
-      "action": "减仓",
+      "code": "600808",
+      "name": "马钢股份",
+      "action": "加仓",
+      "shares": 9500,
+      "limit_price": 2.98,
+      "cost": 28310.0,
+      "reason": "模型 #3/781, 超额 +2.29%，目标仓位 15.8% (现 5.9%)"
+    },
+    {
+      "code": "603341",
+      "name": "龙旗科技",
+      "action": "买入",
       "shares": 1000,
-      "limit_price": 3.29,
-      "cost": -3290.0,
-      "reason": "模型排名 #54/800（跌出 Top 30，减半仓）"
+      "limit_price": 34.8,
+      "cost": 34800.0,
+      "reason": "模型 #8/781, 超额 +1.77%，目标仓位 12.8% (现 0.0%)"
+    },
+    {
+      "code": "002153",
+      "name": "石基信息",
+      "action": "买入",
+      "shares": 4200,
+      "limit_price": 8.31,
+      "cost": 34902.0,
+      "reason": "模型 #10/781, 超额 +1.69%，目标仓位 12.4% (现 0.0%)"
+    },
+    {
+      "code": "600764",
+      "name": "中国海防",
+      "action": "买入",
+      "shares": 1500,
+      "limit_price": 20.65,
+      "cost": 30974.999999999996,
+      "reason": "模型 #11/781, 超额 +1.45%，目标仓位 11.0% (现 0.0%)"
     }
   ],
   "alerts": []
