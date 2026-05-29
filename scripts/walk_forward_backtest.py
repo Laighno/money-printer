@@ -924,8 +924,28 @@ def run_walk_forward():
                     "injected factors onto scoring panel (training untouched)")
         _all_pbd_dates = sorted(panel_by_date.keys())
         if _all_pbd_dates:
-            panel_by_date = _overlay_injected_factors(
-                panel_by_date, bars_map, _all_pbd_dates[0], _all_pbd_dates[-1])
+            # Round 127 sweep: the injected panel is SEED- and COST-independent
+            # (factors only; LGBM_SEED/cost act downstream). INJECT_CACHE lets the
+            # cost sweep reuse one overlay instead of re-running the ~33min build
+            # per (seed,cost). Cache only the traded window [BT_START,BT_END] rows
+            # (scoring uses panel_by_date only there; retrain uses `panel`).
+            _cache = os.environ.get("INJECT_CACHE", "")
+            if _cache and Path(_cache).exists():
+                cdf = pd.read_parquet(_cache)
+                cdf["date"] = pd.to_datetime(cdf["date"])
+                for dkey, grp in cdf.groupby("date"):
+                    panel_by_date[pd.Timestamp(dkey)] = grp.reset_index(drop=True)
+                logger.info("INJECT_CACHE hit: loaded {} overlaid rows / {} dates from {} "
+                            "— skipped ~33min overlay", len(cdf), cdf["date"].nunique(), _cache)
+            else:
+                panel_by_date = _overlay_injected_factors(
+                    panel_by_date, bars_map, _all_pbd_dates[0], _all_pbd_dates[-1])
+                if _cache:
+                    win = [d for d in panel_by_date if bt_start_ts <= d <= bt_end_ts]
+                    cat = pd.concat([panel_by_date[d] for d in win], ignore_index=True)
+                    cat.to_parquet(_cache)
+                    logger.info("INJECT_CACHE saved: {} rows / {} dates → {}",
+                                len(cat), len(win), _cache)
 
     # Trading calendar from panel for label_cutoff (Fix #3: avoid calendar-day approximation)
     _all_trade_dates = sorted(panel["date"].unique())
@@ -988,8 +1008,26 @@ def run_walk_forward():
     # ────────────────────────────────────────────────────────────────────────
 
     # 3. Simulation state
-    fees = FeeSchedule(slippage_bps=SLIPPAGE_BPS, commission_bps=COMMISSION_BPS,
-                       use_sqrt_impact=True, impact_alpha_bps=150.0, min_slippage_bps=3.0)
+    # Round 127 cost sweep: cost model is env-driven so Arm B can be re-costed
+    # cheaply (with INJECT_CACHE) without rebuilding the injected panel.
+    #   USE_SQRT_IMPACT=0 → flat per-trade slippage = SLIPPAGE_BPS (clean "bps"
+    #     sweep); =1 (default) keeps the realistic sqrt-impact (Phase-1 config).
+    #   IMPACT_ALPHA_BPS overrides the sqrt α (default 150).
+    #   STAMP_TAX_BPS overrides sell-side stamp (default FeeSchedule new=5);
+    #     set 0 (with slippage/commission 0) for a true zero-cost gross run.
+    _use_sqrt = os.environ.get("USE_SQRT_IMPACT", "1") == "1"
+    _impact_alpha = float(os.environ.get("IMPACT_ALPHA_BPS", "150.0"))
+    _fee_kw = dict(slippage_bps=SLIPPAGE_BPS, commission_bps=COMMISSION_BPS,
+                   use_sqrt_impact=_use_sqrt, impact_alpha_bps=_impact_alpha,
+                   min_slippage_bps=3.0)
+    _stamp = os.environ.get("STAMP_TAX_BPS")
+    if _stamp is not None:
+        _fee_kw["stamp_tax_bps_old"] = float(_stamp)
+        _fee_kw["stamp_tax_bps_new"] = float(_stamp)
+    fees = FeeSchedule(**_fee_kw)
+    logger.info("FeeSchedule: slippage={} commission={} sqrt_impact={} alpha={} stamp={}",
+                SLIPPAGE_BPS, COMMISSION_BPS, _use_sqrt, _impact_alpha,
+                _stamp if _stamp is not None else "default(5)")
     logger.info("Slippage model: sqrt-impact α={} bps, floor={} bps (fallback linear={} bps)",
                 fees.impact_alpha_bps, fees.min_slippage_bps, fees.slippage_bps)
     broker = SimulatedBroker(INITIAL_CAPITAL, fees, silent=True)
