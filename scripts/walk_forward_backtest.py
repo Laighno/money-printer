@@ -1307,6 +1307,12 @@ def run_walk_forward():
 
     # 5. Performance metrics
     nav_df = pd.DataFrame(nav_records)
+    # Round 135: NAV_DUMP writes the daily (date, daily_return, nav) series for
+    # regime bucketing (Arm B vs A daily excess by ZZ500 up/flat/down day).
+    _nav_dump = os.environ.get("NAV_DUMP")
+    if _nav_dump and not nav_df.empty:
+        nav_df.to_csv(_nav_dump, index=False)
+        logger.info("NAV_DUMP: wrote {} daily rows → {}", len(nav_df), _nav_dump)
     metrics = calc_performance(nav_df)
 
     # 5b. Tail-quality metrics — Hit Rate@K and NDCG@K averaged over
