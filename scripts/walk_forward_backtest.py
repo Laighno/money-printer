@@ -562,6 +562,12 @@ def _build_entry_lk_14_30(close_lk: Dict[tuple, float]) -> Dict[tuple, float]:
 # EOD blend; at inference it sees 14:30-as-today's-close (Design 2's clean
 # reframe). Rule #11: intraday_1m already ends 14:29 (no 14:30 leak).
 INTRADAY_INJECT = os.environ.get("INTRADAY_INJECT", "0") == "1"
+# Round 121 negative control: when > 0, inject the WRONG day's morning bar
+# (shifted N positions in the sorted morning-date list, same code) instead of
+# day T's own. If Arm B's alpha genuinely comes from T's 14:30 bar it MUST
+# collapse to ~baseline here (garbage input → no signal); if it survives, the
+# excess is structural leakage, not the injected signal. Decisive test.
+INJECT_PLACEBO_SHIFT = int(os.environ.get("INJECT_PLACEBO_SHIFT", "0"))
 
 
 def _load_morning_bars(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> Dict[tuple, dict]:
@@ -618,6 +624,19 @@ def _overlay_injected_factors(
         logger.warning("Arm B: no morning bars in window — returning panel unchanged")
         return panel_by_date
 
+    # Negative-control remap (round 121): decision day dt → a WRONG morning
+    # date (shifted in the sorted morning-date list). Same code, wrong day.
+    morning_dates = sorted({d for (_c, d) in morning})
+    wrong_day: Dict[pd.Timestamp, pd.Timestamp] = {}
+    if INJECT_PLACEBO_SHIFT and morning_dates:
+        n_md = len(morning_dates)
+        wrong_day = {d: morning_dates[(i + INJECT_PLACEBO_SHIFT) % n_md]
+                     for i, d in enumerate(morning_dates)}
+        logger.warning("Arm B NEGATIVE CONTROL: INJECT_PLACEBO_SHIFT={} — injecting "
+                       "WRONG-day morning bars; alpha MUST collapse to ~baseline if "
+                       "the signal is real", INJECT_PLACEBO_SHIFT)
+    _audit_done = False
+
     # Pre-index bars_map by code → sorted (date, ohlcv arrays) for fast slicing.
     out: Dict[pd.Timestamp, pd.DataFrame] = dict(panel_by_date)
     window_dates = [d for d in panel_by_date if window_start <= d <= window_end]
@@ -637,7 +656,9 @@ def _overlay_injected_factors(
         base["code"] = base["code"].astype(str).str.zfill(6)
         tech_updates: Dict[int, Dict[str, float]] = {}  # row_idx → {tech_col: val}
         for idx, code in zip(base.index, base["code"]):
-            mb = morning.get((code, pd.Timestamp(dt)))
+            src_dt = (wrong_day.get(pd.Timestamp(dt), pd.Timestamp(dt))
+                      if INJECT_PLACEBO_SHIFT else pd.Timestamp(dt))
+            mb = morning.get((code, src_dt))
             if mb is None:
                 continue
             bdf = bars_map.get(code)
@@ -675,6 +696,23 @@ def _overlay_injected_factors(
             row_vals = {c: float(fac[c][-1]) for c in TECHNICAL_COLUMNS if c in fac}
             tech_updates[idx] = row_vals
             n_rows_injected += 1
+            if not _audit_done:
+                # Round 121 ② panel audit: prove the injected series ends
+                # [..., T-1 real, T synthetic-14:30] with NO T real EOD bar, the
+                # synth close == 14:29 (≠ full-day close), and that ALL 51
+                # technical cols are replaced (missing → kept-baseline = leak).
+                real_t = bdf.loc[bdf["date"] == dt, "close"]
+                missing = [c for c in TECHNICAL_COLUMNS if c not in fac]
+                logger.info(
+                    "Arm B PANEL AUDIT {} T={} (src={}): hist last2={} | T-real-bar "
+                    "in hist? {} | synth(14:29) close={:.4f} vs real-T close={} | "
+                    "tech cols updated {}/{}, missing(kept-baseline)={}",
+                    code, str(pd.Timestamp(dt).date()), str(src_dt.date()),
+                    [str(x.date()) for x in hist['date'].iloc[-2:]],
+                    bool((hist['date'] == dt).any()), mb['close'],
+                    (f"{float(real_t.iloc[0]):.4f}" if len(real_t) else "NA(T not in DB)"),
+                    len(row_vals), len(TECHNICAL_COLUMNS), missing)
+                _audit_done = True
             if len(proof_samples) < 6:
                 proof_samples.append({
                     "code": code, "date": str(pd.Timestamp(dt).date()),
