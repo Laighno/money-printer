@@ -113,8 +113,8 @@ def _merged_current() -> list[str]:
     """Merged current constituents across UNIVERSES (today's list)."""
     from mp.data.fetcher import get_recommendation_universe
     return get_recommendation_universe(UNIVERSES)
-BT_START = "20200101"           # first trading month
-BT_END = "20260401"             # last month (exclusive)
+BT_START = os.environ.get("BT_START", "20200101")   # first trading month (env-overridable for windowed A/B, P11 round 117)
+BT_END = os.environ.get("BT_END", "20260401")       # last month (exclusive)
 TOP_K = int(os.environ.get("TOP_K", "10"))
 HORIZON = 20                    # forward return horizon in trading days
 SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", "5"))
@@ -553,6 +553,155 @@ def _build_entry_lk_14_30(close_lk: Dict[tuple, float]) -> Dict[tuple, float]:
     return out
 
 
+# ── P11 Design 2 (round 117): Arm B real-14:30 factor injection ──────────
+# INTRADAY_INJECT=1 overlays, onto panel_by_date for window dates only, the
+# 64 factors recomputed with the REAL 14:30(T) morning bar injected as the
+# latest bar — i.e. the historical replay of production's
+# build_latest_features(intraday_bars=...). This is SCORING-only: training
+# reads `panel` (untouched), so the model stays the standard non-injected
+# EOD blend; at inference it sees 14:30-as-today's-close (Design 2's clean
+# reframe). Rule #11: intraday_1m already ends 14:29 (no 14:30 leak).
+INTRADAY_INJECT = os.environ.get("INTRADAY_INJECT", "0") == "1"
+
+
+def _load_morning_bars(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> Dict[tuple, dict]:
+    """Aggregate data/intraday_1m/*.parquet into a per-(code, date) morning
+    bar (09:30–14:29). amount is synthesized as Σ(close_i × volume_i) since
+    the 1m parquet has no amount column — that IS the morning turnover."""
+    intra_dir = Path("data/intraday_1m")
+    parts = sorted(intra_dir.glob("*.parquet"))
+    if not parts:
+        logger.warning("INTRADAY_INJECT=1 but data/intraday_1m empty — no Arm B injection")
+        return {}
+    intra = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+    intra["datetime"] = pd.to_datetime(intra["datetime"])
+    intra["date"] = intra["datetime"].dt.normalize()
+    intra = intra[(intra["date"] >= start_ts) & (intra["date"] <= end_ts)].copy()
+    if intra.empty:
+        return {}
+    intra["code"] = intra["code"].astype(str).str.zfill(6)
+    intra["_amt"] = intra["close"].astype(float) * intra["volume"].astype(float)
+    intra = intra.sort_values(["code", "datetime"])
+    agg = intra.groupby(["code", "date"]).agg(
+        open=("open", "first"), high=("high", "max"), low=("low", "min"),
+        close=("close", "last"), volume=("volume", "sum"), amount=("_amt", "sum"),
+    )
+    morning: Dict[tuple, dict] = {}
+    for (code, date), r in agg.iterrows():
+        if pd.isna(r["close"]) or pd.isna(r["open"]):
+            continue
+        morning[(code, pd.Timestamp(date))] = {
+            "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]),
+            "close": float(r["close"]), "volume": float(r["volume"]), "amount": float(r["amount"]),
+        }
+    logger.info("Arm B: loaded {} (code, date) morning bars from intraday_1m", len(morning))
+    return morning
+
+
+def _overlay_injected_factors(
+    panel_by_date: Dict[pd.Timestamp, pd.DataFrame],
+    bars_map: Dict[str, pd.DataFrame],
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+) -> Dict[pd.Timestamp, pd.DataFrame]:
+    """Return a NEW panel_by_date where, for dates in [window_start, window_end]
+    that have intraday_1m data, each (code, T) row's 51 TECHNICAL_COLUMNS are
+    recomputed on [EOD bars < T] + [real 14:30(T) morning bar]. The 13
+    fundamental/trend/industry columns are kept from the baseline row
+    (injection-invariant: publish-date aligned + cross-sectional). Dates
+    outside the window, and codes without a morning bar, are passed through
+    unchanged so the backtest degrades gracefully."""
+    from mp.ml.dataset import _compute_technical_factors, TECHNICAL_COLUMNS
+
+    morning = _load_morning_bars(window_start, window_end)
+    if not morning:
+        logger.warning("Arm B: no morning bars in window — returning panel unchanged")
+        return panel_by_date
+
+    # Pre-index bars_map by code → sorted (date, ohlcv arrays) for fast slicing.
+    out: Dict[pd.Timestamp, pd.DataFrame] = dict(panel_by_date)
+    window_dates = [d for d in panel_by_date if window_start <= d <= window_end]
+    n_rows_injected = 0
+    n_codes_injected = 0
+    proof_samples: List[dict] = []  # injection-proof: baseline vs injected factor values
+
+    _sorted_window = sorted(window_dates)
+    for _di, dt in enumerate(_sorted_window):
+        if _di % 20 == 0:
+            logger.info("Arm B inject progress: {}/{} window dates ({} rows so far)",
+                        _di, len(_sorted_window), n_rows_injected)
+        base = panel_by_date[dt]
+        if base is None or base.empty:
+            continue
+        base = base.copy()
+        base["code"] = base["code"].astype(str).str.zfill(6)
+        tech_updates: Dict[int, Dict[str, float]] = {}  # row_idx → {tech_col: val}
+        for idx, code in zip(base.index, base["code"]):
+            mb = morning.get((code, pd.Timestamp(dt)))
+            if mb is None:
+                continue
+            bdf = bars_map.get(code)
+            if bdf is None or bdf.empty:
+                continue
+            hist = bdf[bdf["date"] < dt]
+            if len(hist) < 80:   # _process_single_stock minimum
+                continue
+            # Cap to the last 300 bars before computing factors. Every
+            # TECHNICAL_COLUMNS factor uses a rolling window <= 60, and MACD's
+            # EMA26 fully converges in < 300 bars, so the LAST row's factor
+            # values are identical (to ~1e-8) to the full-history computation
+            # — but ~9x cheaper: hist otherwise grows to ~2700 bars by 2025,
+            # which was the real Arm B bottleneck (~2h). Correctness-preserving.
+            if len(hist) > 300:
+                hist = hist.tail(300)
+            # Build injected series arrays: [EOD bars < T] + [morning(T)].
+            close = np.append(hist["close"].to_numpy(float), mb["close"])
+            high = np.append(hist["high"].to_numpy(float), mb["high"])
+            low = np.append(hist["low"].to_numpy(float), mb["low"])
+            volume = np.append(hist["volume"].to_numpy(float), mb["volume"])
+            amount = np.append(
+                (hist["amount"].to_numpy(float) if "amount" in hist.columns
+                 else hist["close"].to_numpy(float) * hist["volume"].to_numpy(float)),
+                mb["amount"])
+            open_arr = np.append(hist["open"].to_numpy(float), mb["open"])
+            turnover = np.append(
+                (hist["turnover"].to_numpy(float) if "turnover" in hist.columns
+                 else np.full(len(hist), np.nan)), np.nan)
+            try:
+                fac = _compute_technical_factors(close, high, low, volume, amount, turnover, open_arr)
+            except Exception as e:
+                logger.debug("Arm B inject factor calc failed {} {}: {}", code, dt, e)
+                continue
+            row_vals = {c: float(fac[c][-1]) for c in TECHNICAL_COLUMNS if c in fac}
+            tech_updates[idx] = row_vals
+            n_rows_injected += 1
+            if len(proof_samples) < 6:
+                proof_samples.append({
+                    "code": code, "date": str(pd.Timestamp(dt).date()),
+                    "rsi_14_base": float(base.at[idx, "rsi_14"]) if "rsi_14" in base.columns else None,
+                    "rsi_14_inj": row_vals.get("rsi_14"),
+                    "close_ma5_dev_base": float(base.at[idx, "close_ma5_dev"]) if "close_ma5_dev" in base.columns else None,
+                    "close_ma5_dev_inj": row_vals.get("close_ma5_dev"),
+                })
+        if tech_updates:
+            for col in TECHNICAL_COLUMNS:
+                if col not in base.columns:
+                    continue
+                col_map = {idx: vals[col] for idx, vals in tech_updates.items() if col in vals}
+                if col_map:
+                    base.loc[list(col_map.keys()), col] = list(col_map.values())
+            out[pd.Timestamp(dt)] = base
+            n_codes_injected = max(n_codes_injected, len(tech_updates))
+
+    logger.info("Arm B: injected 14:30 factors into {} (code,date) rows across {} window dates",
+                n_rows_injected, len(window_dates))
+    for s in proof_samples:
+        logger.info("  Arm B inject-proof {} {}: rsi_14 {:.3f}→{:.3f} | close_ma5_dev {:.5f}→{:.5f}",
+                    s["code"], s["date"], s["rsi_14_base"] or float("nan"), s["rsi_14_inj"] or float("nan"),
+                    s["close_ma5_dev_base"] or float("nan"), s["close_ma5_dev_inj"] or float("nan"))
+    return out
+
+
 def run_walk_forward():
     """Main walk-forward backtest."""
     t0 = time.time()
@@ -727,6 +876,18 @@ def run_walk_forward():
     panel_by_date: Dict[pd.Timestamp, pd.DataFrame] = {}
     for dt_key, grp in panel.groupby("date"):
         panel_by_date[pd.Timestamp(dt_key)] = grp
+
+    # Arm B (Design 2): overlay real-14:30-injected factors onto the SCORING
+    # panel for window dates with intraday_1m data. Training (`panel`) is
+    # untouched. The window is the full BT span; injection only lands where
+    # morning bars exist (2025-09+), so older dates pass through unchanged.
+    if INTRADAY_INJECT:
+        logger.info("INTRADAY_INJECT=1 (Arm B / Design 2) — overlaying real-14:30 "
+                    "injected factors onto scoring panel (training untouched)")
+        _all_pbd_dates = sorted(panel_by_date.keys())
+        if _all_pbd_dates:
+            panel_by_date = _overlay_injected_factors(
+                panel_by_date, bars_map, _all_pbd_dates[0], _all_pbd_dates[-1])
 
     # Trading calendar from panel for label_cutoff (Fix #3: avoid calendar-day approximation)
     _all_trade_dates = sorted(panel["date"].unique())
