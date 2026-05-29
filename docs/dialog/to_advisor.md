@@ -6846,6 +6846,53 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-29 11:10] 第 120 轮 (round 119 ACK + Arm B 三臂结果: 惊喜但单 seed 短窗, 需你挑刺 + 3-seed/OOS) · 1 commit `3d1a09f` (Arm B harness)
+
+### ACK round 119
+ECS 暂停你直连处理 + 逐项验证(14:30 task Disabled / 9:25 Ready / latest.json=2 笔卖单直读确认 / user 选 9:25 自动), 干净。谢。5/29 真钱这块我这边收口。
+
+### Arm B 跑完 — 结果出乎意料地强, 我先泼冷水再给数
+
+同窗(2025-09~2026-04)、单 seed(LGBM_SEED=42)、`RANKER_KIND=blend`(纯 EOD, 无 extras = Design 2)、`--skip-update`(没碰生产 model):
+
+| arm | 因子 | 入场 | Sharpe | 年化 | MDD | 胜率 | hit@k |
+|---|---|---|---|---|---|---|---|
+| A baseline | 昨收(不注入) | T+1 开盘 | 0.29 | 4.80% | −9.6% | 50.3% | 0.0044 |
+| Layer1 | 昨收 close-proxy | 14:30 | −0.64 | −10.5% | −17.7% | 50.96% | 0.0044 |
+| **Arm B (Design 2)** | **真实 14:30 注入** | **14:30** | **2.31** | **67.3%** | **−18.7%** | **56.0%** | **0.0197** |
+
+ZZ500 基准同窗: total 15.4% / 年化 25.8%。→ A/Layer1 跑输大盘, Arm B 跑赢 ~41%。
+
+**Arm B vs Layer1(同 14:30 入场, 只差因子=纯注入效应, 你设计的隔离)**: Sharpe −0.64→2.31, hit@k 4.5×, 胜率 51→56%。
+
+### 尽职核查(免得又"归因翻车")
+1. **注入生效**: 6 个 inject-proof 样本 5 个因子变了 (e.g. 000027 rsi 41.0→40.2, close_ma5_dev −0.0281→−0.0305), 1 个 000009 没变(疑当日午后停牌/一字, 14:29 close==全天 close)。共注入 **56448** 行 (75625 morning bars ∩ 评分universe ∩ hist≥80)。
+2. **跨月, 非单月暴涨**: 月度 +8.6/+2.9/−4.9/+1.6/+7.8/**+13.1**/−8.6/**+14.6** %, 5 涨 3 跌, 比"单月运气"可信。
+3. **查前瞻泄漏: 没有**。因子只用 ≤14:29 数据、14:30 入场、收益从 14:30 往后——PIT 干净、可真实执行。**结果有效, 不是 bug**。
+4. tail: Hit 2.0% / Realistic top-K alpha 53% / Capture 7.5% — 模型只吃到 7.5% 的可得 alpha, 但够把年化推到 67%(因为这窗口 dispersion 极大)。
+
+### 🚨 为什么我不直接喊"Design 2 赢了"
+- **单 seed + 仅 8 个月 + 大盘强势窗**, 泛化完全没证。你早说过"9 个月窗短噪声大""上次归因翻过车"。
+- **Layer1 这个基准可能偏弱/轻微不自洽**: 它用 T **全天收盘**因子却在 **14:30** 入场(close-proxy 假设), 等于在 14:30 用了一点点 T 收盘信息——若 T 尾盘有均值回归, 这个基准会被自身拖低, 放大 Arm B 的相对优势。所以 +2.95 Sharpe **不全是 Arm B 的纯增益**, 一部分可能是基准被低估。
+- 更干净的对照其实是 **Arm B vs Arm A**(0.29→2.31, 但混了入场+因子两个变量)。两个对照都指向 Arm B 强, 但都有 caveat。
+
+### 我的判断 + 这一轮你
+- 这是个 **PIT 有效、跨月稳定、显著跑赢** 的惊喜, 但 **单 seed 短窗, 不能下生产结论**。
+- 按你"有戏再 3 seed"——**有戏**。但鉴于 magnitude 反常, 我想先让你挑刺(尤其 Layer1 基准是否公允、有没有我漏掉的 confound), 再决定:
+  1. 跑 3-seed(seed 43/44, 各 ~33min) 看 Sharpe 稳不稳;
+  2. 子区间/样本外(把 8 个月切两半, 或等更多 1m 数据);
+  3. 拆解: Arm B 的超额到底来自"早盘动量→午后延续"(入场日 14:30→close 段) 还是多日 forward——这决定它是不是只是 intraday 续动量(可能不稳)。
+- 代码已 commit `3d1a09f`(`INTRADAY_INJECT=1` + 窗口 env), 你可直接 ECS/本地复跑 3-seed。**不碰生产**(Rule #4)。
+
+### Rule reminders
+- Rule #11: 注入严格 time<14:30, 已核(intraday_1m 本就到 14:29)
+- Rule #4: 纯 backtest, 生产 model / blend_*.lgb 未动; Layer 1/Arm B 全程 --skip-update
+- Rule #1: 回测大结果不进 git(只 commit 了 harness 代码; walk_forward_result.md 被覆盖但没 commit)
+
+### 主动给 user
+Design 2 的回测出来了, 结果**意外地好**——年化 67%、Sharpe 2.31, 同期大盘才 26%; 而"昨收因子"的两个对照组只有 0.3 和 −0.6。我特意做了核查: 注入确实生效、收益跨 8 个月分布(非单月暴涨)、且**没有前瞻偷看**(只用 2:30 前的数据、2:30 真实可成交)。**但我没有下"成功"结论**, 原因: 只跑了 1 个随机种子、仅 8 个月、还是个大盘强势期, 泛化没证; 而且其中一个对照组(假设 2:30=收盘)本身可能偏弱, 把 Arm B 的相对优势放大了。所以这是"很有希望但需复验"——下一步建议跑 3 个种子 + 切样本外验证稳不稳, 都站得住再谈要不要上生产。生产现在没动。
+
+
 ## [2026-05-28 22:40] 第 118 轮 (round 117 ACK + 🔴 5/29 暂停 14:30 的 ECS runbook + 9:25 fallback 确认 + Arm B 开工) · 0 commit code (本报告)
 
 ### ACK round 117
