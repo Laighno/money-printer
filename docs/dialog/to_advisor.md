@@ -6846,6 +6846,44 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-29 12:42] 第 124 轮 (round 123 ACK + Phase 1 3-seed 已开跑 + Phase 2 scope) · 0 commit code (本报告; Phase 1 跑后 round 126 报数)
+
+### ACK round 123
+收到 user 的两阶段决定(先 3-seed, 再立项追动量)。护栏记下: 全程研究态、真钱 + 14:30 task 冻结、成交真实性是生死线。
+
+### Phase 1 已开跑 (后台 `bn6syq6kl`, caffeinate 防睡眠)
+seeds 43/44 各 4 arm(seed 42 已有)。inject 三臂(B / ① 负对照 / ③ placebo)**每 seed 3-路并行**(各 ~33min), A 便宜(~2min)。两 seed 串行 → 约 **~68min** 出全表。`--skip-update` 不碰生产。完成自动通知, 我 round 126 报:
+- **4-arm × 3-seed 表**(A / ③ / Arm B / ① 的 Sharpe/年化, 每 seed + 均值);
+- 三个稳定性判断: ③ 干净增益(A→③ 的 +0.24)稳不稳 / Arm B 2.31 稳不稳 / ① 跨 seed 仍 ≈ 基准。
+- (seed 42 基线回顾: A 0.29 / ③ 0.53 / B 2.31 / ① −0.44。)
+
+### Phase 2 scope (只 scope, 等 Phase 1 + 复盘后执行)
+
+目标 = 把"14:29 理想价 + 几乎无成本"换成实盘真实经济, 看 +1.78 那段还剩多少。
+
+**好消息: 大部分基建现成**, walk_forward 已有 `FeeSchedule(use_sqrt_impact, α=150bps)`; `engine.py` 已有 `stamp_tax_bps` 参数(当前=0)。实现:
+1. **真实成本(Mac 可做, 核心)**: 给 14:30 入场路径开 (a) sqrt-impact 滑点(按 size/ADV/波动 scale, 动量票冲击大); (b) **卖方印花税 ~10bps**(把 stamp_tax 打开)+ 佣金 + 过户费; (c) **报换手率**(日频高换手→成本咬得狠)。
+2. **成本敏感性 sweep(Mac 可做, 生死线)**: impact ∈ {0/5/10/20bps}(或 sqrt 模型不同 ADV% 档)→ 净 Sharpe 曲线 + **盈亏平衡点**。这一项最关键——中等成本就打穿 = 坐实"脆弱、放弃"。
+3. **真实 14:30 fill(二阶, 需 ECS 数据)**: 理想是用 14:30 bar 的 open/VWAP 成交。但 `data/intraday_1m` 现在到 **14:29**(因子 PIT 用), **没有 14:30 执行 bar** → 要 ECS xtdata 补这根(我 Mac 无 xtquant 拉不了, 需你 ECS 或我写 fetch 脚本你跑)。**不过 14:30 open ≈ 14:29 close(相邻 1 bar, 差极小)**, 真实"水分"主要在滑点/冲击不在这 1-bar 价差 → 所以 **(1)+(2) 用 14:29 fill + 真实成本已能照出绝大部分水分**, 14:30-bar 精修是第二步。
+4. **决策规则**: 真实成本后净 Sharpe 仍 **显著 > ③ 干净(~0.53)且 > 大盘(25.8%)** → 值得为 14:30 基建立项; 中等成本打穿 → 放弃。
+
+**工作量**: (1)+(2) ~半天 Mac 实现 + 一次 sweep 跑; (3) 需 ECS 补 14:30 bar(可后补)。
+
+### 这一轮你
+1. ACK round 124
+2. 等 Phase 1(~68min)→ 我 round 126 报 4×3 表 + 稳定性
+3. 看 Phase 2 scope OK 否(尤其"先 Mac 做成本 sweep, 14:30-bar 精修二阶"这个取舍)
+4. 生产/真钱冻结
+
+### Rule reminders
+- Rule #4: 全程 --skip-update; 真钱 + 14:30 task 冻结
+- Rule #11: 3-seed 注入守 time<14:30; Phase 2 决策仍 ≤14:29, 成交用 14:30 之后价
+- Rule #1: 大结果不进 git(只 commit harness)
+
+### 主动给 user
+按你定的, **Phase 1 (3 个随机种子复跑) 已经在后台开跑了**, 约 1 小时出结果, 确认那个信号(尤其干净可执行的小增益)不是单次运气。**Phase 2 (真实成交测试) 我已经把方案理清楚**: 关键是加上真实滑点 + A 股印花税/佣金 + 高换手成本, 再扫一遍不同成本档找"盈亏平衡点"——这步大部分能在本机做; 唯一要补的是当天 2:30 的真实成交价数据(得从 ECS 那台拉, 但因为 2:30 价和我们现在用的 2:29 价几乎一样, 这步是第二位的精修, 不影响先看成本敏感性的结论)。真钱和盘中自动交易**全程冻结**, 等真实成交回测站得住才谈。
+
+
 ## [2026-05-29 11:55] 第 122 轮 (round 121 三证伪结果: 非泄漏=真信号, 但主要是脆弱短线动量; 干净可执行增益很小) · 1 commit `24f56f1` (证伪 harness)
 
 ### ACK round 121 + 三个证伪全做完
