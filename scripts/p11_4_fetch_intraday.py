@@ -151,6 +151,7 @@ def _fetch_one_month(
     yyyymm: str,
     force: bool,
     out_dir: Path,
+    adjust: str = "front",
 ) -> Optional[Path]:
     """Fetch 1m bars for one month-tile, save parquet.  Returns path or None."""
     import pandas as pd
@@ -226,7 +227,7 @@ def _fetch_one_month(
         start_time=start_str,
         end_time=end_str,
         count=-1,
-        dividend_type="none",
+        dividend_type=adjust,
         fill_data=False,
     )
     if not raw or not all(isinstance(v, pd.DataFrame) for v in raw.values()):
@@ -295,6 +296,15 @@ def main() -> int:
                          "14:30 fill) instead of the 9:30–14:30 morning factor "
                          "window. Implies out-dir data/intraday_1430_exec unless "
                          "--out-dir is given explicitly.")
+    ap.add_argument("--adjust", choices=("front", "none"), default="front",
+                    help="Dividend adjustment for the fetched 1m bars (round 147 "
+                         "fix ①): 'front' = 前复权 qfq (default, aligns with the "
+                         "qfq daily history + model training scale); 'none' = legacy "
+                         "un-adjusted (matches the pre-round-147 fetch). "
+                         "With --out-dir at its default, 'front' implies "
+                         "data/intraday_1m_qfq (morning) or "
+                         "data/intraday_1430_exec_qfq (--exec-window); 'none' "
+                         "keeps the legacy data/intraday_1m / data/intraday_1430_exec.")
     ap.add_argument("--force", action="store_true",
                     help="Re-fetch even if monthly parquet already exists")
     ap.add_argument("--limit-codes", type=int, default=0,
@@ -305,8 +315,14 @@ def main() -> int:
         global _FILTER_MODE
         _FILTER_MODE = "exec"
         if args.out_dir == "data/intraday_1m":
-            args.out_dir = "data/intraday_1430_exec"
+            args.out_dir = ("data/intraday_1430_exec_qfq"
+                            if args.adjust == "front" else "data/intraday_1430_exec")
         logger.info("--exec-window: fetching 14:30–15:00 execution bars → {}", args.out_dir)
+    elif args.adjust == "front" and args.out_dir == "data/intraday_1m":
+        # Round 147 fix ①: default qfq morning fetch goes to a NEW dir so the
+        # legacy un-adjusted data/intraday_1m is preserved for before/after.
+        args.out_dir = "data/intraday_1m_qfq"
+        logger.info("--adjust=front (default): fetching qfq morning bars → {}", args.out_dir)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -324,15 +340,15 @@ def main() -> int:
     xt_codes = [_code_to_xtquant(c) for c in codes]
 
     months = _month_range(args.start, args.end)
-    logger.info("=== P11-4 Step 1 fetch: {} codes × {} months ({}~{}) → {} ===",
-                len(codes), len(months), args.start, args.end, out_dir)
+    logger.info("=== P11-4 Step 1 fetch: {} codes × {} months ({}~{}) adjust={} → {} ===",
+                len(codes), len(months), args.start, args.end, args.adjust, out_dir)
 
     t_overall = time.time()
     ok = 0
     failed = 0
     for yyyymm in months:
         try:
-            result = _fetch_one_month(xt_codes, yyyymm, args.force, out_dir)
+            result = _fetch_one_month(xt_codes, yyyymm, args.force, out_dir, adjust=args.adjust)
             if result is not None:
                 ok += 1
             else:

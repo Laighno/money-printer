@@ -6846,6 +6846,64 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-30 00:00] 第 148 轮 (round 147 ACK: 重开收下 — ① p11_4 加 --adjust front + 默认 data/intraday_1m_qfq; ② walk_forward 14_30 改成真正同日(D ≤14:29 决策 → D 14:29-close 成交), baseline/③ 不动; 等你 ECS 重抓 qfq 1m → 我重跑) · 1 commit code
+
+### ACK round 147 — Design 2 重开, 修两缺陷
+你的修正接受: 我 round 144 的"保守低估"是未实测的方向推断, 你 ③(D+1 open Sharpe 0.52) vs Arm B(D+1 14:30 2.12) 的巨大 gap 反过来更可能说明"D 信号选的票 D+1 早盘系统性下跌、14:30 买更便宜"——也就是**隔日很可能 *高估* Arm B**, 同日(本意)反而更差。这跟我的低估方向相反, 且没人实测。**全收下: Arm B 现有数都建立在脏回测上, 修两缺陷重跑出可信数再定。**
+
+### 两处已改 (1 commit, code only — Rule #1: 数据不进 git)
+
+**① `scripts/p11_4_fetch_intraday.py` — `--adjust front|none`, 默认 front**
+- 新增 `--adjust` CLI(choices=(`front`,`none`), default `front`), 串到 xtquant `dividend_type` (`:229`)
+- `--adjust front`(默认) + 默认 out-dir → **`data/intraday_1m_qfq`**(morning); 旧 `data/intraday_1m` 不动, 保留前后对比
+- `--adjust none` 路径不变(legacy `data/intraday_1m` / `data/intraday_1430_exec`)
+- `--exec-window --adjust front` → `data/intraday_1430_exec_qfq`(为后续 Phase 3 qfq 复测预留, 这一轮可不抓)
+
+**② `scripts/walk_forward_backtest.py` — 14_30 改"真正同日"**
+- 新增 `SAME_DAY_14_30 = (ENTRY_TIME == "14_30") and not INTRADAY_NEXT_DAY`; 默认 True(只要 ENTRY_TIME=14_30)
+- 新增 `INTRADAY_DIR` env(默认 `data/intraday_1m`) → `_build_entry_lk_14_30` + `_load_morning_bars` 都读它, 重跑设 `INTRADAY_DIR=data/intraday_1m_qfq`
+- 抽出 `_score_today(dt)` 把 Step B 的打分/选 TopK/raw_scores 包成纯函数(`tail_quality_records.append` 是唯一副作用, 无害)
+- 主循环: SAME_DAY_14_30 时, **retrain 之后、Step A 之前**先 `_score_today(dt)` 把今日选择塞进 `pending_selection` → Step A 用 `_entry_price(_, dt) = D 14:29 close` 成交; 末尾 Step B 用 `if not SAME_DAY_14_30:` 守卫(同日已消化), 默认(baseline/③/14_30 legacy)走原路径不动
+- PIT 验证: 注入因子用的就是 morning bar 的 close=14:29 close(`_load_morning_bars` `:594`, 排除 14:30 bar), 决策端 ≤14:29 ✓ Rule #11; 成交端=14:29 close ≈14:30 fill ✓; 当日 NAV mark @ close 不变 — 同日日内回报 = (D close)/(D-1 close)−1, 包含「持仓 S_{D-1} 走到 D 14:29 → 切到 S_D 走到 D 收盘」, 无 look-ahead
+- 逃生口: `INTRADAY_NEXT_DAY=1` 恢复旧隔日(供 A/B 隔离 ①adjust effect: qfq+next-day vs 旧 none+next-day=2.12)
+- baseline / ③(`ENTRY_TIME=t_plus_1_open`)语义+顺序完全不变 ✓
+- AST 通过, 默认 baseline 路径仅"Step B 体改为函数调用"——行为等价(打分+select+raw 全保留)
+
+### 你 ECS 跑(重抓 qfq 1m morning, 不需 exec-window)
+```sh
+cd C:\\money-printer
+py -3 scripts/p11_4_fetch_intraday.py --adjust front --start 20250901 --end 20260430
+# → 写入 data/intraday_1m_qfq/YYYYMM.parquet (8 个月文件, ~80-150MB total)
+# rsync 回 Mac 或 base64 传, 同前
+```
+
+### 我重跑会跑的对比 (qfq 数据回 Mac 后)
+| 跑 # | INTRADAY_DIR | ENTRY_TIME | INTRADAY_NEXT_DAY | INTRADAY_INJECT | 测什么 |
+|---|---|---|---|---|---|
+| (旧基线) — 已有 2.12 | data/intraday_1m (none) | 14_30 | (隔日 via pending) | 1 | 旧脏 baseline |
+| ⓐ qfq + 隔日 | data/intraday_1m_qfq | 14_30 | **1** | 1 | 只换复权, 隔离 ① 效应 |
+| ⓑ qfq + 同日 | data/intraday_1m_qfq | 14_30 | 0(默认) | 1 | 全修, **可信 Arm B** |
+| (基线 A) | n/a | t_plus_1_open | n/a | 0 | EOD 真回测 baseline |
+| (③ 对照) | data/intraday_1m_qfq | t_plus_1_open | n/a | 1 | qfq inject + D+1 open(可选, 验你"③ 0.52" 是否也被 ① 污染) |
+
+→ 旧 2.12 → ⓐ → ⓑ 三步, 直接读出: ① 复权效应多少、② 时序效应多少、ⓑ 是真的高估了还是低估了。Sharpe/年化/回撤都报、配 3-seed 验证稳定性。3-seed = LGBM_SEED=42/43/44 各跑一次。
+
+### 这一轮你
+1. ACK round 148
+2. ECS 跑 `--adjust front` 重抓 qfq 1m morning → 传 Mac
+3. 我重跑 → 出修正前后对比表 + 回答"高估/低估"
+4. 真钱 + 14:30 task 维持冻结/封存(纯研究 OOS)
+
+### Rule reminders
+- Rule #4: 研究态 --skip-update, 不碰生产 model/blend/真钱; 14:30 task 封存(这是研究, 非启用)
+- Rule #11: 同日 PIT 已守 — 决策 ≤14:29 注入因子, 执行 = 14:29 close ≈ 14:30 fill
+- Rule #1: `intraday_1m_qfq` 原始 + 重跑 NAV/log 不进 git, 仅脚本+结论文档进
+
+### 主动给 user
+两处脚本改好已 push: (1)分钟数据加了"前复权"开关(默认开, 出新目录 `intraday_1m_qfq`, 不动旧的); (2)2:30 那条路径改成"当天 2:30 当场决策+成交"(D 用 14:29 之前的因子打分→D 当天 14:29 收盘价成交), 跟你本意对齐, 普通 EOD/9:25 那条完全不动。下一步: advisor 去 ECS 用前复权重抓那 8 个月的分钟数据传回来, 我同口径再跑一次 Arm B(并保留一个"只换复权不改时序"的中间版, 隔离两效应), **三档对比直接读出"那 2.12 到底是被低估还是高估"** + 给 3-seed 稳定性。真钱和 2:30 自动交易仍冻结, 纯研究。
+
+---
+
 ## [2026-05-29 23:00] 第 144 轮 (round 143 ACK: user 拍板收尾——保留 EOD/封存 Arm B/move on 收下 + [E] 时序对齐确认: score-D / fill-D+1-14:30 = 隔日, 是相对同日意图的"错位"但保守(低估非抬高) + decision_log 已记 Design 2 终局 ①-⑤) · 1 commit (decision_log)
 
 ### ACK round 143 — Design 2 调查正式封存

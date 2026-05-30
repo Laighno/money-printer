@@ -168,6 +168,22 @@ ENTRY_TIME = os.environ.get("ENTRY_TIME", "t_plus_1_open")
 assert ENTRY_TIME in ("t_plus_1_open", "14_30"), \
     f"Unknown ENTRY_TIME={ENTRY_TIME}"
 
+# Round 147 (Design 2 fix-and-rerun): which intraday-1m dir to read for the
+# 14:30 entry price + Arm B injection. Default = the legacy NON-adjusted
+# `data/intraday_1m`; the round-147 clean rerun points this at the
+# front-adjusted (qfq) re-fetch so the 14:30 bar shares the qfq scale of the
+# EOD history + model training (fixes defect ① 复权尺度混用).
+INTRADAY_DIR = os.environ.get("INTRADAY_DIR", "data/intraday_1m")
+
+# Round 147 (fix ② 时序错位): ENTRY_TIME=14_30 now means TRUE SAME-DAY —
+# decide on D's ≤14:29 injected factors and EXECUTE the same day D at the
+# 14:29 close (≈14:30 fill), instead of the legacy pending-mechanism lag that
+# scored D and filled D+1 14:30 (隔日). Set INTRADAY_NEXT_DAY=1 to restore the
+# legacy next-day fill (for the A/B that isolates the timing effect from ①).
+# Only affects ENTRY_TIME=14_30; baseline + ③(t_plus_1_open) are untouched.
+INTRADAY_NEXT_DAY = os.environ.get("INTRADAY_NEXT_DAY", "0") == "1"
+SAME_DAY_14_30 = (ENTRY_TIME == "14_30") and not INTRADAY_NEXT_DAY
+
 # P11-4 Phase C (round 91): INTRADAY_HYBRID enables hybrid feature compute
 # when RANKER_KIND=intraday_blend. 1 → 2025-09+ dates use real intraday
 # from data/intraday_1m/*.parquet, else EOD-proxy (matches Phase B
@@ -527,13 +543,13 @@ def _build_entry_lk_14_30(close_lk: Dict[tuple, float]) -> Dict[tuple, float]:
     same approximation P11-4 Step 1 fetch made.
     """
     out: Dict[tuple, float] = {}
-    intra_dir = Path("data/intraday_1m")
+    intra_dir = Path(INTRADAY_DIR)
     if not intra_dir.exists():
-        logger.warning("ENTRY_TIME=14_30 but data/intraday_1m missing — full fallback to T close")
+        logger.warning("ENTRY_TIME=14_30 but {} missing — full fallback to T close", INTRADAY_DIR)
         return out
     parts = sorted(intra_dir.glob("*.parquet"))
     if not parts:
-        logger.warning("ENTRY_TIME=14_30 but data/intraday_1m empty — full fallback to T close")
+        logger.warning("ENTRY_TIME=14_30 but {} empty — full fallback to T close", INTRADAY_DIR)
         return out
     frames = [pd.read_parquet(p) for p in parts]
     intra = pd.concat(frames, ignore_index=True)
@@ -576,10 +592,10 @@ def _load_morning_bars(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> Dict[tup
     """Aggregate data/intraday_1m/*.parquet into a per-(code, date) morning
     bar (09:30–14:29). amount is synthesized as Σ(close_i × volume_i) since
     the 1m parquet has no amount column — that IS the morning turnover."""
-    intra_dir = Path("data/intraday_1m")
+    intra_dir = Path(INTRADAY_DIR)
     parts = sorted(intra_dir.glob("*.parquet"))
     if not parts:
-        logger.warning("INTRADAY_INJECT=1 but data/intraday_1m empty — no Arm B injection")
+        logger.warning("INTRADAY_INJECT=1 but {} empty — no Arm B injection", INTRADAY_DIR)
         return {}
     intra = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
     intra["datetime"] = pd.to_datetime(intra["datetime"])
@@ -896,7 +912,12 @@ def run_walk_forward():
             return open_lk.get((code, dt))
     logger.info("ENTRY_TIME={} — entry price source: {}",
                 ENTRY_TIME,
-                "intraday_1m 14:29 close + T close fallback" if ENTRY_TIME == "14_30" else "T+1 open")
+                "{} 14:29 close + T close fallback".format(INTRADAY_DIR)
+                if ENTRY_TIME == "14_30" else "T+1 open")
+    if ENTRY_TIME == "14_30":
+        logger.info("14_30 execution timing: {} (round 147 fix ②)",
+                    "SAME-DAY D 14:30 (decision ≤14:29 → fill D 14:29-close)"
+                    if SAME_DAY_14_30 else "legacy NEXT-DAY D+1 14:30 (INTRADAY_NEXT_DAY=1)")
 
     # All trading dates in the BT window
     bt_start_ts = pd.Timestamp(BT_START)
@@ -1051,6 +1072,63 @@ def run_walk_forward():
     # what actually matters for a Top-K strategy.
     tail_quality_records: List[dict] = []
 
+    # Round 147 (fix ②): extract Step B's scoring so SAME_DAY_14_30 can run it
+    # BEFORE Step A (same-day fill), while the default path keeps running it
+    # after (next-day fill). Returns (selection, raw_scores) or (None, {})
+    # when the ranker isn't ready / today's panel is empty — callers leave
+    # the prior `pending_selection` untouched in that case.
+    def _score_today(dt):
+        ranker_ready = current_ranker is not None and (
+            getattr(current_ranker, "model", None) is not None
+            or (
+                hasattr(current_ranker, "primary")
+                and getattr(current_ranker.primary, "model", None) is not None
+            )
+        )
+        if not ranker_ready:
+            return None, {}
+        today_df = panel_by_date.get(dt)
+        if today_df is None:
+            return None, {}
+        today_df = today_df[today_df["code"].isin(current_universe)]
+        today_valid = today_df.dropna(subset=core)
+        if today_valid.empty:
+            return None, {}
+        codes_in = today_valid["code"].tolist()
+        scores = current_ranker.predict(today_valid)
+        if hasattr(current_ranker, "predict_raw"):
+            raws = current_ranker.predict_raw(today_valid)
+        else:
+            raws = scores
+        raw_score_map = dict(zip(codes_in, raws))
+        scored = sorted(zip(codes_in, scores), key=lambda x: -x[1])
+        if COST_AWARE_REBALANCE:
+            from mp.backtest.ml_backtest import _cost_aware_select
+            selection = _cost_aware_select(scored, TOP_K, broker, dt, adv_lk)
+        else:
+            selection = scored[:TOP_K]
+        try:
+            pred_top_k = [c for c, _ in scored[:TOP_K]]
+            fwd_ret_map = dict(zip(today_valid["code"], today_valid["fwd_ret"]))
+            valid_fwd = {c: r for c, r in fwd_ret_map.items() if pd.notna(r)}
+            if len(valid_fwd) >= TOP_K * 5:
+                tail_quality_records.append({
+                    "date": dt,
+                    "pred_top_k": pred_top_k,
+                    "fwd_ret_map": valid_fwd,
+                })
+        except Exception as e:
+            logger.debug("tail_quality record skip {}: {}", dt, e)
+        if POSITION_SIZING == "conviction_oracle":
+            oracle_map = {}
+            for _, row in today_valid.iterrows():
+                fr = row.get("fwd_ret")
+                oracle_map[row["code"]] = float(fr) if pd.notna(fr) else 0.0
+            raw_scores = oracle_map
+        else:
+            raw_scores = raw_score_map
+        return selection, raw_scores
+
     # 4. Main loop — retrain monthly, score & rebalance daily
     for step, dt in enumerate(trading_dates):
         # Track month transitions for monthly return logging
@@ -1128,6 +1206,19 @@ def run_walk_forward():
                     current_ranker = ranker
                 except Exception as e:
                     logger.error("  Training failed: {}", e)
+
+        # Round 147 (fix ② same-day timing): for SAME_DAY_14_30 the decision
+        # uses today's ≤14:29 injected factors and fills at TODAY's 14:29
+        # close — so we score BEFORE Step A and feed today's selection into
+        # the same pending mechanism, which Step A then executes at dt.
+        # Other modes (baseline / ③ next-day open / 14_30 legacy next-day
+        # with INTRADAY_NEXT_DAY=1) keep scoring at Step B → pending for
+        # tomorrow (unchanged).
+        if SAME_DAY_14_30:
+            _sel, _raws = _score_today(dt)
+            if _sel is not None:
+                pending_selection = _sel
+                pending_raw_scores = _raws
 
         # --- Step A: Execute pending signal from previous close at today's open ---
         if pending_selection is not None:
@@ -1207,77 +1298,14 @@ def run_walk_forward():
             pending_selection = None  # consumed
 
         # --- Step B: Score stocks at today's close, store as pending for tomorrow ---
-        # Filter to the universe that was known on this date to avoid look-ahead
-        # from index membership.  When only today's snapshot is available,
-        # current_universe == all current codes (no filtering effect).
-        # StockRanker stores its booster as `.model`; BlendRanker has no `.model`
-        # attribute but is ready as long as its sub-rankers are trained.
-        ranker_ready = current_ranker is not None and (
-            getattr(current_ranker, "model", None) is not None
-            or (
-                hasattr(current_ranker, "primary")
-                and getattr(current_ranker.primary, "model", None) is not None
-            )
-        )
-        if ranker_ready:
-            today_df = panel_by_date.get(dt)
-            if today_df is not None:
-                today_df = today_df[today_df["code"].isin(current_universe)]
-                today_valid = today_df.dropna(subset=core)
-                if not today_valid.empty:
-                    codes_in = today_valid["code"].tolist()
-                    scores = current_ranker.predict(today_valid)
-                    # Also capture raw excess predictions for conviction sizing
-                    # (BlendRanker.predict_raw returns primary's excess prediction
-                    # in decimal; StockRanker.predict_raw == predict).
-                    if hasattr(current_ranker, "predict_raw"):
-                        raws = current_ranker.predict_raw(today_valid)
-                    else:
-                        raws = scores
-                    raw_score_map = dict(zip(codes_in, raws))
-                    scored = sorted(zip(codes_in, scores), key=lambda x: -x[1])
-
-                    if COST_AWARE_REBALANCE:
-                        from mp.backtest.ml_backtest import _cost_aware_select
-                        pending_selection = _cost_aware_select(
-                            scored, TOP_K, broker, dt, adv_lk,
-                        )
-                    else:
-                        pending_selection = scored[:TOP_K]
-
-                    # Record tail-quality data for post-backtest analysis.
-                    # We use the model's top-K vs the actual top-K (by realized
-                    # fwd_ret) — works even when fwd_ret is forward-looking
-                    # because this is computed POST-hoc, not used for trading.
-                    try:
-                        pred_top_k = [c for c, _ in scored[:TOP_K]]
-                        fwd_ret_map = dict(zip(today_valid["code"],
-                                                today_valid["fwd_ret"]))
-                        # Skip if too many fwd_ret NaN (last 20 days of panel)
-                        valid_fwd = {c: r for c, r in fwd_ret_map.items() if pd.notna(r)}
-                        if len(valid_fwd) >= TOP_K * 5:   # need decent universe
-                            tail_quality_records.append({
-                                "date": dt,
-                                "pred_top_k": pred_top_k,
-                                "fwd_ret_map": valid_fwd,
-                            })
-                    except Exception as e:
-                        logger.debug("tail_quality record skip {}: {}", dt, e)
-                    # Snapshot the raw scores keyed by date for the buy step.
-                    # In conviction_oracle mode (leak check ONLY), replace with
-                    # the realized forward 20d return — this is the perfect
-                    # conviction upper bound.
-                    if POSITION_SIZING == "conviction_oracle":
-                        oracle_map = {}
-                        for _, row in today_valid.iterrows():
-                            fr = row.get("fwd_ret")
-                            if pd.notna(fr):
-                                oracle_map[row["code"]] = float(fr)
-                            else:
-                                oracle_map[row["code"]] = 0.0
-                        pending_raw_scores = oracle_map
-                    else:
-                        pending_raw_scores = raw_score_map
+        # Round 147: SAME_DAY_14_30 already scored & consumed above (fix ②);
+        # the default path (baseline / ③ / 14_30 legacy next-day) scores here
+        # and stores pending for tomorrow's open execution in Step A.
+        if not SAME_DAY_14_30:
+            _sel, _raws = _score_today(dt)
+            if _sel is not None:
+                pending_selection = _sel
+                pending_raw_scores = _raws
 
         # --- Daily NAV ---
         close_snap = {}
