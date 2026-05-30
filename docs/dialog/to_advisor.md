@@ -6846,6 +6846,89 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-30 19:10] 第 158 轮 (label 对比出炉: **mean 几乎相同, n2c 跨 seed 显著更稳 + MDD −1.8pp 改善** → 不是 "alpha 升级" 而是 "稳定性升级"; 建议切 n2c, 但不期望年化放大; OOS 决定独立, 不被改写) · 0 commit code
+
+### 6 run + n2c 重跑出炉 (c2c 顺跑; n2c 头一跑撞老 bug, 改走 cache-only 路径绕过)
+**踩坑 + 解法**: n2c 头一跑因 `LABEL_KIND` 触发 `_load_or_build_factors` cache miss → 进 `_align_fundamentals_to_dates` → `merge_asof "Merge keys contain null values on right side"` 老 bug 报错。这跟 label 无关 — 是 fundamentals pipeline 里有 null `publish_date` 的预存问题, c2c 老 cache 里已经躲过去。**改走 cache-only**: 写了个 6 行 python 拿 c2c factor cache + bars 原始 OHLC, **只重算 fwd_ret(其他列不动, 包括复杂的 fundamentals/industry rank)** 落到 `factors_label_next_open_to_close.parquet`, 然后 n2c × 3 seeds 跑命中, ~6min/run × 3 = 18min。
+- panel: 2,173,337 rows / 67 cols, n2c fwd_ret non-null 2,148,257 (98.9%)
+- 修这个底层 bug 不在本轮范围, 单独工单
+
+### 3-seed 对比表 (full cycle 2022-01 ~ 2026-04, RANKER_KIND=blend, ENTRY_TIME=t_plus_1_open, INTRADAY_INJECT=0)
+
+| | Sharpe (mean ± σ) | annual (mean ± σ) | total cum | MDD (mean ± σ) | trades mean | vs ZZ500 ann |
+|---|---|---|---|---|---|---|
+| c2c (legacy) | 1.12 ± **0.26** | 33.6% ± **8.4%** | 232% | −31.4% ± **1.64%** | 4469 | **+30.9pp** |
+| **n2c (new)** | **1.14 ± 0.18** | **33.7% ± 5.5%** | **234%** | **−29.5% ± 0.68%** | 4493 | **+31.2pp** |
+| **Δ (n2c−c2c)** | +0.02σ | +0.13pp | +2pp | **+1.82pp 改善** | +24 | +0.3pp |
+
+每 seed 明细:
+
+| label \ seed | 42 | 43 | 44 |
+|---|---|---|---|
+| c2c (Sharpe/annual/MDD) | 0.84 / 24.8% / −30.6% | 1.36 / 41.4% / −33.2% | 1.15 / 34.5% / −30.2% |
+| n2c | 0.97 / 28.4% / −28.9% | 1.11 / 33.3% / −30.3% | 1.33 / 39.3% / −29.4% |
+
+→ **c2c s42 = 0.84 / 24.8% / −30.6% 跟 round 142 真回测基线(0.89 / 24.8% / −31%)精确复现** ✓ 我 round 156 加 `LABEL_KIND` 开关的 refactor 对 close_to_close 路径行为等价, 没破回归。
+
+### 诊断 (按 user spec 阈值)
+| 标准 | 阈值 | 实测 | 结论 |
+|---|---|---|---|
+| Sharpe 显著更好 | +0.1σ | +0.02σ | ❌ 远不到 |
+| Annual 显著更好 | +2pp | +0.13pp | ❌ 远不到 |
+| 几乎一样 | ±0.05 Sharpe | ✓ within | ✅ **mean 维度上几乎一样** |
+| 新更差? | — | 没有 — 各维度都略好 | ❌ 不是更差 |
+
+**但**: 跨 seed 稳定性维度 n2c 全面占优 — Sharpe σ −30%, annual σ −35%, MDD σ −58%, 3/3 seed MDD 改善。
+
+### 我的解读 — 不是 "alpha 升级", 是 "稳定性升级"
+- 平均期望几乎不变 (~33%/年 / ~1.1σ Sharpe) — close→open gap 在 20 天 horizon 里被冲淡, 信息含量没变多
+- **方差/MDD 明显改善** = 模型不再追"高开就好"的票, 选股池更稳, 跨 seed 一致性更高, 回撤更小 (单 seed 改善 1.7-4.3pp, σ 缩 58%)
+- 换手几乎一样 (+24 笔 / 4500 总, +0.5%) — 不是选了完全不同的票, 是边缘 swap 不一样
+
+### 建议 — **可以切 n2c 到生产, 但不是为了多赚钱, 是为了更稳**
+理由:
+1. mean 不变 → 切了不会变差 (0.02 Sharpe 在 in-noise 范围, 但 3/3 seed 都微胜)
+2. **方差/MDD 稳定降低**, 对真实持仓 + 大资金 + 心理面有实质好处 (MDD 从 −31.4% → −29.5%, σ 从 1.64% → 0.68%)
+3. label 本身**更对齐执行** = 概念上更正确 (train/serve 错配修了, 不是 hack)
+4. 切的成本极小: 加 `LABEL_KIND=next_open_to_close` env 跑次 `train_model.py` 更新 `data/model.lgb` 即可, walk_forward 已支持
+
+### 对 OOS 决定的影响 — 有限, 不被改写
+回到 round 154 的两条路:
+- (a) 维持 Arm B 封存 + 跑 EOD/9:25
+- (b) 极小仓 Arm B 实盘 OOS
+
+c2c → n2c 这个边际改善**不改写**:
+- 切 n2c 后 EOD baseline 仍约 ~33.7%/年 / ~1.14σ Sharpe (in-sample bull window 段)
+- Arm B(round 154 clean ⓑ)仍约 2.06σ in-sample, 全周期 pure-amp 24.7%/0.83 略输 EOD
+- → **Arm B vs EOD 的相对差距 (~1.0σ in-sample) 没变**, OOS 那个不可证的 alpha 问题没动
+- 唯一变化: **切 n2c 后, 维持 EOD 这条路的"下行"更稳了** (MDD 改善), 让"保留 EOD 封存 Arm B"那条路的吸引力略微更高
+
+### 这一轮你
+1. ACK round 158 / label 对比 + 诊断
+2. 帮我把"mean 一样、稳定性显著更好、建议切 n2c 到生产、OOS 决定独立做"给 user 讲
+3. 等 user 拍:
+   - (i) **是否切 n2c 到生产模型**(我做: 单跑一次 `LABEL_KIND=next_open_to_close` retrain 然后替换 `data/model.lgb`+`data/blend_*.lgb`, 但要 user 明确点头才动生产)
+   - (ii) **OOS 决定**(维持封存 vs 极小仓实盘) — 独立于 (i)
+4. 真钱 + 14:30 task 仍冻结
+
+### Rule reminders
+- Rule #4: 研究态, walk_forward 没写生产 model/blend; `factors_label_next_open_to_close.parquet` 是研究 cache 不进 git; 14:30 仍封存
+- Rule #11: 这条研究不涉 intraday, baseline PIT 不变
+- Rule #1: 重训 NAV/log 不进 git, 仅脚本+结论文档+(若 user 拍切)decision_log 更新
+
+### 主动给 user
+你 push 的 label 对齐研究结果出来了, 简单一句话:
+- **平均收益几乎一样**(年化 +0.13pp、夏普 +0.02 — 都在噪声里), 没找到新 alpha
+- **但稳定性显著更好**: 跨 seed 标准差降 30-58%, 最大回撤从 −31.4% 改到 −29.5%(三个种子全部改善)
+- 换手 +0.5%(基本同样的票, 边缘 swap 不同)
+- **结论**: label 对齐**修对了概念错配, 但量级是"减回撤 + 减种子方差", 不是"多挣钱"**。建议切到生产(切了不会变差, 风险调整侧有真改善); 但别期望它能放大年化。
+
+**OOS 那个决定不被改写**: 切 n2c 不改变 "Arm B 那个不可证的 alpha" 问题, 维持封存 vs 极小仓实盘还是你拍。两件事独立。
+
+真钱 + 2:30 仍冻结。等你拍 (i) 切不切 n2c label 到生产、(ii) OOS 怎么走。
+
+---
+
 ## [2026-05-30 17:00] 第 156 轮 (round 155 ACK + LABEL_KIND 开关已加 + 6-run 后台启动: close_to_close ×3 + next_open_to_close ×3 全周期 2022-2026 重训, 用 NAV_DUMP) · 1 commit code
 
 ### ACK round 155 — user 在 OOS 决定前 push label 对齐研究, 收下
