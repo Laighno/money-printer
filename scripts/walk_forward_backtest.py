@@ -119,6 +119,21 @@ BT_START = os.environ.get("BT_START", "20200101")   # first trading month (env-o
 BT_END = os.environ.get("BT_END", "20260401")       # last month (exclusive)
 TOP_K = int(os.environ.get("TOP_K", "10"))
 HORIZON = 20                    # forward return horizon in trading days
+
+# Round 155 (label-alignment research): which label to train on.
+#   "close_to_close" (default, current production): fwd_ret[i] = close[i+H]/close[i]−1
+#       → assumes entry at close[i]; rewards stocks that gap UP overnight before
+#       T+1 open since the gap is captured in the label but NOT capturable when
+#       you actually execute at open[i+1] (train/serve mismatch).
+#   "next_open_to_close" (round 155 fix): fwd_ret[i] = close[i+H]/open[i+1]−1
+#       → label entry = open[i+1] = real T+1 open execution price; eliminates
+#       the overnight-gap windfall and the model no longer prefers gap-up names
+#       whose alpha you can't capture.
+# Cache key (factors.parquet path) is branched by LABEL_KIND so the legacy
+# close_to_close cache stays untouched.
+LABEL_KIND = os.environ.get("LABEL_KIND", "close_to_close")
+assert LABEL_KIND in ("close_to_close", "next_open_to_close"), \
+    f"Unknown LABEL_KIND={LABEL_KIND}"
 SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", "5"))
 COMMISSION_BPS = int(os.environ.get("COMMISSION_BPS", "3"))
 COST_AWARE_REBALANCE = True      # skip swaps where score gap < round-trip cost
@@ -261,7 +276,12 @@ def _load_or_build_factors(
     codes: List[str],
 ) -> pd.DataFrame:
     """Build full factor panel with forward returns, with parquet cache."""
-    cache_path = CACHE_DIR / "factors.parquet"
+    # Round 155: cache key branches on LABEL_KIND so the new next_open_to_close
+    # label gets its own file and never collides with the legacy close_to_close
+    # cache. Default (close_to_close) keeps the original `factors.parquet` path
+    # — no rebuild needed for existing runs.
+    cache_path = CACHE_DIR / ("factors.parquet" if LABEL_KIND == "close_to_close"
+                              else f"factors_label_{LABEL_KIND}.parquet")
     if cache_path.exists():
         logger.info("Loading cached factor panel from {}", cache_path)
         panel = pd.read_parquet(cache_path)
@@ -342,9 +362,24 @@ def _load_or_build_factors(
             close_arr = close_vals["close"].values.astype(float)
             n = len(close_arr)
             fwd = np.full(n, np.nan)
-            for i in range(n - HORIZON):
-                if close_arr[i] > 0:
-                    fwd[i] = close_arr[i + HORIZON] / close_arr[i] - 1.0
+            if LABEL_KIND == "next_open_to_close":
+                # Round 155: entry = open[i+1] (real T+1 fill); exit unchanged
+                # at close[i+HORIZON]. Both indexes are bounded by the loop's
+                # range(n - HORIZON) since HORIZON ≥ 1 ⇒ i+1 ≤ n-HORIZON ≤ n-1.
+                open_arr = (close_vals["open"].values.astype(float)
+                            if "open" in close_vals.columns else None)
+                if open_arr is None:
+                    grp["fwd_ret"] = np.nan
+                    fwd_parts.append(grp)
+                    continue
+                for i in range(n - HORIZON):
+                    entry = open_arr[i + 1] if i + 1 < n else np.nan
+                    if entry > 0 and not np.isnan(entry) and close_arr[i + HORIZON] > 0:
+                        fwd[i] = close_arr[i + HORIZON] / entry - 1.0
+            else:
+                for i in range(n - HORIZON):
+                    if close_arr[i] > 0:
+                        fwd[i] = close_arr[i + HORIZON] / close_arr[i] - 1.0
             grp["fwd_ret"] = fwd
         else:
             grp["fwd_ret"] = np.nan

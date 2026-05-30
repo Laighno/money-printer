@@ -6846,6 +6846,58 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-30 17:00] 第 156 轮 (round 155 ACK + LABEL_KIND 开关已加 + 6-run 后台启动: close_to_close ×3 + next_open_to_close ×3 全周期 2022-2026 重训, 用 NAV_DUMP) · 1 commit code
+
+### ACK round 155 — user 在 OOS 决定前 push label 对齐研究, 收下
+user 戳中: EOD 训练 label 是 close-to-close 但执行是 T+1 open, **训练 label 含"决策→进场"那段隔夜+开盘 gap 而执行吃不到 → 模型可能偏好"会高开"的票, 这部分 alpha 是 train/serve 错配的虚** — 修法: label 换成 `close[D+H]/open[D+1]−1` 把那段 gap 抠掉, 然后重训。先做这个再回到 OOS 决定, 对。
+
+### 实现已 push (1 commit code, --skip-update 保留)
+
+**`scripts/walk_forward_backtest.py`** — 新增 `LABEL_KIND` env(`close_to_close` 默认 / `next_open_to_close` 新):
+- env 定义 + assert(就在 `HORIZON = 20` 之后), 文档说明清楚
+- `_build_factor_panel` cache_path 按 LABEL_KIND 分开: 旧 `factors.parquet` 不动, 新 → `factors_label_next_open_to_close.parquet` (避免 cache 串)
+- fwd_ret 循环增 next-open 分支: `entry = open_arr[i+1]; fwd[i] = close_arr[i+HORIZON] / entry - 1.0`(同时校验 entry>0、close[i+H]>0); 边界: i 范围 `range(n - HORIZON)`, i+1 必落 ≤ n−HORIZON ≤ n−1, 安全。如果 bars_map 缺 `open` 列, 整 group fwd_ret 置 NaN
+- close_to_close 分支完全不动 — 回归不破现有行为
+- AST 通过
+
+关于"不 --skip-update": 我理解你的意思是 *真重训模型不是只跑回测 harness*, 而不是要 refetch 数据。我保留 `--skip-update`(数据已就位), walk_forward 内部的 monthly retrain 不受这个 flag 影响——label 一变, 每月 retrain 都吃新 fwd_ret, 模型从 0 起步, 整 4 年 50 次 retrain 都是新的。生产 `data/model.lgb` / `data/blend_*.lgb` 不会被覆盖(walk_forward 不写它们, 只有显式 train 脚本才写)。
+
+### 6 run 后台已启动 (`bz7h46fks`, caffeinate, ~3-6h)
+脚本 `/tmp/label_compare.sh`, log `/tmp/label_compare.log` (按完成顺序追加 + 末尾 summary), 全部 NAV_DUMP。BT_START=20220101 BT_END=20260501, RANKER_KIND=blend, ENTRY_TIME=t_plus_1_open, INTRADAY_INJECT=0(纯 EOD, 不动 14:30)。
+
+| 顺序 | LABEL_KIND | seed | 备注 |
+|---|---|---|---|
+| 1-3 | close_to_close | 42, 43, 44 | 现有 cache 命中, 快; 复现 round 142 基线 (~24.8%/0.89/−31%) |
+| 4 | next_open_to_close | 42 | **BUILDS 新 cache**, 慢(~30-60min cache + ~20-30min walk_forward) |
+| 5-6 | next_open_to_close | 43, 44 | 新 cache 命中, 快 |
+
+NAV 文件 `/tmp/nav_lbl_c2c_s{42,43,44}.csv` + `/tmp/nav_lbl_n2c_s{42,43,44}.csv` — 完事可以算每日 Top-K Jaccard 重叠率 / 换手 / 任何二次指标。
+
+### 完成后我会出
+1. **3-seed 对比表**: 两 label × 3 seed → mean ± σ 的 [全周期累计/年化/vs ZZ500/Sharpe/MDD/Total trades]
+2. **诊断**:
+   - 若 next_open Sharpe +0.1+ 或 annual +2pp+ → close-to-close 漏掉对齐性 alpha, **建议切**
+   - 若 ±0.05 σ 以内 → 隔夜 gap 在 20 日窗口里被冲淡, 不必改
+   - 若新 label 更差 → 也诚实报(next-open 起点 noise 大可能反而吃亏)
+3. **换手对比**(Total trades), 看新 label 是否选了不同/更多/更少的票
+4. **(若 user 还要)** 每日 Top-K Jaccard 重叠率(用 NAV 序列 + 重跑一次抓 pick log, 或在脚本里加 pick dump)
+5. **回到 OOS 决定** — 这条研究结果会影响"维持封存 vs 极小仓 OOS" 的判断: 如果新 label 让 EOD 本身更好, OOS 的对比基准也变
+
+### 这一轮你
+1. ACK round 156 + label 开关 + 6-run 启动
+2. 等数(~3-6h 自动通知, 我立即跟进 round 158 报对比表)
+3. 真钱 + 14:30 task 维持冻结(纯研究)
+
+### Rule reminders
+- Rule #4: 研究态, walk_forward 不写生产 model/blend; --skip-update 保留(数据已就位); 14:30 仍封存
+- Rule #11: 这条研究不涉 intraday, baseline EOD PIT 不变
+- Rule #1: `factors_label_next_open_to_close.parquet` + NAV/log 不进 git, 仅脚本 + 结论文档
+
+### 主动给 user
+你 push 的"先做 label 对齐"已经动手: 加了个 LABEL_KIND 开关(`close_to_close` 旧 / `next_open_to_close` 新), 把训练 label 从"close 起涨"换成"D+1 open 起涨"——正好对齐你实际成交的起点, 把"决策→进场"那段隔夜 gap 从 label 里抠掉。然后 6 个 backtest 后台跑起来(两种 label × 3 seeds, 全周期 2022-2026, 大约 3-6 小时), 完了直接告诉你: (1) 新 label 是不是真的更好(夏普/年化/回撤/换手), (2) 值不值得切到生产, (3) 然后再回到 2:30 OOS 那个决定。真钱 + 2:30 仍冻结。
+
+---
+
 ## [2026-05-30 16:00] 第 154 轮 (clean refit + 全周期合成更新: a' DOUBLED (33→14.8) / β' HALVED (0.22→0.45) / **R²塌到0.007** → 全周期 alpha-real 撑到 189%/Sharpe 3.35 但 a' 统计上跟 0 区分不开 (SE≈31bps, 95%CI 含 0); pure-amp 25%/Sharpe 0.83 略输 EOD (0.89) — round 142 封存判断**基本不变**, alpha 实/假仍不可证) · 0 commit code
 
 ### NAV 跑完, 重拟 a'/β' (in-sample 8mo: ⓑ s42 + A s42 + ZZ500)
