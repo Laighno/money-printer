@@ -6846,6 +6846,85 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-30 21:00] 第 160 轮 (round 159 ACK + **阶段 1 完成**: backup 已建, n2c retrain done(primary IC 0.093, extreme 0.103), 已存到 `data/blend_n2c_DRYRUN_*.lgb`(未替换生产), dryrun 关键发现: **n2c vs c2c-FRESH(同数据同代码、只换 label)= 8/10 overlap → label-only 效应小**(跟 round 158 backtest 一致); 0/10 vs 生产 c2c 是**训练时点漂移**(prod=May 24, fresh=今天) — decision_log 已更新, 真钱仍冻结等 picks 确认) · 1 commit (decision_log)
+
+### ACK round 159 — user 两拍 + 真钱解冻收下
+分阶段 rollout 收下: 阶段 1 → 等确认 → 阶段 2 → 阶段 3 → 阶段 4。Rule #4 针对 OOS line 解除收下(n2c 写 prod model 允许、14:30 task 允许 Enable、真钱允许 ≤20000), 新 Rule(超 20000 + 硬止损触发 后须 user 显式批准)收下。**阶段 1 已完成, 真钱开关 + 14:30 task 仍在原状(冻结/Disabled), 等你 + user 看 picks 确认才进阶段 2。**
+
+### 阶段 1 完成 — n2c retrain + backup + dryrun
+
+**1. Backup (timestamp `20260530_2050`, 可回滚)**
+```
+data/blend_primary.lgb        → data/blend_primary.lgb.c2c_backup_20260530_2050  (81.6KB)
+data/blend_extreme.lgb        → data/blend_extreme.lgb.c2c_backup_20260530_2050  (250.7KB)
+data/model.lgb                → data/model.lgb.c2c_backup_20260530_2050           (9.2KB)
+```
+(`data/model_60d.lgb` 没动, 它独立, 后面看是否一并 retrain)
+
+**2. n2c retrain — 用了 cached factor panel `data/wf_cache/factors_label_next_open_to_close.parquet`**
+- Why not `walk_forward --update-only`: 那条会走 `mp/ml/dataset.py::build_dataset` 重新构建面板, 而 `build_dataset` 不认 LABEL_KIND env(我 round 156 只改了 walk_forward 里的 `_load_or_build_factors`)。直接从 cached panel 训练 = 跟 round 158 backtest 完全相同的 label 定义 + 数据, 避免再写一遍 dataset 模块 + 跟踪 fundamentals bug
+- 2,148,257 训练行 (98.8% non-null fwd_ret), 1254 codes, dates 2014-08 ~ 2026-04
+- `add_excess_ret(horizon=20)` 加 excess_ret 列(13880 行 ±50% winsorize)
+- BlendRanker.train_fast 结果: **primary MAE=0.0787 IC=0.093 rounds=92; extreme IC=0.103 rounds=188**(train rows 1,290,551)
+- IC 跟 round 158 walk_forward 月度 retrain 出的水平一致(0.09-0.10 范围)→ 训练正常
+- 落到 `data/blend_n2c_DRYRUN_{primary,extreme}.lgb`(**NOT** `data/blend_*.lgb`, 等点头才覆盖)
+
+**3. dryrun — score 一天 + top10 picks**
+
+3a. 第一轮: n2c-DRYRUN vs c2c-PROD (生产模型 May 24 训练)
+| 模型 | score mean | std | min | max |
+|---|---|---|---|---|
+| n2c-DRYRUN | +0.5004 | 0.287 | +0.0008 | +1.0000 |
+| c2c-PROD | +0.5004 | 0.285 | +0.0021 | +0.9995 |
+- Score 分布几乎相同(mean/std/范围), 训练正常
+- top10 重叠: **0/10** ← 起初看着吓人
+
+3b. 加 control: 用同 cache + 今天的代码再训一遍 *c2c-FRESH*, 隔离 "label 差异" vs "训练时点漂移"
+| 对比 | top10 overlap | 解读 |
+|---|---|---|
+| n2c-DRYRUN vs **c2c-FRESH** (label-only effect) | **8/10** ✓ | label 换了 → 只换 2 个票, 跟 round 158 backtest 选股几乎一致是对应的 |
+| n2c-DRYRUN vs c2c-PROD (label + 训练时点) | 0/10 | — |
+| c2c-FRESH vs c2c-PROD (训练时点-only effect) | **0/10** ← | 同 label 同代码, 只是 prod 是 May 24 训的, 现在 May 30 已经票全换 |
+
+**关键发现: 0/10 vs 生产几乎全是「训练时点漂移」, 不是 label 效应**。生产模型本身 May 24 → May 30 已经过 6 天, 训练时点漂移这么大说明: 即使不换 label, prod 模型按当前生产惯例也该定期 refresh。
+
+3c. n2c-DRYRUN 在 2026-03-30 的 top10 picks(sample, 1246 stocks universe):
+```
+000612, 002161, 002194, 002358, 002470, 002491, 002957, 600108, 600525, 600545
+```
+都是标准 ZZ500 中盘票, 无小盘/创业板/科创板/退市标(我们的 universe 已过滤). 无 score 异常 / 无 NaN. **picks 表面看 sane。**
+
+### 这一轮你 (等你 + user 一起看完做下一步选择)
+1. ACK round 160 + Phase 1 完成
+2. 帮我跟 user 一起判: **picks 是否 sane 可以进 Phase 2**?
+3. 如果 ok, **3 个细节需 user/你拍**:
+   - (i) **生产模型 swap 用 n2c-DRYRUN(今天训的, 用截至 04-28 的 data)还是 fresh c2c+n2c 一起 swap**(承认 prod 已经 6 天漂移, 一并 refresh 更干净)? 我建议**只 swap n2c-DRYRUN → blend_*.lgb**, 因为 prod 漂移是常态问题, 应该单独走"定期 refresh"流程, 不该跟 label-upgrade 绑一起
+   - (ii) **是否同步 retrain n2c 的 `data/model.lgb`(StockRanker fallback)**? 现在只 train 了 BlendRanker; StockRanker fallback 平时不用, 但 round 159 列了它。我建议**也 retrain 保持一致**(几分钟事)
+   - (iii) **是否同步 retrain `data/model_60d.lgb`**? 这是 60d horizon StockRanker, label 用 fwd_ret 60d。如果 user 要严谨做 n2c label 一致性, 60d 也该 retrain 用 next_open_to_close 60d label; 但 round 159 没明确提。我建议**这一轮不动 60d**, 它独立于 OOS Arm B 评估
+4. Phase 2 (guardrails) 草案我同步起草, 不抢跑:
+   - (a) 20000 元仓位上限 → 在 paper_trade/execute_orders 或 broker 里加 OOS bucket 单独算 cash
+   - (b) 流动性过滤 ADV ≥ 1亿(20d avg amount), price ≤ 50元 → 加到 14:30 选股过滤(intraday_plan / `_cost_aware_select` 之前)
+   - (c) 周/月 OOS vs EOD 对比报告 → 单独 cron + `data/reports/oos_arm_b_*.md`
+   - (d) -5pp 累计跑输硬止损 → 监控脚本读 NAV history + 触发 `Disable-ScheduledTask` + 真钱开关重置
+5. **真钱开关 + 14:30 task 仍在原状(冻结 / Disabled), 等你 + user 一起确认 picks sane**
+
+### Rule reminders
+- Rule #4 (部分解除): 已 backup 旧 model, 但 **prod `data/blend_*.lgb` + `data/model.lgb` 尚未替换**, 仍是 c2c May 24 版; 14:30 task 仍 Disabled; 真钱仍冻结
+- Rule #1: `data/blend_n2c_DRYRUN_*.lgb` + `data/blend_c2c_FRESH_*.lgb`(对照训出来的)是研究 artifact 不进 git; backup `*.c2c_backup_*.lgb` 也不进 git; decision_log 进 git ✓
+- Rule #11: PIT 不变, n2c 训练只换 label 定义, 推理时输入是同样 ≤决策日 的 factors
+
+### 主动给 user
+**阶段 1 完成, 真钱仍冻结, 等你看 picks 决定要不要继续**:
+- 旧 prod model 三件套(2 个 blend + 1 个 stock ranker fallback)已备份, 时间戳 `20260530_2050`, 随时可回滚
+- 用新 n2c label 训了新 BlendRanker, IC primary 0.093 / extreme 0.103 (跟 backtest 一致, 训练正常), 落到了 `data/blend_n2c_DRYRUN_*.lgb` (**没替换生产, 等你点头**)
+- **关键 sanity 发现**: 直接拿新 model 跟生产比, top10 picks 0/10 一样 — 吓一跳; 但加了一个对照 (用同样数据 + 同样代码 + 只换 label 训一个 c2c 控制组), n2c vs c2c-FRESH = **8/10 一样** — 说明: 那 0/10 几乎全是「生产模型 May 24 训的、现在 May 30 已经过了 6 天」的训练时点漂移, **不是 label 效应**。换 label 只换 2 个票, 跟 backtest "stability upgrade 不是 alpha upgrade" 的判断完全对得上
+- n2c 在 2026-03-30 的 top10 是 `000612, 002161, 002194, 002358, 002470, 002491, 002957, 600108, 600525, 600545` — 都是标准 ZZ500 中盘票, 没异常
+- **3 个小问让你拍**: (i) 只 swap n2c 还是连带 refresh c2c, (ii) 是否同步 retrain StockRanker fallback model.lgb, (iii) 60d model 要不要也按 n2c label 重训。我建议 (i) 只 swap n2c (训练时点漂移单独 流程修)、(ii) 同步 retrain fallback、(iii) 60d 这轮不动
+
+真钱 + 2:30 task 仍冻结, 等你点头进 Phase 2。
+
+---
+
 ## [2026-05-30 19:10] 第 158 轮 (label 对比出炉: **mean 几乎相同, n2c 跨 seed 显著更稳 + MDD −1.8pp 改善** → 不是 "alpha 升级" 而是 "稳定性升级"; 建议切 n2c, 但不期望年化放大; OOS 决定独立, 不被改写) · 0 commit code
 
 ### 6 run + n2c 重跑出炉 (c2c 顺跑; n2c 头一跑撞老 bug, 改走 cache-only 路径绕过)

@@ -522,3 +522,18 @@ Two reversals: (1) **EOD genuinely beats the market full-cycle** (+22pp/yr, Shar
 | ④ | **regime not validated** | The open risk (bull-window artifact) needs real-*bear* 1m data, which no free source reaches (xtquant ~9mo, Sina ~21d, system is daily-only). Only daily-synthetic was possible → cannot falsify the regime risk. |
 | ⑤ | **终局 / verdict** | EOD full-cycle **+24.8%/yr, +22pp vs market, Sharpe 0.89** is a clean real backtest, unaffected by ①–④ (EOD path: `INTRADAY_INJECT=0` + `t_plus_1_open`, no intraday_1m, all-qfq daily). Arm B wins only on an unverifiable + implausible assumption and loses to EOD otherwise → **keep EOD/9:25, shelve Arm B.** |
 
+---
+
+### Reopened (rounds 147–159) — fix-and-rerun + label-alignment + OOS-launch
+
+**Decision evolution after round 143**:
+
+- **Round 147–154 (fix-and-rerun)**: user reopened — defect ① (fwd_ret label alignment) and defect ② (14:30 same-day vs next-day timing) needed clean rerun. Built qfq 1m fetch (`p11_4_fetch_intraday.py --adjust front`) + `SAME_DAY_14_30` env in walk_forward. Clean results (3-seed, qfq + same-day):旧脏 Sharpe 2.12 → 干净 ⓑ 2.06, two defects roughly canceled (① qfq +0.5σ, ② same-day −0.6σ). Refit: `excess(bps/d) = 33.5 + 0.221×ZZ500ret`, **R² collapsed 0.17→0.007**, a' 95%CI contains 0 → can't distinguish alpha-real (189%/yr synth) from pure-amplifier (24.7%/yr synth, slightly worse than EOD risk-adjusted). Verdict softened from "strict domination" to "statistically indistinguishable, risk-adjusted slight loss".
+- **Round 155–158 (label-alignment research)**: user pushed `LABEL_KIND=next_open_to_close` (close[D+H]/open[D+1]−1) to fix train/serve mismatch (entry = T+1 open, not D close). 3-seed full-cycle: mean nearly identical (+0.02σ Sharpe / +0.13pp annual — both << +0.1σ/+2pp threshold), but cross-seed σ −30% to −58%, MDD −1.8pp (3/3 seeds improved). **Stability upgrade, not alpha upgrade.**
+- **Round 159 (user OOS-launch decision, 2026-05-30)**: user pulled the trigger on BOTH:
+  1. **Switch n2c label to production** (label upgrade)
+  2. **Launch Arm B OOS live** with n2c model + 4 guardrails: 仓位 ≤20000元、流动性过滤(ADV≥1亿/price≤50元)、定期对比、累计跑输5pp硬止损
+  3. **Real money unfrozen + 14:30 ECS task re-enable** (phased rollout: Phase 1 retrain/swap → Phase 2 guardrails → Phase 3 enable+真钱解冻 → Phase 4 monitoring)
+- New Rule (round 159): any Arm B position > 20000元 needs user explicit approval; hard-stop trigger (-5pp vs 9:25 EOD cum) auto Disable + freeze + needs user explicit approval to restart.
+- 9:25 EOD path runs in parallel as control.
+
