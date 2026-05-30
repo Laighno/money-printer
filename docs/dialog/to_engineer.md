@@ -8992,6 +8992,53 @@ ECS `--adjust front --start 20250901 --end 20260430` 跑完, base64-over-ssh 全
 前复权那 8 个月分钟数据(2025-09 ~ 2026-04, 615 只票)已经从你 ECS 抓回 Mac, 字节数完全匹配、pandas 读取通过, 数据就绪。下一步: 工程方按 round 148 设计的三档对比跑 ① 旧脏 → ② 只换复权 → ③ 全修(复权+同日) + 3-seed 稳定性。**修完那个 2.12 到底变成多少, 一锤定音"隔日是高估还是低估"、值不值得重新认真看 2:30。** 真钱仍冻结。
 
 
+## [2026-05-30 16:30] 第 155 轮 (round 152+154 ACK + user 在 OOS 决定前 push 新研究: label 对齐实际执行 — `close[D+20]/open[D+1]` vs 旧 `close[D+20]/close[D]`, 重训对比 EOD 优劣)
+
+### ACK round 152 + 154 — clean refit 收下, "封存"软化为"风险调整略输 + 不可证"
+- 152: 两缺陷反号抵消, 旧 2.12 → 干净 ⓑ 2.06, **方向没翻**; ②时序高估 −0.6σ(advisor 对) / ①复权低估 +0.5σ; 3-seed σ 大。
+- 154: refit a'=33.5/β'=0.22/**R²=0.007**; 全周期 alpha-real 189%/Sharpe 3.35 但 a' 95%CI 含 0; pure-amp 24.7%/0.83/MDD −35% 跟 EOD(24.8%/0.89/−31%) 几乎平、风险调整略输; **不再"严格支配", 现有数据根本判不了 alpha 实/假**。
+- 给 user 的两条路收下(维持封存 vs 极小仓 OOS), 等他拍。
+
+### user push 的新研究 — label 基准对齐实际执行
+user 戳中之前那个未修的 train/serve 错配: **EOD 训练 label 是 `close[D+20]/close[D]−1` (close-to-close), 但执行是 D+1 开盘进场——基准错配, 模型可能偏好"会高开"的票(close-to-close 看涨但 gap 在开盘兑现完, open 进场吃不到)**。要先做这个 label 对比, 才回到 OOS 决定。
+
+**新 label spec(user 已确认)**: 
+```
+旧: fwd_ret[i] = close[i + HORIZON] / close[i] - 1        # close-to-close
+新: fwd_ret[i] = close[i + HORIZON] / open[i + 1] - 1     # next-open → close
+```
+HORIZON 保持 20。差异 = 起点从 `close[i]` 换成 `open[i+1]`, **把"决策→进场"那段隔夜+开盘 gap 从 label 抠掉**(因为真实执行吃不到)。理论后果: 模型重训会去找"D+1 开盘之后还能走"的票, 避开"close 看好但 gap up 吃完 alpha"的票。
+
+### 让你做(纯研究, 不动生产 / --skip-update)
+1. **加 LABEL_KIND 开关**(env, 默认 `close_to_close` 保留旧行为):
+   - `LABEL_KIND=close_to_close`(默认): `fwd_ret = close[i+H]/close[i]−1`(现有, 不变)
+   - `LABEL_KIND=next_open_to_close`(新): `fwd_ret = close[i+H]/open[i+1]−1`
+   - 实现位置: `scripts/walk_forward_backtest.py` `_build_factor_panel` 里 fwd_ret 那段(`:316-332` 附近); 顺带 `_build_factor_panel` 的 parquet cache key 要带上 LABEL_KIND, 避免读到旧 close-label cache。
+2. **真重训整个模型, 不 --skip-update**(label 变了, 模型要从头学; 但还在研究态——别覆盖生产 model/blend)。两套 label 各跑全周期 retrain(2022-01~2026-04, RANKER_KIND=blend, ENTRY_TIME=t_plus_1_open, INTRADAY_INJECT=0)。
+3. **3-seed**(42/43/44)各跑一次, 报均值±σ。
+4. **对比表**(两套 label):
+   - 全周期: 绝对累计 / 年化 / vs ZZ500 / Sharpe / MDD
+   - in-sample(2025-09~2026-04): 同上, 跟我们已有的"EOD A 24.8%/Sharpe 0.89/MDD −31%"对齐
+   - **选股层面**: 每日 Top-K 重叠率(Jaccard 或两套各自 Top-10 的交集比例 mean ± σ), 看新 label 模型是否真的选了不同的票
+   - **运营层面**: 平均换手(笔/日), 看新 label 是否换手更高/更低
+   - (可选) IC / Hit Rate@K 训练阶段 metric, 用一致测试集
+5. **诚实诊断**: 若新 label 显著更好(Sharpe +0.1+ / 年化 +2pp+ / MDD 更小), 说明 close-to-close label 漏掉了对齐性 alpha——值得切; 若几乎一样(±0.05 Sharpe 内), 说明 close→open gap 这一日的差异在 20 日窗口里被冲淡, 不必改; 若新 label *更差*(也可能, 因 next-open 起点 noise 大), 也要诚实报。
+
+### 这一轮你
+1. ACK round 155
+2. 实现 LABEL_KIND + 重训两套(close_to_close / next_open_to_close)各 3-seed
+3. 出对比表(全周期 + in-sample + 选股重叠 + 换手), 给 user 决定切不切 + 回到 OOS 决定
+4. 真钱 + 14:30 task 维持冻结(纯研究)
+
+### Rule reminders
+- Rule #4: 研究态, 别覆盖生产 model/blend(单独命名比如 `data/model.lgb.label_open_test_*`), --skip-update 可关(label 重训需要); 真钱 + 14:30 仍冻结
+- Rule #11: 这条研究不涉 intraday, 不动 14:30 注入; baseline EOD PIT 不变
+- Rule #1: 重训 model 文件 + 回测 NAV/log 不进 git(脚本 + 结论文档 OK)
+
+### 主动给 user
+你 push 的"先做 label 对齐"安排了: 工程方实现一个开关让 label 从"D 收盘起涨"换成"D+1 开盘起涨"(即对齐你实际成交起点的版本), 然后用新 label 重训整个模型, 跟现有模型并排跑全周期 + 3-seed, 看新版本的年化/夏普/回撤/选股是否真的更好。这是个**真重训**的研究(不是改回测开关), 单次 retrain + 全周期回测大概 30-60min × 2 套 × 3 seed = 几小时。完了直接告诉你 (1) 新 label 是否值得切到生产、(2) 切了能多多少, 再回到 2:30 OOS 那个决定。真钱 + 2:30 仍冻结。
+
+
 
 
 
