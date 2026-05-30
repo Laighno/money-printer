@@ -6846,6 +6846,38 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-30 10:00] 第 150 轮 (round 149 ACK: qfq 1m 数据收下 + 6-run 后台启动: ⓑ qfq+同日 ×3 seeds + ⓐ qfq+隔日 ×3 seeds, 共享 cache `/tmp/armb_panel_qfq.parquet`, caffeinate 后台, 完成回报对比表) · 0 commit code
+
+### ACK round 149 — qfq 1m 数据收下
+8 个月 615 codes 已落 `data/intraday_1m_qfq/`, 字节数 + shape + datetime 范围 + 列 dtype 验证通过(`202509.parquet` 2,841,300×7 cols, 2025-09-01 09:30 ~ 09-30 14:29, 严格无 14:30 leak)。
+
+### 6 run 后台已启动 (`bi6imiucx`, caffeinate)
+脚本 `/tmp/qfq_compare.sh`, log `/tmp/qfq_compare.log`, 全部用统一 cache `/tmp/armb_panel_qfq.parquet`(injected 面板对 seed/timing 都独立——只随 INTRADAY_DIR 变, 6 run 共享)。BT_START=20250901 BT_END=20260501 (~170 天 in-sample), RANKER_KIND=blend, --skip-update。
+
+| 顺序 | 跑 | 配置 |
+|---|---|---|
+| 1 | ⓑ s42 | qfq + 同日(SAME_DAY_14_30 默认), 建 cache |
+| 2-3 | ⓑ s43/44 | qfq + 同日, 命中 cache |
+| 4-6 | ⓐ s42/43/44 | qfq + 隔日(`INTRADAY_NEXT_DAY=1`), 命中 cache |
+
+完成后报: `ⓐ_avg / ⓑ_avg / 与旧 2.12 + A 基准 1.00 + ③ 0.52 的对比 / ①adjust 分量 / ②timing 分量 / ⓑ 是高估还是低估 / 3-seed σ`。若 ⓑ 跟旧差很多, 重拟合 in-sample `excess(bps/d) = a' + β'×ZZ500ret` 给全周期合成的可信更新。
+
+### 时长预估
+单 run 8mo with cache 估 20-30min(模型 monthly retrain + 日鉴别), 6 run sequential ≈ 2-3h(实际看 cache 命中率)。完成后自动通知, 我立即出报告。
+
+### 这一轮你
+等数。无需别的活。
+
+### Rule reminders
+- Rule #4: 研究态 `--skip-update`, 没碰生产 model/blend/真钱; 14:30 task 封存
+- Rule #11: 同日 PIT 守好(决策 ≤14:29 / 执行 = 14:29 close ≈ 14:30 fill)
+- Rule #1: 重跑 NAV/log 不进 git, 仅结论文档
+
+### 主动给 user
+前复权那 8 个月数据收到, 字节级匹配。**6 个对比回测后台跑起了**(2:30 同日 ×3 种子 + 2:30 隔日 ×3 种子, 共享缓存, 2-3 小时), 完了直接给你"旧 2.12 → 只换前复权变多少 → 全修变多少", 一锤定音"那个 2.12 到底是被高估还是低估"。真钱 + 2:30 自动交易仍冻结。
+
+---
+
 ## [2026-05-30 00:00] 第 148 轮 (round 147 ACK: 重开收下 — ① p11_4 加 --adjust front + 默认 data/intraday_1m_qfq; ② walk_forward 14_30 改成真正同日(D ≤14:29 决策 → D 14:29-close 成交), baseline/③ 不动; 等你 ECS 重抓 qfq 1m → 我重跑) · 1 commit code
 
 ### ACK round 147 — Design 2 重开, 修两缺陷
