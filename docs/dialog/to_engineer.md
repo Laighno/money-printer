@@ -9137,6 +9137,79 @@ backup 三件套 ✓ / n2c retrain IC 0.093+0.103 跟 round 158 walk_forward 月
 你拍的 3 个都按推荐: 工程方现在 (1) 把 n2c 模型正式覆盖到生产 (5 分钟事, 跑完做一次"用新 model 选股是不是跟昨天 dryrun 完全一致"的 sanity check, 不一致就回滚) → (2) 接着实现 4 条 guardrails (仓位 ≤2 万 / 流动性过滤 ADV≥1亿+价格≤50 / 周月对比报告 / 累计跑输 5pp 自动止损 + 冻结真钱) + 一条一条 smoke 测。**Phase 2 全部完成 + 你 + 我都确认 guardrails 生效, 才进 Phase 3 启用盘中自动交易 + 真钱解冻。** 真钱和 2:30 仍冻结。慢一点稳一点。
 
 
+## [2026-05-31 10:30] 第 163 轮 (Phase 2 ACK + advisor review 5 点全过 + **user 拍板进 Phase 3** → final dryrun + cron 挂载 + 真钱解冻 + ECS Enable-ScheduledTask)
+
+### ACK round 162 — Phase 2 漂亮, 5 个 review 点我都接受
+- (a) execute_orders 入口层不是 broker 层 ✓: 你理由对 — plan.entry_path 是自然边界, broker 不知道 Arm B 是什么, emergency_liquidate 是 sell-only 不需 cap, execute_orders 是唯一 production buy 路径
+- (b) 14:29 morning bar close 做 price cap ✓: PIT 安全, 最接近成交时点, 比 prev close 准
+- (c) NAV 没拆 bucket → 当前 proxy 接受 ✓: "EOD baseline = 无 intraday-execution 日 NAV"偏假阳性而非假阴性, 安全方向对; **bucket 拆分后续另开 PR**(不阻塞 Phase 3, OOS 期间用保守 proxy 触发)
+- (d) `WARN_DELTA_PP = -3pp` yellow card 保留 ✓: 早期预警有价值, hard stop −5pp 不变
+- (5) commit 已 push (94a7002) ✓ Rule #1 守住(model 文件不进 git, BASELINE/decision_log/guardrail 代码进)
+- Step A sanity 10/10 match round 160 dryrun picks ✓ swap 正确
+
+### user 拍板进 Phase 3 (真钱解冻 + ECS Enable-ScheduledTask)
+4 条 guardrails 都生效 + 监控就位 → user 同意进 Phase 3。但启动前**必须再一次 final dryrun**, 因为这是真钱解冻最后一道关。
+
+### 这一轮你 — 3 个 Step, 顺序做
+
+**Step C — final dryrun (今晚或明天盘前, 真钱前最后一关)**
+用新生产 model (n2c blend + n2c model.lgb) + intraday_plan (含 4 guardrails) 跑一次"明天 14:30 应该买什么"的 dryrun, 输出:
+- top10 picks list (按 score 排序)
+- 仓位预算占用预测 (cap=20000)
+- 流动性过滤丢了几只 + 哪几只
+- 跟同一天 9:25 EOD plan 的 picks 重叠率
+- 任何 NaN/异常告警
+
+我和 user 看一遍 picks, OK 才进 Step D。**不 OK 就退回, 不启 14:30 task。**
+
+**Step D — 真钱解冻 + ECS Enable + cron 挂载**
+
+依次:
+1. **cron 先挂上**(止损监控必须在真钱解冻前就生效, 否则真钱跑了 monitor 没起来等于裸奔)
+   - Mac launchd / `arm_b_stop_monitor.py` 盘中 15min: `*/15 * * * 1-5` (周一到周五)
+   - Mac launchd / `oos_arm_b_report.py` 月度: `0 8 1 * *` (每月 1 号 8 点)
+   - 你写 plist / Task XML 给我或 user, 我帮挂(advisor 端 Mac 操作)
+2. **真钱开关解冻**: 你知道具体配置位置, 写明执行的命令; ARM_B_BUDGET_MAX=20000 确认在 env / config
+3. **ECS Windows ScheduledTask**: `Enable-ScheduledTask -TaskName "MoneyPrinter-IntradayPipeline"` (我帮远程执行 if needed, 但你 push 个 ssh-friendly 命令)
+4. **decision_log 更新**: Phase 3 启动条目, 列日期 / 关键 commit / 仓位 cap / 4 guardrails active / cron 挂载位置
+
+**Step E — Phase 4 监控规则 (持续, advisor + 工程方 共同)**
+- 第一周 daily: advisor 看 fill 真实滑点 vs 模型价 (取 execute_orders log)
+- 每周: advisor 平行跑独立 OOS vs EOD 对比, 跟工程方 cron 生成的对账
+- 每月: 工程方 cron 出报告, advisor + user review
+- 红线 (任一触发 → 暂停 + 报 advisor + user):
+  - fill 滑点 median > 20bps (执行真实性差)
+  - 14:30 task 失败 > 2 次 (运维)
+  - 跑输 EOD > -3pp (yellow card warn)
+  - 跑输 EOD ≤ -5pp (hard stop, monitor 自动 freeze)
+  - guardrail 触发 (仓位超 / 流动性过滤丢 > 50% top10 / 真钱拒绝)
+
+### 真钱解冻范围 (再明示一次)
+- **解冻**: OOS Arm B bucket, 上限 20000 元 (guardrail (a) 强制), 仅 14:30 path
+- **不解冻**: 任何超 20000 元的改动; 9:25 EOD path 维持自治 (BASELINE 跑 n2c label)
+- **回滚**: hard stop 触发 / 任一红线 → 自动 freeze 真钱 + Disable 14:30 task, 重启须 user 显式批准
+
+### 这一轮你
+1. ACK round 163 + Step C(final dryrun) 输出 picks 报告
+2. 等我 + user 看 picks ok 之后, Step D(cron + 解冻 + Enable)
+3. Step E 监控 ramp up
+4. decision_log 更新 Phase 3 启动条目
+
+### Rule reminders
+- Rule #4 完全解除针对 OOS line (cap 由 guardrail 强制); 9:25 EOD 维持自治
+- Rule #11: PIT 不变
+- Rule #1: cron plist/Task XML 进 git (作为部署文档); freeze flag / budget state JSON 不进 git
+- 新 Rule 沿用: 任何超 20000 的改动须 user 显式批准 / 硬止损触发后重启须 user 显式批准
+
+### 主动给 user
+你拍的进 Phase 3 安排了, **三步**:
+1. **今晚或明早盘前最后一次 dryrun** — 用新模型 + 4 guardrails 模拟"明天 14:30 应该买什么", 出 picks list + 仓位占用 + 流动性丢了几只 + 跟 9:25 EOD picks 重叠率, 我和你一起看一遍。**不合理就退回**。
+2. **正式启动 (今晚/明早 dryrun OK 后)**: 先把止损监控 cron 挂上 (盘中 15 分钟一次, 防真钱裸奔) → 然后真钱解冻 (仓位仍由 guardrail 强制 ≤2 万) → ECS 启 14:30 ScheduledTask。
+3. **进监控期**: 我每周平行跑独立对比 + 工程方 cron 月度报告, 任一红线 (跑输 -3pp warn / -5pp hard stop / 滑点 > 20bps / task 失败 > 2 次) 自动暂停, 报你 + 我。
+
+最快路径: 工程方今天出 dryrun → 你和我今晚看 → 明天 (周一) 14:30 跳 OOS。慢一点稳一点的话往后推都可以。**任何超 2 万的改动 + 硬止损触发后的重启, 都要你点头才能动。**
+
+
 
 
 
