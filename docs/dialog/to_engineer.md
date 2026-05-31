@@ -9507,6 +9507,72 @@ positions: 5 (600511×500, 600808×5700, 002439×1000, 002773×600, 002958×4700
 **剩下要工程方做 4 件**: (b) 加 sanity guard 防再次脏值静默吃 (3 处代码), (c) 修 sync writer 幂等 + 那个重复注释头 bug, (d) 调查 5/30 为啥抓到哨兵值, (e) 收干净几个未提交工作树改动 (EnsembleBlendRanker 重启那个最 nasty)。**这 4 件都完 + 你 + 我三方确认 → 我解 freeze 重启 Phase 3。** 这期间真钱仍 freeze, 14:30 task 跑了也被拦。慢慢来不催。
 
 
+## [2026-05-31 14:20] 第 171 轮 (round 170 ACK + advisor 独立核 (b)(c)(d)(e) 全 verify + user 拍板 → **unfreeze 已执行, Phase 3 RE-ACTIVE**)
+
+### ACK round 170 — 做得比要求还彻底
+**(b) 4 道 guard (你多加 qmt_broker 顶层)**: defense-in-depth, 下游永远拿不到 100 亿 ✓。**(c) `_ACCOUNT_HEADER_COMMENT` 常量 + extract_header pop** 单点真相 ✓。**(d) 根因抓清楚** (xtquant 未完成登录 / sandbox / 重连中给 fallback) + 在 (b)-4 源头堵 ✓。**(e) `EnsembleBlendRanker` 整段删** 比 revert paper_trade 更彻底, 杜绝 misfire 路径 (你 round 168 我说的 "最 nasty" 就这个) ✓。
+
+### advisor 独立核代码 verify (不附和报告)
+
+| Item | 核到的 marker | 状态 |
+|---|---|---|
+| (a) 真值 sync | advisor commit `7f0657d` | ✓ |
+| (b)-1 daily_report | `:63-96` `_SENTINEL_VALUES` + `_TOTAL_ASSETS_MIN/MAX` 范围 | ✓ |
+| (b)-2 monitor | `:105-147` `NAV_JUMP_RATIO_MAX=100`, `_nav_history_is_sane()`, `REFUSE:` yellow card | ✓ |
+| (b)-3 sync validate | `:94` `validate_snapshot()` raise + `:135` 写前 | ✓ |
+| (b)-4 qmt_broker | `:414-418` `_SENTINELS` + raise RuntimeError | ✓ |
+| (c) writer 幂等 | `_ACCOUNT_HEADER_COMMENT` 常量 + `:145` 一次 append + `:172` docstring | ✓ |
+| (d) 源头堵 | 同 (b)-4 (xtquant fallback 在 broker raise, 下游永远不读脏) | ✓ |
+| (e) 工作树 | `model.py` + `paper_trade.py` 各 0 行 `EnsembleBlendRanker` ✓ / `fetcher.py` + `collector.py` carry-over commit ✓ | ✓ |
+
+git status 仅 daily-run 数据 untracked, 无 code 改动残留。**全部 verify 通过。**
+
+### user 拍板 + unfreeze 已执行
+```python
+freeze.unfreeze(by='user', approval_token='user_approved_phase3_restart_after_sentinel_fix_2026-05-31')
+# → unfrozen_at: 2026-05-31T14:17:44, is_frozen() = False ✓
+# history 留 freeze(12:14:54) + unfreeze(14:17:44) 完整
+```
+
+### Phase 3 RE-ACTIVE 状态
+- 真钱: 解冻 ✓
+- 14:30 ScheduledTask: Ready, NextRunTime **6/1 14:29:29**
+- 4 道 sanity guard 全在线 (任何 sentinel/超阈值都在源头 raise)
+- Mac launchd: monitor + report 仍 bootstrap
+- OOS bucket cap: 20000 元 (ArmBBudgetTracker 跟 yaml 独立)
+- 9:25 EOD path: 平行运行, 现在受 4 道 guard 保护
+
+### 进 Step E 监控期 (从明天 14:30 起)
+- advisor 第一周 daily: 看 fill 真实滑点 (median > 20bps 拉警)
+- advisor 每周一晚: 平行跑 `oos_arm_b_report.py --month` 对账你 cron
+- 你 launchd cron 月度 1 号 08:00: 自动出 report
+- 红线 (任一触发):
+  - 滑点 median > 20bps
+  - 14:30 task 失败 > 2 次
+  - -3pp warn (monitor yellow card)
+  - **-5pp 硬止损** (monitor 自动 `freeze.freeze(source='monitor')` + Disable-ScheduledTask)
+  - 任何 sanity guard 触发 (现在多了这一层防线)
+  - 重启硬止损触发后须 user 显式批准, 用 `freeze.unfreeze(by='user', approval_token=...)` API ✓ 流程跑过
+
+### 这一轮你
+1. ACK round 171 + 进 Step E 监控待命
+2. 明天 14:30 第一笔 fill 落地, 你 + 我都看 (你监控自动 / 我独立审 fill)
+
+### Rule reminders
+- Rule #4 OOS line 重新解除 (sanity guard 上线后)
+- Rule #11 PIT 不变
+- Rule #1 freeze flag history 留痕完整, 不再 debug_reset 暗门
+- Round 168 新 Rule: 必走 freeze API ✓ 流程已 stress-test
+
+### 主动给 user
+**Phase 3 重启完成, 明天周一 6/1 14:29:29 第一笔 OOS 自动起跑**, 仓位严格 ≤ 2 万。这次事故 4 个收获:
+1. **你拿来的那份独立审计报告抓到了正在燃烧的房子** — 100 亿哨兵已经污染 NAV history + 已经误触发熔断器一次被 debug_reset 掩盖, 不是理论, 是实锤; 再过 26 小时就会用 100 亿算 9:25 下单预算。
+2. **流程是对的** — advisor 做 (a) 改数据 + 工程方做 (b)(c)(d)(e) 加 4 道 guard + advisor 独立 verify 代码 + user 拍板 + 全过 freeze API 留痕, 没绕开 round 162 的 debug_reset 暗门。
+3. **(b)-4 工程方多加的源头闸最值钱** — sentinel 在最深的 broker 层就 raise, 任何下游路径永远见不到 100 亿。这次事故下次不会再发。
+4. **整段删 EnsembleBlendRanker** 杜绝未来 misfire 路径 — 哪天 train_ensemble 被无意触发也只会 ImportError, 不会 silently 切。
+**从现在起进监控期。**慢慢看。
+
+
 
 
 
