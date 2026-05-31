@@ -82,10 +82,57 @@ def fetch_names(codes: List[str]) -> Dict[str, str]:
     return get_stock_names(codes)
 
 
+# round 168 sanity bounds (matches scripts/daily_report.py and
+# scripts/arm_b_stop_monitor.py). Any account value outside [1e3, 1e9] OR
+# matching a known QMT mock/未初始化哨兵 is rejected before write — better
+# to refuse to overwrite portfolio.yaml than to write 100亿 over real data.
+_TOTAL_ASSETS_MIN = 1_000.0
+_TOTAL_ASSETS_MAX = 1_000_000_000.0
+_SENTINEL_VALUES = {9_999_999_999.0, 10_000_000_000.0}
+
+
+def validate_snapshot(snapshot: Dict[str, Any]) -> None:
+    """Raise ValueError if the QMT snapshot looks polluted (round 168 incident).
+
+    5/30 incident: sync wrote total_assets=10000071328 / cash=9999999999 over
+    real ~28 万 — likely QMT had not connected / returned defaults. Guard at
+    the writer so 哨兵值 cannot reach disk.
+    """
+    acc = snapshot.get("account") or {}
+    ta = float(acc.get("total_assets") or 0)
+    cash = float(acc.get("cash_available") or 0)
+    mv = float(acc.get("market_value") or 0)
+    if ta <= _TOTAL_ASSETS_MIN or ta >= _TOTAL_ASSETS_MAX:
+        raise ValueError(
+            f"snapshot.total_assets={ta} outside sane bounds "
+            f"[{_TOTAL_ASSETS_MIN}, {_TOTAL_ASSETS_MAX}] — refusing to write. "
+            "Likely QMT 未连接 / mock fallback."
+        )
+    if ta in _SENTINEL_VALUES or cash in _SENTINEL_VALUES:
+        raise ValueError(
+            f"snapshot has known QMT sentinel value (total={ta}, cash={cash}). "
+            "Refusing — re-run after confirming QMT desktop is connected + logged in."
+        )
+    if cash < 0:
+        raise ValueError(f"snapshot.cash_available={cash} is negative — refusing.")
+    if mv > 0 and ta < mv:
+        raise ValueError(
+            f"snapshot.total_assets ({ta}) < market_value ({mv}) — impossible, refusing."
+        )
+
+
+# round 168 (c) — the placeholder comment line above `account:` MUST be unique.
+# extract_header() prior to this fix kept everything above `account:`, so each
+# sync iteration prepended a fresh comment while preserving the prior one —
+# the file accumulated 4 copies before the incident exposed the bug.
+_ACCOUNT_HEADER_COMMENT = "# 账户快照（结构化，供 4 点日报订单清单生成用）"
+
+
 def render_portfolio_yaml(snapshot: Dict[str, Any], names: Dict[str, str],
                           header: str) -> str:
     """Render the new yaml string. Header is preserved verbatim above
     `account:`."""
+    validate_snapshot(snapshot)
     acc = snapshot["account"]
     pos = snapshot["positions"]
     today = datetime.now().strftime("%Y-%m-%d")
@@ -95,7 +142,7 @@ def render_portfolio_yaml(snapshot: Dict[str, Any], names: Dict[str, str],
     lines: List[str] = []
     lines.append(header.rstrip())
     lines.append("")
-    lines.append("# 账户快照（结构化，供 4 点日报订单清单生成用）")
+    lines.append(_ACCOUNT_HEADER_COMMENT)
     lines.append("account:")
     lines.append(f"  total_assets: {acc['total_assets']:.2f}      # 总资产 (QMT auto-sync {today})")
     lines.append(f"  market_value: {acc['market_value']:.2f}       # 持仓市值")
@@ -119,12 +166,21 @@ def render_portfolio_yaml(snapshot: Dict[str, Any], names: Dict[str, str],
 
 
 def extract_header(text: str) -> str:
-    """Everything above the first `account:` line (or whole file if absent)."""
+    """Everything above the first `account:` line (or whole file if absent).
+
+    round 168 (c) fix: strip trailing blank lines AND any trailing copy of
+    `_ACCOUNT_HEADER_COMMENT` so re-syncs don't accumulate duplicate header
+    comments. Pre-fix portfolio.yaml had 4 copies of the comment line.
+    """
     out = []
     for line in text.splitlines():
         if line.strip().startswith("account:"):
             break
         out.append(line)
+    # Drop trailing blank-or-duplicate-comment lines so render can re-add
+    # exactly one comment + blank line below the header.
+    while out and (out[-1].strip() == "" or out[-1].strip() == _ACCOUNT_HEADER_COMMENT):
+        out.pop()
     return "\n".join(out)
 
 

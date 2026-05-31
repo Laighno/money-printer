@@ -55,11 +55,24 @@ def load_holdings() -> List[dict]:
     return [h for h in cfg.get("holdings", []) if h.get("type") == "stock" and h.get("code")]
 
 
+# Sentinel/sanity bounds for account fields (round 168 incident: 5/30 sync
+# wrote 9_999_999_999 哨兵值, daily_report.compose_orders used
+# total_assets × 0.7 → would have submitted 几亿~十亿 real-money orders).
+# Reject anything outside [1e3, 1e9] — real account is ~28 万, anything
+# > 1e9 is QMT mock/未初始化; anything < 1e3 means broker disconnected.
+_TOTAL_ASSETS_MIN = 1_000.0          # 1 千元下限
+_TOTAL_ASSETS_MAX = 1_000_000_000.0  # 10 亿元上限 (留 3 个数量级缓冲)
+_SENTINEL_VALUES = {9_999_999_999.0, 10_000_000_000.0}
+
+
 def load_account() -> dict | None:
     """Load structured account snapshot (total_assets / cash_available / target_position_pct).
 
     Returns None if portfolio.yaml has no `account:` block — orderlist generation
     will then be skipped gracefully.
+
+    Also returns None (with loud logger.error) if the account snapshot contains
+    sentinel / out-of-band values — see round 168 incident.
     """
     if not PORTFOLIO_PATH.exists():
         return None
@@ -71,6 +84,29 @@ def load_account() -> dict | None:
             return None
         # Sanity: require total_assets & cash_available
         if "total_assets" not in acct or "cash_available" not in acct:
+            return None
+        # round 168 sanity guard: reject sentinel / out-of-band values
+        ta = float(acct.get("total_assets") or 0)
+        cash = float(acct.get("cash_available") or 0)
+        mv = float(acct.get("market_value") or 0)
+        if ta <= _TOTAL_ASSETS_MIN or ta >= _TOTAL_ASSETS_MAX:
+            logger.error(
+                "load_account: total_assets={} out of bounds [{}, {}] — "
+                "likely stale QMT 哨兵值 (round 168 incident). Refusing.",
+                ta, _TOTAL_ASSETS_MIN, _TOTAL_ASSETS_MAX,
+            )
+            return None
+        if cash in _SENTINEL_VALUES or ta in _SENTINEL_VALUES:
+            logger.error(
+                "load_account: sentinel value detected (total={}, cash={}). "
+                "Refusing — re-sync portfolio.yaml from QMT.", ta, cash,
+            )
+            return None
+        if mv > 0 and ta < mv:
+            logger.error(
+                "load_account: total_assets ({}) < market_value ({}) — "
+                "impossible, refusing.", ta, mv,
+            )
             return None
         return acct
     except Exception as e:

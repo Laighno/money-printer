@@ -389,19 +389,48 @@ class QMTBroker:
     # ── account queries ─────────────────────────────────────────
 
     def get_account_info(self) -> AccountInfo:
-        """Query account asset snapshot."""
+        """Query account asset snapshot.
+
+        round 168 incident: 5/30 QMT returned default/uninit values
+        (cash=9999999999 / total_asset=10000071328) — likely the xtquant
+        session connected to QMT desktop but the desktop itself had not
+        completed broker-server login. Sentinel values passed through
+        unchecked and reached portfolio.yaml. Guard at the broker so any
+        downstream caller (sync, ad-hoc query, paper_trade) sees a
+        clean RuntimeError instead of garbage numbers.
+        """
         self._require_connected()
         from datetime import datetime
         asset = self._trader.query_stock_asset(self._account)
         if asset is None:
             raise RuntimeError("QMT query_stock_asset returned None")
-        return AccountInfo(
+        info = AccountInfo(
             cash_available=float(asset.cash),
             cash_frozen=float(asset.frozen_cash),
             market_value=float(asset.market_value),
             total_assets=float(asset.total_asset),
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
+        # round 168 sentinel guard
+        _SENTINELS = {9_999_999_999.0, 10_000_000_000.0}
+        if info.cash_available in _SENTINELS or info.total_assets in _SENTINELS:
+            raise RuntimeError(
+                f"QMT returned sentinel/uninit values "
+                f"(cash={info.cash_available}, total={info.total_assets}) — "
+                "QMT desktop session likely not fully connected to broker server. "
+                "Refusing to return — re-check QMT login state."
+            )
+        if info.total_assets > 1_000_000_000.0:  # > 10 亿
+            raise RuntimeError(
+                f"QMT returned implausibly large total_assets={info.total_assets} "
+                "(> 10 亿) — likely default/uninit, refusing."
+            )
+        if info.total_assets <= 0:
+            raise RuntimeError(
+                f"QMT returned non-positive total_assets={info.total_assets} — "
+                "refusing."
+            )
+        return info
 
     def get_positions(self) -> list[Position]:
         """Query all current positions."""

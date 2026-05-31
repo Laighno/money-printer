@@ -98,6 +98,36 @@ def get_intraday_dates() -> set[str]:
     return out
 
 
+# round 168 sanity bounds — refuse to compute deltas off obviously polluted
+# NAV history. 5/30 incident: portfolio.yaml sync wrote 100 亿哨兵值 → NAV
+# history captured 10000071328 alongside real 287460 → day-over-day ratio
+# 34788×, cum_ret = -9415583pp → monitor "triggered" off garbage.
+NAV_JUMP_RATIO_MAX = 100.0      # any |NAV[t]/NAV[t-1] - 1| ratio > 100× → refuse
+NAV_ABS_MAX = 1_000_000_000.0   # 10 亿元 — anything beyond is 哨兵值
+NAV_ABS_MIN = 1_000.0           # 1 千元 — anything below means broker disconnected
+CUM_RET_ABSURD = 10.0           # ±1000% in either direction is absurd for one account
+
+
+def _nav_history_is_sane(navs: List[Tuple[str, float]]) -> Tuple[bool, str]:
+    """Return (ok, msg). False if any NAV point or day-over-day jump looks polluted."""
+    for d, v in navs:
+        if v < NAV_ABS_MIN or v > NAV_ABS_MAX:
+            return False, (f"NAV {d}={v:.2f} outside sane bounds "
+                           f"[{NAV_ABS_MIN}, {NAV_ABS_MAX}] — likely "
+                           "sentinel / 哨兵值. Refusing to compute delta.")
+    for i in range(1, len(navs)):
+        prev_v = navs[i - 1][1]
+        cur_v = navs[i][1]
+        if prev_v <= 0:
+            continue
+        ratio = cur_v / prev_v
+        if ratio > NAV_JUMP_RATIO_MAX or ratio < (1.0 / NAV_JUMP_RATIO_MAX):
+            return False, (f"NAV {navs[i-1][0]}→{navs[i][0]} jump ratio "
+                           f"{ratio:.2f}× exceeds {NAV_JUMP_RATIO_MAX}× — "
+                           "data pollution suspected. Refusing.")
+    return True, ""
+
+
 def compute_cumulative_returns(nav_history: List[dict],
                                 intraday_dates: set[str]
                                 ) -> Tuple[float, float, str]:
@@ -111,6 +141,11 @@ def compute_cumulative_returns(nav_history: List[dict],
       drift on intraday days).
 
     If no intraday history exists, returns (0.0, full_cum_ret, msg).
+
+    round 168 sanity guard: any NAV point outside [1e3, 1e9] OR any
+    day-over-day jump > 100× raises a refuse-to-compute path. Returns
+    (0.0, 0.0, "REFUSE: ...") which run_check treats as no-op / yellow-card,
+    NOT as a hard-stop trigger (so a polluted NAV cannot freeze accounts).
     """
     if len(nav_history) < 2:
         return 0.0, 0.0, f"insufficient NAV history (n={len(nav_history)})"
@@ -123,9 +158,17 @@ def compute_cumulative_returns(nav_history: List[dict],
     if len(navs) < 2:
         return 0.0, 0.0, f"no usable NAV points"
 
+    # round 168 sanity guard
+    ok, why = _nav_history_is_sane(navs)
+    if not ok:
+        return 0.0, 0.0, f"REFUSE: {why}"
+
     nav_start = navs[0][1]
     nav_end = navs[-1][1]
     full_cum_ret = (nav_end - nav_start) / nav_start
+    if abs(full_cum_ret) > CUM_RET_ABSURD:
+        return 0.0, 0.0, (f"REFUSE: full_cum_ret={full_cum_ret:+.2%} exceeds "
+                          f"±{CUM_RET_ABSURD*100:.0f}% — data pollution.")
 
     # Cumulative ret on days WITHOUT intraday execs (proxy for EOD-only)
     eod_only = [(d, v) for d, v in navs if d not in intraday_dates]
@@ -201,6 +244,16 @@ def run_check(simulate_trigger: bool = False) -> int:
         # else fall through to simulate path below
 
     arm_b_ret, eod_ret, msg = compute_cumulative_returns(nav_history, intraday_dates)
+
+    # round 168 sanity guard: REFUSE prefix means NAV history is polluted —
+    # do NOT trigger hard-stop off garbage. Yellow-card (exit 1) so cron / ops
+    # see it but real money stays in its current state.
+    if msg.startswith("REFUSE:"):
+        logger.warning("Monitor REFUSING to compute delta: {}", msg)
+        if simulate_trigger:
+            logger.warning("--simulate flag set, but REFUSE path takes precedence")
+        return 1
+
     delta_pp = (arm_b_ret - eod_ret) * 100  # percentage points
 
     logger.info("Monitor check: {}", msg)

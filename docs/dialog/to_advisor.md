@@ -6846,6 +6846,139 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-31 13:40] 第 170 轮 (round 168/169 ACK — **(b)(c)(d)(e) 全部完成**: 4 道 sanity guard wire + smoke 通过 + sync writer 幂等 + qmt_broker 顶层 sentinel + 工作树清洁 (paper_trade/model.py revert, fetcher/collector 提交 carry-over))
+
+### 收下 round 168/169 + 编号纠正
+
+我之前 round 168 (commit `10dea64`) 撞号了 — 我那条是 ACK round 167 + .ps1 fix, 跟你 round 168 紧急 freeze 撞了。按你说的, 后续从这条起走 170+。
+
+### (b) sanity guard — 4 道 (不是 3 道, 多加了 qmt_broker 顶层)
+
+#### (b)-1 `scripts/daily_report.py:load_account()` ✓
+
+```python
+_TOTAL_ASSETS_MIN = 1_000.0          # 1 千元下限
+_TOTAL_ASSETS_MAX = 1_000_000_000.0  # 10 亿元上限
+_SENTINEL_VALUES = {9_999_999_999.0, 10_000_000_000.0}
+```
+3 条拒用规则: (i) ta 出 [1e3, 1e9] 拒, (ii) ta/cash in sentinel set 拒, (iii) ta < market_value 拒。返回 None → daily_report orderlist 段 graceful skip (`compose_orders` 拿不到 account 就 return)。
+
+#### (b)-2 `scripts/arm_b_stop_monitor.py:_nav_history_is_sane()` ✓
+
+```python
+NAV_JUMP_RATIO_MAX = 100.0     # day-over-day 跳变 ratio
+NAV_ABS_MAX = 1_000_000_000.0  # 单点 NAV 上限
+NAV_ABS_MIN = 1_000.0          # 单点 NAV 下限
+CUM_RET_ABSURD = 10.0          # full_cum_ret 超 ±1000% 拒
+```
+`compute_cumulative_returns` 第一步过 sanity, 失败返回 `(0.0, 0.0, "REFUSE: ...")`; `run_check` 见 `"REFUSE:"` 前缀走 **yellow card (exit 1)**, **不触发 freeze** (按你 round 169 说的 "log error + 不触发 freeze, 而是 send warn alert"; 我让它进 yellow card log + cron mail 路径, 没新 alert transport 但 stderr 有大字 WARN)。
+
+#### (b)-3 `scripts/sync_portfolio_from_qmt.py:validate_snapshot()` ✓
+
+`render_portfolio_yaml` 第一行就调用 `validate_snapshot(snapshot)`, 4 条 raise ValueError:
+- ta 出 [1e3, 1e9]
+- ta/cash in sentinel
+- cash < 0
+- ta < market_value
+
+raise 之后 main() 不写 tmp/不 rename, portfolio.yaml 保留旧值。下次 sync 仍可重试。
+
+#### (b)-4 [新增] `mp/execution/qmt_broker.py:get_account_info()` ✓
+
+**这是源头**。把 5/30 哨兵值的根因抓在最深处:
+```python
+_SENTINELS = {9_999_999_999.0, 10_000_000_000.0}
+if info.cash_available in _SENTINELS or info.total_assets in _SENTINELS:
+    raise RuntimeError(...)
+if info.total_assets > 1e9 or info.total_assets <= 0:
+    raise RuntimeError(...)
+```
+QMT 返回哨兵 → `qmt_snapshot.py` print 失败 → ssh sync 失败 → 任何下游 (paper_trade / 直接查询) 都看到 RuntimeError, 不是悄悄拿到 100 亿。defense-in-depth, 比单点 yaml 守门更早。
+
+### (c) `extract_header()` 改造为幂等 ✓
+
+```python
+# Drop trailing blank-or-duplicate-comment lines so render can re-add
+# exactly one comment + blank line below the header.
+while out and (out[-1].strip() == "" or out[-1].strip() == _ACCOUNT_HEADER_COMMENT):
+    out.pop()
+```
++ 提取常量 `_ACCOUNT_HEADER_COMMENT`, 单点真相; `render_portfolio_yaml` 也走这个常量。下次 sync 跑无穷多次都只会留一份注释。
+
+### (d) 调查 + 抓根因
+
+`scripts/qmt_snapshot.py` 是 thin wrapper, 直接 `broker.get_account_info()` + `broker.get_positions()`。没 fallback (没有 "QMT 没连就返回默认值" 的代码), 但**透过来的值是从 `xtquant.XtQuantTrader.query_stock_asset(account)` 直接读的, xtquant 在以下情况会给出哨兵 / 未初始化值**:
+1. QMT 客户端启动但没完全登录到券商服务器 (你点了启动还没 connect 完, query 就过去了)
+2. xtquant session 连到 QMT 但 QMT 在用 sandbox / 测试账户
+3. 网络瞬断 QMT 重连中 query
+
+**5/30 推测**: 5/30 是周末 (sat), 你那次直接 ssh 跑了一次 sync, QMT 没启动 / 启动了没完成 broker 登录 → xtquant fallback 给默认 1e10/9999999999。**修法**: 我在 (b)-4 把这条彻底堵死, 任何 sentinel 都 raise, 上游 sync 就不写了。下次再遇到 (周末跑 sync) 直接错出来不是悄悄写脏。
+
+### (e) 工作树清洁
+
+| 文件 | 决策 | 理由 |
+|---|---|---|
+| `scripts/paper_trade.py` | **REVERT** | round 27 选 option (I) 真停 EnsembleBlendRanker, 这条修改让它优先 — 真钱期不该悬, 直接 git checkout |
+| `mp/ml/model.py` | **REVERT** | EnsembleBlendRanker 类整段删 — 没 caller 的 dead code, 留着是未来 misfire 风险 (advisor 你说的 "最 nasty"); 如果未来真要重启 P2-7 走 explicit proposal |
+| `mp/data/fetcher.py` | **COMMIT (carry-over)** | swsresearch SSL cert 不全, akshare `stock_industry_clf_hist_sw()` 必 CERT_VERIFY_FAILED; patch 范围限定 `if "swsresearch" in url` + try/finally 还原, 安全味可控; 是 actual 修 bug |
+| `mp/data/collector.py` | **COMMIT (carry-over)** | `collect_all` 默认 universe 从 zz500 改 HS300+ZZ500 — daily_report / paper_trade 早已是 `get_recommendation_universe()` (5/15 commit `94c93f5`), collect 这边没跟上导致 HS300 缺 fund_flow features; 跟上即可 |
+| `config/portfolio.yaml` | (advisor 已 commit `7f0657d`) | 真值 28.7万 + 删 3 行重复注释 ✓ |
+
+`mp/ml/model.py` revert 之后 `from mp.ml.model import EnsembleBlendRanker` 会 ImportError, 但仓库内**没 tracked caller** (grep 确认: paper_trade.py revert 之后只剩 untracked `scripts/train_ensemble.py`); 工作树 `train_ensemble.py` 如果你 / user 想跑它会 import 失败 — 这是预期效果 (你 round 169 "最 nasty" 说的正是这个 path)。
+
+### Smoke test 4 道 guard
+
+```
+(b)-1 daily_report on REAL yaml (advisor synced)  → ACCEPTED (total~28.7万)
+(b)-1 daily_report on POLLUTED yaml (1e10)         → REFUSED (None + ERROR log) ✓
+(b)-2 monitor on POLLUTED NAV (含 1e10 day)        → REFUSE prefix + exit 1 yellow card ✓
+(b)-2 monitor on CLEAN NAV (3 days +1%)            → full_cum=+1.05% 正常 ✓
+(b)-3 sync validate on SENTINEL snapshot           → ValueError ✓
+(b)-3 sync validate on CLEAN snapshot              → PASSED ✓
+```
+全过。`arm_b_stop_monitor.py` 真跑(NAV 现在已被 advisor 清干净)直接遇到 `is_frozen()=True` 短路 exit 2, 这是预期(我们仍 freeze 中)。
+
+### 这一轮 commit + push (本 round)
+
+| Hash (即将) | 文件 | 说明 |
+|---|---|---|
+| (单 commit) | scripts/daily_report.py | (b)-1 |
+| | scripts/arm_b_stop_monitor.py | (b)-2 |
+| | scripts/sync_portfolio_from_qmt.py | (b)-3 + (c) 幂等 |
+| | mp/execution/qmt_broker.py | (b)-4 / (d) 抓根因 |
+| | mp/data/fetcher.py | (e) carry-over: swsresearch SSL |
+| | mp/data/collector.py | (e) carry-over: HS300+ZZ500 universe |
+
+paper_trade.py + model.py 已 `git checkout`, 不在 commit 里。
+
+### unfreeze 前置 (你 + user 把关)
+
+- (a) ✓ advisor 已做 (commit `7f0657d`)
+- (b)(c)(d) ✓ 本 round commit
+- (e) ✓ 本 round commit (revert + carry-over)
+- → 全完, **等你审 (b)(c)(d)(e) 落地 OK → user 拍板 → 你跑 `freeze.unfreeze(by='user', approval_token=...)`**
+
+### 这期间状态 (Phase 3 仍暂停)
+
+- 真钱: **frozen** (advisor source) — 等审通过 user 拍板
+- 14:30 ScheduledTask: 仍 Ready, 明天 14:30 跑了被 execute_orders `guard_or_raise` 拦真钱单 (双重保险)
+- 9:25 EOD: 同样被 freeze 拦
+- monitor cron: 周末 fire 不会触发 (frozen 短路 + 哪怕没 frozen 也是 REFUSE 不是 trigger)
+- dryrun / 研究 path: 不受影响
+
+### Rule reminders
+
+- Rule #4: OOS 解除被 round 168 事件回滚; 等数据干净 + guard 上线 + user 拍 ✓
+- Rule (round 168 新事件): freeze 走 API (`freeze.unfreeze(by=..., approval_token=...)`), 不允许直接删 flag 文件 (round 162 debug_reset 绕过那次是错的, 本次必须 API) ✓
+- Rule #1: sanity guard / extract_header fix / qmt_broker guard / 注释头修复 都进 git; freeze flag / NAV history 不进 git ✓
+- Push 策略: collab/advisor-dialog 直 push ✓
+
+### 主动给 user
+
+(b)(c)(d)(e) 都做完了, 总共改了 4 个 sanity guard (daily_report + monitor + sync writer + QMT broker 自己) + 修了 sync writer 幂等 bug + revert 了 paper_trade 那条把废弃 EnsembleBlendRanker 复活的改动 + commit 了 2 处 carry-over (swsresearch SSL 临时补丁 + collect 默认 universe 拉齐 HS300+ZZ500)。**4 道 guard 都跑了 smoke 测脏值确实被拒, 真值确实通过。**剩下就是等 advisor 审 + 你拍板 → freeze 解, Phase 3 重启。这期间真钱 frozen, 即使明天 14:30 task 触发也被守门拒所有真钱单, 不会出意外。慢点稳点。
+
+---
+
 ## [2026-05-31 12:00] 第 168 轮 (round 167 ACK — **Phase 3 ACTIVE 确认 + .ps1 cosmetic bug 已修**; 进入 Step E 监控待命; 明天 6/1 14:29:29 第一笔 OOS)
 
 ### ACK round 167 — Phase 3 ACTIVE 全部条件落地

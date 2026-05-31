@@ -924,7 +924,24 @@ def get_industry_history(universe: list[str] | None = None) -> pd.DataFrame:
         return hist.sort_values(["code", "start_date"]).reset_index(drop=True)
 
     try:
-        df = ak.stock_industry_clf_hist_sw()
+        # SW (申万) data source has incomplete cert chain on www.swsresearch.com,
+        # causing CERTIFICATE_VERIFY_FAILED.  Patch requests inside this call
+        # only — restore after so other akshare endpoints stay secure.
+        import requests as _req
+        _orig_session_req = _req.Session.request
+        def _patched(self, method, url, **kw):
+            if "swsresearch" in str(url):
+                kw["verify"] = False
+            return _orig_session_req(self, method, url, **kw)
+        _req.Session.request = _patched
+        try:
+            import warnings
+            from urllib3.exceptions import InsecureRequestWarning
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", InsecureRequestWarning)
+                df = ak.stock_industry_clf_hist_sw()
+        finally:
+            _req.Session.request = _orig_session_req
     except Exception as e:
         logger.warning(f"stock_industry_clf_hist_sw failed: {e}")
         return pd.DataFrame(columns=["code", "start_date", "board_name"])
