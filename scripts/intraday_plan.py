@@ -596,12 +596,26 @@ def score_universe(
     return result
 
 
-def apply_top_k_filters(full_scored: pd.DataFrame, top_k: int = TOP_K) -> Tuple[pd.DataFrame, list[str]]:
+ARM_B_PRICE_CAP = 50.0  # RMB; round 161 guardrail (b): high-price tickers
+                         # are slippage / cost hostile for ¥20k bucket, drop them.
+
+
+def apply_top_k_filters(
+    full_scored: pd.DataFrame,
+    top_k: int = TOP_K,
+    price_map: Optional[Dict[str, float]] = None,
+) -> Tuple[pd.DataFrame, list[str]]:
     """Same filter chain as daily_report.recommend_stocks Top-N:
       - drop 688/689/300/301 (already excluded from universe but defend
         in depth);
       - drop low-liquidity (20d avg amount < ¥1亿) on the top-30 head;
       - flag warn-tier (< ¥3亿) with _low_liquidity for the renderer.
+
+    When ``price_map`` (code → most-recent-close, typically the 14:29
+    morning-bar close) is supplied, additionally drop any candidate whose
+    last close is > ``ARM_B_PRICE_CAP`` (default 50 RMB). This is the
+    round 161 guardrail (b) for the 14:30 OOS bucket; the EOD path can
+    skip ``price_map`` to keep its prior behaviour.
 
     Returns (top_k_df, names_for_top_k_codes).
     """
@@ -629,6 +643,29 @@ def apply_top_k_filters(full_scored: pd.DataFrame, top_k: int = TOP_K) -> Tuple[
                     list(candidates.loc[too_illiquid, "code"]))
     candidates = candidates[~too_illiquid].reset_index(drop=True)
     candidates["_low_liquidity"] = candidates["_avg_amount_20d"] < LOW_LIQUIDITY_WARN_AMOUNT
+
+    # Arm B price cap (round 161 guardrail (b)): only applied when caller
+    # supplies a price_map (typically the 14:30 intraday path).
+    if price_map is not None:
+        candidates["_last_price"] = candidates["code"].map(
+            lambda c: float(price_map.get(str(c).zfill(6), 0.0))
+        )
+        # If a candidate has no price (missing morning bar) treat as 0 →
+        # they would be excluded by the > cap test below being False, but
+        # such codes should also be dropped because we can't size them
+        # safely.
+        no_price = candidates["_last_price"] <= 0
+        over_cap = candidates["_last_price"] > ARM_B_PRICE_CAP
+        too_pricey = over_cap | no_price
+        if int(too_pricey.sum()):
+            dropped_rows = candidates.loc[too_pricey, ["code", "_last_price"]]
+            logger.info(
+                "Arm B price cap (≤¥{:.0f}) dropped {}: {}",
+                ARM_B_PRICE_CAP, int(too_pricey.sum()),
+                [(row["code"], f"¥{row['_last_price']:.2f}")
+                 for _, row in dropped_rows.iterrows()],
+            )
+        candidates = candidates[~too_pricey].reset_index(drop=True)
 
     top = candidates.head(top_k).reset_index(drop=True)
     name_map = get_stock_names(top["code"].tolist())
@@ -797,7 +834,15 @@ def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
         asof_eod=asof_eod,
     )
 
-    top_k_df, _name_map = apply_top_k_filters(full_scored, top_k=TOP_K)
+    # Build code→price map from 14:29 morning bars so apply_top_k_filters
+    # can enforce the Arm B ≤¥50 price cap (round 161 guardrail (b)).
+    price_map = {
+        str(c).zfill(6): float(bar.get("close", 0.0))
+        for c, bar in intraday_bars.items()
+    }
+    top_k_df, _name_map = apply_top_k_filters(
+        full_scored, top_k=TOP_K, price_map=price_map,
+    )
     if top_k_df.empty:
         logger.error("Top-K filter dropped everything — abort")
         return 5

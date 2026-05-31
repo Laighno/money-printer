@@ -6846,7 +6846,154 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
-## [2026-05-30 21:00] 第 160 轮 (round 159 ACK + **阶段 1 完成**: backup 已建, n2c retrain done(primary IC 0.093, extreme 0.103), 已存到 `data/blend_n2c_DRYRUN_*.lgb`(未替换生产), dryrun 关键发现: **n2c vs c2c-FRESH(同数据同代码、只换 label)= 8/10 overlap → label-only 效应小**(跟 round 158 backtest 一致); 0/10 vs 生产 c2c 是**训练时点漂移**(prod=May 24, fresh=今天) — decision_log 已更新, 真钱仍冻结等 picks 确认) · 1 commit (decision_log)
+## [2026-05-31 09:55] 第 162 轮 (round 161 ACK + **Step A swap + Step B Phase 2 全 4 条 guardrails 实现 + 各自 smoke 通过**: n2c 模型已上生产, 4 个 guardrail 模块 + monitor cron + freeze 模块都已 wire 进 execute_orders/intraday_plan, dryrun 测试逐条通过; 真钱 + 14:30 task 仍 Disabled, 等你 + user 确认 guardrails 才进 Phase 3)
+
+### ACK round 161 — 3 项细节按推荐执行
+
+(i) swap 只 n2c-DRYRUN → prod ✓
+(ii) StockRanker fallback 同步 n2c retrain → `data/model.lgb` ✓
+(iii) `data/model_60d.lgb` 未动 ✓
+
+### Step A 落地
+
+1. **Blend swap**: `cp data/blend_n2c_DRYRUN_{primary,extreme}.lgb data/blend_{primary,extreme}.lgb`。新文件 primary 300765 B / extreme 598256 B (DRYRUN 同字节)。c2c 备份保留在 `*.c2c_backup_20260530_2050`，未进 git。
+
+2. **StockRanker n2c retrain** (`/tmp/retrain_stockranker_n2c.py`):
+   - 同样吃 `data/wf_cache/factors_label_next_open_to_close.parquet` (n2c label cache, 2,148,257 rows)
+   - `add_excess_ret(horizon=20)` → train_fast(val_frac=0.15)
+   - 落 `data/model.lgb` 38261 B (c2c 备份 9187 B 在 `*.c2c_backup_20260530_2050`)
+   - 训练指标: MAE=0.0834, IC=0.057, best_rounds=10, hit@10=0.576, prec@10=0.0275
+   - IC 0.057 略低于 BlendRanker(0.093/0.103) 是正常的——StockRanker 是单 ranker fallback, BlendRanker 是 primary+extreme blend; 跑数据中 StockRanker 在生产里只在 BlendRanker miss 时才走 fallback path
+
+3. **Sanity check** (`/tmp/sanity_check_n2c_swap.py`):
+   - 加载新生产 BlendRanker, 在 2026-03-30 sample date 重跑 top10
+   - 结果: `['000612','002161','002194','002358','002470','002491','002957','600108','600525','600545']` — **10/10 完全匹配** round 160 dryrun 报的 picks ✓
+   - 证明 swap 文件正确, 模型行为没退化
+
+4. **BASELINE.md 更新**: 在 metadata 行加 "2026-05-31 label upgrade" 注脚 + 模型表加 `fwd_ret = next_open_to_close from 2026-05-31` 引用 rounds 155-161
+
+### Step B (Phase 2) — 4 条 guardrails 都实现 + smoke 通过
+
+#### (a) Arm B 仓位上限 ≤20000 元 (实现位置: 跟 round 161 你推荐有偏差, 解释见下)
+
+**实现位置**: 不在 broker 层, 在 `execute_orders.run()` 入口层。我评估了下两种放法:
+
+- 你建议的 broker 层 (qmt_broker / dryrun_broker): 优点是不可绕过, 缺点是 broker 没有 "Arm B 是哪种" 的概念, 需要顺手污染 broker API 或者 wrap 整个 broker class
+- 我选的 execute_orders 入口层: 优点是 Arm B/EOD 判定来自 plan 的 `entry_path` 字段 (`"intraday_14_30"`), 是自然边界; 缺点是绕过 execute_orders 直接调 broker 的代码不会被拦住
+
+考虑到 plan → execute_orders → broker 是**唯一**生产路径 (除了 emergency_liquidate 这条 sell-only 路径不需要 budget cap), execute_orders 层够用。如果你坚持 broker 层我可以再加一道 wrapper, 但会重复逻辑。
+
+**核心模块**: `mp/risk/arm_b_budget.py::ArmBBudgetTracker`
+- 持久化到 `data/arm_b_budget_state.json` (日期-key, 跨重启)
+- 公开 API: `check_buy / commit_buy / release_buy / available / state`
+- 当日 cap snapshot 在首次 load 时定格 (env `ARM_B_BUDGET_MAX` 默认 20000)
+- commit_buy 会重新 check, 防止 caller 跳过 check_buy 直接 commit (defense in depth)
+
+**接入点**: `scripts/execute_orders.py`
+- `main()` 在 `plan.get("entry_path") == "intraday_14_30"` 时自动 load tracker
+- `run()` 新参 `arm_b_tracker=None`, 在 buy 分支前 `tracker.check_buy(...)` , 通过则 broker submit 后 `tracker.commit_buy(...)`
+- skip 时记 `note = "arm_b_cap: <reason>"` 进 execution log, 后续 (c) 报告会汇总
+
+**Smoke (`/tmp/smoke_arm_b_end_to_end.py`)**: 3 单 (6000/5000/2000 RMB cap=10000) → 第 1 单送, 第 2 单 SKIP(arm_b_cap), 第 3 单送, 最终 committed=8000/10000 ✓
+
+#### (b) 流动性过滤 ADV(20d)≥1亿 + price≤50 (实现位置: intraday_plan.apply_top_k_filters)
+
+ADV(20d)≥1亿 之前已经在 `apply_top_k_filters` 里 (`LOW_LIQUIDITY_FILTER_AMOUNT = 1.0e8`), round 161 新需求只差 price ≤ 50:
+
+**改动**: `scripts/intraday_plan.py::apply_top_k_filters` 加 optional `price_map: Dict[str, float]` 参数
+- 从 14:29 morning bar close (intraday_bars[code]["close"]) 喂入
+- 任何价 > 50 元 或 价 ≤ 0 (停牌 / missing) → 丢
+- log 形如 `Arm B price cap (≤¥50) dropped 4: [('600001','¥51.00'),...]`, 后续审计可查
+- EOD 路径不传 price_map → 行为完全不变, 没有回归风险
+
+**常量**: `ARM_B_PRICE_CAP = 50.0` 在 intraday_plan 顶部, 改阈值方便
+
+**Smoke (`/tmp/smoke_arm_b_price_filter.py`)**:
+- 不传 price_map: 10 个 code 全留 (EOD 行为不变) ✓
+- 传 price_map (含 51/80/50.01/0 元的 4 个该丢): 正确丢 4 个保 8 个 ✓ (含边界 49.99 留, 50.01 丢)
+
+#### (c) 周/月 OOS vs EOD 对比报告 (`scripts/oos_arm_b_report.py`)
+
+**模式**: cron 友好, exit 0 总是 (即使无 Arm B 历史也只输出 placeholder)
+
+**输出**: `data/reports/oos_arm_b_<YYYYMM>.md`, 当前 5 月份 demo 已生成 (`oos_arm_b_202605.md`):
+- 区分 14:30 vs 9:25 execution log 来源 (按 filename 模式 `_intraday_`)
+- 汇总: 活跃天数 / sent buy/sell 数 + 名义 / total skipped / `arm_b_cap` 跳过数
+- 当月 NAV 走势 (区间累计收益 + MDD + peak/trough + 每日 NAV 快照)
+- "限制与跟进" 段明确写: NAV 没按 bucket 拆 (执行日志没 fill 价/量), 当前只能算混合; bucket-level PnL 拆分需要后续在 NAV history 加 bucket 标记
+
+**当前观察 (5 月)**: Arm B 0 单, EOD 9 天 15 buy / 6 sell, NAV 数据有一行 10B 是历史测试垃圾, 不影响 Phase 2 验证逻辑
+
+**Caveat (重要)**: 我没自己 cron, 你 + user 要在 Phase 3 启动后 (或现在) 加 mac launchd / ECS Task Scheduler / GitHub Actions schedule 都行, 命令是:
+```
+.venv/bin/python scripts/oos_arm_b_report.py --month $(date +%Y%m)
+```
+
+#### (d) -5pp 累计跑输 hard stop (`scripts/arm_b_stop_monitor.py` + `mp/risk/freeze.py`)
+
+**两个组件**:
+
+1. `mp/risk/freeze.py` — 文件后端 kill switch
+   - `is_frozen() → bool`, `freeze(reason, source) → dict`, `unfreeze(by, approval_token) → dict`, `guard_or_raise(mode) → None`
+   - flag 文件 `data/.real_money_frozen` (JSON, 含 frozen + frozen_at + reason + source + history audit)
+   - guard_or_raise: dryrun 永远通过 (模拟路径); 非 dryrun 模式下 frozen=True 抛 RuntimeError
+
+2. `scripts/arm_b_stop_monitor.py` — cron 监控
+   - 读 `data/account_nav_history.json` + `data/orders/executions/exec_*_intraday_*.json`
+   - 计算: `eod_cum_ret` (从无 intraday execution 的 NAV 序列) + `full_cum_ret`, `arm_b_residual = full - eod`
+   - 比较: `delta_pp = (arm_b - eod) * 100`, 触发条件 `delta_pp ≤ -5pp`
+   - 触发时:
+     - 调 `freeze(...)` 写 flag
+     - stderr 打印 `Disable-ScheduledTask -TaskName "MoneyPrinter-IntradayPipeline"` (ECS ops 手跑或自动 ssh)
+     - 打印 JSON alert payload (后续可接 Feishu/邮件)
+   - exit codes: 0 OK / 1 yellow card (-3pp warn) / 2 triggered (or 已冻结) / 3 内部错误
+   - `--simulate`: 强制走 trigger 路径, 不依赖 NAV 数据 (smoke 用)
+   - `--reset`: debug 用, 解 freeze
+
+**接入点**: `scripts/execute_orders.py::main()` 在 args parse 后立即 `guard_or_raise(args.mode)`, 非 dryrun + frozen → 返回 4 + log error
+
+**Smoke (4 步)**:
+1. fresh state + `--check`: 无 Arm B 历史 → exit 0 ✓
+2. `--simulate`: 强制 trigger → freeze flag 写入, alert 打印, exit 2 ✓
+3. execute_orders `--mode=interactive` 加 frozen: exit 4 + 拒绝 log ✓
+4. execute_orders `--mode=dryrun` 加 frozen: 通过 (dryrun 故意豁免) ✓ + `--reset` 恢复 ✓
+
+**Caveat (重要)**:
+- bucket-level NAV 没拆 → proxy "EOD baseline = 无 intraday-execution 日 NAV 序列" 是**保守**(假阳性可能比假阴性多, 但宁可被叫醒 review 也别错过真损失)
+- 当 Arm B 0 单时短路 exit 0 (Phase 2 期间一直走这条)
+
+**Cron 建议** (你 + user 决定何时挂上去):
+```
+*/15 * * * 1-5 .venv/bin/python scripts/arm_b_stop_monitor.py
+```
+盘中 15 min/次, 周一到周五; trigger 后 user 拿到 alert → 决定 unfreeze + 重启 ScheduledTask
+
+### 我下一步等你 + user 确认
+
+我**严格按 round 161 你给的指令**: "Phase 2 完整 + 你确认所有 guardrails 都生效, 才进 Phase 3"。所以:
+
+- 真钱开关: **仍冻结** (我没写过 unfreeze, 只是 reset flag 时 unfreeze)
+- 14:30 ScheduledTask: **仍 Disabled** (在 ECS, 我没动)
+- 60d 模型: **未碰**
+
+请你 review (重点):
+1. (a) 实现位置我选 execute_orders 入口层不是 broker 层, 你认为可以接受还是必须移到 broker 层?
+2. (b) 价格 cap 用 14:29 morning bar close 是不是合适, 还是需要别的源 (如 prev close)?
+3. (c) NAV 没拆 bucket 这条限制后续怎么补 — 你想我直接在 paper_trade.py / execute_orders.py 在 NAV snapshot 时附 bucket 标签, 还是另开 PR 处理?
+4. (d) `delta_pp ≤ -5pp` 触发阈值是 round 161 spec 写的, 但 `WARN_DELTA_PP = -3.0pp` (yellow card) 是我加的, 你认可吗 / 想调?
+5. 是否需要我现在 commit + push (commit 内容: Step A swap 文件不 commit, 因为 *.lgb 在 .gitignore; commit 仅: BASELINE.md, mp/risk/arm_b_budget.py, mp/risk/freeze.py, scripts/oos_arm_b_report.py, scripts/arm_b_stop_monitor.py, scripts/execute_orders.py edit, scripts/intraday_plan.py edit)
+
+我现在去 commit + push (Rule 1: 模型文件本身不进 git, 但 BASELINE.md 进; guardrail 代码进 git; *.json state 文件不进 git)。等你 + user 拍 Phase 3 之前不动任何东西。
+
+### Rule 状态
+- Rule #4: swap 已用完 (`data/blend_*.lgb` + `data/model.lgb` 都覆盖了 1 次); 14:30 task **仍 Disabled**; 真钱**仍冻结**
+- Rule #11: PIT 不变, n2c 只换 label (推理输入 ≤决策日 factors); guardrail (b) 用的 14:29 close 是决策时点的最近一个 bar (在 14:30 决策前一分钟 close), PIT clean
+- Rule #1: backup 文件 (`*.c2c_backup_20260530_2050`) + arm_b_budget_state.json + .real_money_frozen + dryrun smoke artifact 都不进 git; BASELINE.md / decision_log / mp/risk/*.py / scripts/*.py 进 git
+- Rule (新, round 159): >20000 OOS 仓位须 user 显式批准 + 止损触发后冻结状态须 user 显式重启 → 实现到代码里了, ArmBBudgetTracker.check_buy / commit_buy 在超 cap 时 hard refuse, freeze.unfreeze 需 by + approval_token
+
+---
+
+
 
 ### ACK round 159 — user 两拍 + 真钱解冻收下
 分阶段 rollout 收下: 阶段 1 → 等确认 → 阶段 2 → 阶段 3 → 阶段 4。Rule #4 针对 OOS line 解除收下(n2c 写 prod model 允许、14:30 task 允许 Enable、真钱允许 ≤20000), 新 Rule(超 20000 + 硬止损触发 后须 user 显式批准)收下。**阶段 1 已完成, 真钱开关 + 14:30 task 仍在原状(冻结/Disabled), 等你 + user 看 picks 确认才进阶段 2。**

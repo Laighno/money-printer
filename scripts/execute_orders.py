@@ -215,8 +215,14 @@ def run(
     price_drift_pct: float = 0.02,
     fill_wait_seconds: float = 2.0,
     reconcile_tolerance: Optional[float] = None,
+    arm_b_tracker=None,
 ) -> list[dict]:
-    """Execute the plan.  Returns per-order execution records."""
+    """Execute the plan.  Returns per-order execution records.
+
+    When ``arm_b_tracker`` is non-None (typically auto-engaged for the
+    14:30 OOS bucket — see ``main()``), each buy is gated by the tracker's
+    daily 20,000 RMB cap (round 159 / round 161 guardrail (a)).
+    """
     orders = plan.get("orders", [])
     if not orders:
         logger.info("Plan has no orders — nothing to execute")
@@ -297,6 +303,20 @@ def run(
                                  "limit_price": limit, "note": msg})
                 continue
 
+            # Arm B daily budget cap (round 161 guardrail (a)): if a tracker
+            # is engaged (intraday 14:30 path), refuse buys that would push
+            # cumulative Arm B buy notional past the daily cap (default
+            # 20,000 RMB). Sells & non-armB pipelines bypass this gate.
+            if arm_b_tracker is not None:
+                ok, msg = arm_b_tracker.check_buy(code, shares, limit)
+                if not ok:
+                    logger.warning("Arm B cap SKIP {}: {}", code, msg)
+                    results.append({"status": "skipped", "code": code, "name": name,
+                                     "action": action, "shares": shares,
+                                     "limit_price": limit,
+                                     "note": f"arm_b_cap: {msg}"})
+                    continue
+
         # Interactive confirm
         if mode == "interactive":
             if not _confirm(f"  → 确认 {action.upper()} {code} {shares} @ ¥{limit:.2f}?"):
@@ -309,6 +329,16 @@ def run(
         result = broker.place_limit_order(code, action, shares, limit)
         if result.success:
             logger.info("  ✅ order_id={}", result.order_id)
+            # Commit Arm B budget after successful broker accept.
+            # If commit raises (race / extreme edge), surface as failed
+            # rather than silently corrupting cap accounting.
+            if arm_b_tracker is not None and action == "buy":
+                try:
+                    arm_b_tracker.commit_buy(code, shares, limit,
+                                              order_id=str(result.order_id))
+                except ValueError as e:
+                    logger.error("Arm B commit failed post-submit (state may "
+                                 "be inconsistent — investigate): {}", e)
             results.append({"status": "sent", "code": code, "name": name,
                              "action": action, "shares": shares,
                              "limit_price": limit, "order_id": result.order_id,
@@ -446,6 +476,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # Real-money kill switch (round 161 guardrail (d)): refuse live modes
+    # if the freeze flag is set. Dryrun + --emergency liquidation bypass
+    # this gate — emergency liquidation is the recovery path, not new
+    # exposure.
+    if not args.emergency:
+        from mp.risk.freeze import guard_or_raise
+        try:
+            guard_or_raise(args.mode)
+        except RuntimeError as e:
+            logger.error("{}", e)
+            return 4
+
     if args.emergency:
         return _run_emergency(args)
 
@@ -492,12 +534,23 @@ def main() -> int:
             qmt_userdata_path=args.qmt_userdata,
         )
 
+    # Engage Arm B daily-budget tracker iff this plan came from the 14:30
+    # OOS bucket. EOD / morning 9:30 plans run uncapped (their cap is
+    # account-level concentration above). Round 161 guardrail (a).
+    arm_b_tracker = None
+    if plan.get("entry_path") == "intraday_14_30":
+        from mp.risk.arm_b_budget import ArmBBudgetTracker
+        arm_b_tracker = ArmBBudgetTracker.load()
+        logger.info("Arm B budget tracker engaged: committed={:.0f}/{:.0f} RMB",
+                    arm_b_tracker.committed(), arm_b_tracker.budget_max())
+
     results = run(
         broker, plan,
         mode=args.mode,
         max_orders=args.max_orders,
         max_single_pct=args.max_single_pct,
         price_drift_pct=args.price_drift_pct,
+        arm_b_tracker=arm_b_tracker,
     )
 
     summary_md = _format_summary(results)

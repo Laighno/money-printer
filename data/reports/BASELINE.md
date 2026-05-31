@@ -1,6 +1,6 @@
 # 冻结基线（Frozen Baseline）
 
-**定稿日期**: 2026-04-22 · **2026-04-29 更新**：volume 单位 bug 修复 + BlendRanker 完整 walk_forward 验证 · **2026-05-24 re-baseline**：universe 扩到 hs300+zz500 + Bug 1/2 修复 + winsorize 入栈
+**定稿日期**: 2026-04-22 · **2026-04-29 更新**：volume 单位 bug 修复 + BlendRanker 完整 walk_forward 验证 · **2026-05-24 re-baseline**：universe 扩到 hs300+zz500 + Bug 1/2 修复 + winsorize 入栈 · **2026-05-31 label upgrade**：BlendRanker primary/extreme + StockRanker fallback 同步 retrain 到 `next_open_to_close` 标签（execution-aligned；dialog rounds 155–161）。c2c backup 保留在 `data/blend_*.lgb.c2c_backup_20260530_2050` + `data/model.lgb.c2c_backup_20260530_2050`，`data/model_60d.lgb` 本轮不动。
 **状态**: 研究收敛 — 进入"观察 + 监控退化"阶段，主线不再频繁改动。
 
 本文档是单一事实来源（single source of truth）。如果未来出现"是不是该 X"的冲动，先查这里：X 可能已经被否决过。
@@ -45,7 +45,7 @@
 | SLIPPAGE_BPS | 5 | env `SLIPPAGE_BPS` |
 | COMMISSION_BPS | 3 | env `COMMISSION_BPS` |
 | COST_AWARE_REBALANCE | True | `scripts/walk_forward_backtest.py` |
-| **模型（生产）** | **BlendRanker(0.80 primary + 0.20 extreme)** | `mp/ml/model.py` · 训练 label = `excess_ret` |
+| **模型（生产）** | **BlendRanker(0.80 primary + 0.20 extreme)** + StockRanker fallback | `mp/ml/model.py` · 训练 label = `excess_ret`（excess vs cross-sectional 均值，underlying `fwd_ret`= `next_open_to_close` from 2026-05-31，n2c label upgrade，rounds 155-161） |
 | RANKER_KIND（walk_forward 验证用） | 默认 `stock`，`blend` 用于验证 BlendRanker | env `RANKER_KIND` |
 | **POSITION_SIZING** | **`conviction`**（weight ∝ 模型超额预测） | env `POSITION_SIZING`，2026-04-29 起从 `equal` 切换 |
 | 因子集 ★ | `FACTOR_COLUMNS` 全量 64（51 技术 + 6 基本面 + 4 行业相对 + 3 基本面趋势）。固化在 `mp/ml/feature_presets.py::W_BASELINE_PRESET` (sig=3000062054) | `mp/ml/dataset.py` |
