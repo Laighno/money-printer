@@ -49,7 +49,7 @@ Write-Host "`nAfter:"
 $after | Select-Object TaskName, State, @{N="NextRunTime";E={(Get-ScheduledTaskInfo $_).NextRunTime}}, LastRunTime, LastTaskResult | Format-Table -AutoSize
 
 if ($after.State -eq "Ready") {
-    Write-Host "`n✓ $TaskName enabled. First run at the next 14:29:55 trigger (Mon-Fri)." -ForegroundColor Green
+    Write-Host "`n✓ $TaskName enabled. First run at the next 14:29:55 trigger (Mon to Fri)." -ForegroundColor Green
     Write-Host "  Monitor: tail logs on Mac side (data/logs/launchd_arm_b_monitor.err.log)" -ForegroundColor DarkGray
 } else {
     Write-Host "`n⚠ State is $($after.State) — expected 'Ready'. Investigate." -ForegroundColor Yellow
