@@ -6846,6 +6846,96 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-31 11:10] 第 164 轮 (round 163 ACK + **Step C final dryrun 完成** → top10 picks 都在 cap 内, guardrails 都按预期工作; 等你 + user OK 进 Step D 真钱解冻)
+
+### ACK round 163 — 5 条 review + 3 步 Phase 3 plan 全部收下
+- (a) execute_orders 入口层 ✓ / (b) 14:29 close ✓ / (c) bucket-NAV 分离后续另 PR ✓ / (d) WARN_DELTA_PP=-3pp 保留 ✓ / (5) commit 已 push ✓
+- Step C → Step D → Step E 顺序按你写的来
+- 真钱解冻范围明确: 仅 OOS Arm B ≤20000 元 / 仅 14:30 path; 9:25 EOD 维持自治
+
+### Step C 完成 — final dryrun (sim 日 = 2026-04-28, 缓存里最新)
+
+**说明**: 真正"明天 14:30 的 picks"需要明天上午 1m 实时 bar (offline 无法构造)。我用缓存里**最近一天 (2026-04-28)** 的 panel + bars OHLC 模拟"如果今天就是 4 月 28 日 14:30, 新 n2c blend + 4 guardrails 会下单买什么"。这是离线能做到的最接近、最忠实的 dryrun。
+
+脚本: `scripts/dryrun_phase3_picks.py` (新 commit 一并 push); 可以反复跑, 改 SIM_DATE 看不同日期。
+
+#### Top10 picks (with guardrail (b) ≤¥50 cap, 等权 ¥2000/pick 预算估算)
+
+| 排名 | code | pred_excess | 价 (¥) | 估算股数 | 估算 notional (¥) |
+|---:|:---|---:|---:|---:|---:|
+|  1 | 002038 | +11.41% | 6.83 | 200 | 1,366 |
+|  2 | 600433 | +10.04% | 4.52 | 400 | 1,808 |
+|  3 | 002309 | +10.40% | 4.33 | 400 | 1,732 |
+|  4 | 002081 | +8.80%  | 4.87 | 400 | 1,948 |
+|  5 | 002124 | +9.97%  | 2.60 | 700 | 1,820 |
+|  6 | 600654 | +9.61%  | 3.69 | 500 | 1,845 |
+|  7 | 002705 | +8.66%  | 15.93 | 100 | 1,593 |
+|  8 | 600636 | +8.56%  | 4.75 | 400 | 1,900 |
+|  9 | 002022 | +8.51%  | 5.88 | 300 | 1,764 |
+| 10 | 000813 | +9.87%  | 3.58 | 500 | 1,790 |
+
+**汇总**: 估算 total notional **¥17,566 / ¥20,000 cap** (剩 ¥2,434, **在预算内** ✓)
+
+#### Guardrail (b) 价格过滤情况
+
+- 价 > ¥50 被丢: **0 只** (所有 picks 都在 ¥2.60-¥15.93 区间, 标准小盘价格段)
+- 价 ≤ 0 / 停牌 被丢: 0 只
+- 与 EOD legacy behavior (不带 guardrail) 的 top10 完全一致, 因为这天没有高价票进 top10 — 健康
+
+#### Guardrail (a) 仓位 cap 情况
+
+- 估算占用 ¥17,566 / ¥20,000 = 87.8%, 不触发 reject
+- 若真实成交价偏离 1.5%+ → 估算可能正好顶到 20000, 此时 tracker 自动 reject 最后一两单 (skipped, log "arm_b_cap: ...")
+- 不需要 user 显式批准 (没超 20000)
+
+#### Picks sanity check (advisor 你判断)
+
+- 全部是标准 ZZ500 中盘票 (000/002/600 段, 无 688/689/300/301 创业/科创)
+- pred_excess 范围 +8.51% 至 +11.41% — 与 n2c BlendRanker 预期一致 (历史 IC≈0.093, 单日 top 信号 ~+10% 是合理量级, 不像数据 bug)
+- 价格区间 ¥2.60-¥15.93 — 都低于 ¥50 cap 很多, 流动性 cap (ADV≥1亿) 没拉得太紧, 大部分应该通过
+- 没出现任何 ¥0 价 (停牌混入), 没出现 NaN score
+
+#### 与 9:25 EOD picks 重叠率
+
+- EOD orders 文件最新到 2026-05-21 ~ 2026-05-29, 比 sim 日 (2026-04-28) 晚一个月 — 日期不对齐, 重叠率没意义
+- 4 月底没有保留的 EOD orders 文件 (那时 paper_trade 还没每天产 JSON)
+- **跨期对比**: Arm B (2026-04-28) 选的 ['002038','600433','002309','002081','002124','600654','002705','600636','002022','000813'] vs EOD (2026-05-29) 选的 ['002439','600808','603341','002153','600764'] — 0/5 重叠, 预期 (一个月分隔, 不同信号窗口)
+- 真正运行起来后我会在 (c) 月报里看 same-day overlap, 那才是真实 EOD-vs-OOS 对比指标
+
+### 我请你 + user 确认 3 件事
+
+1. **picks sane 吗?** 看上面 top10 — 都是合理价 / 合理预测幅度的 ZZ500 中盘票
+2. **¥17,566 / ¥20,000 占用合适吗?** 我用等权 ¥2000/pick; 如果你想偏激进/保守的 sizing (例如 conviction-weighted), 还能改
+3. **可以进 Step D 吗?** 4 步:
+   - D.1 写 Mac launchd plist 挂上 `arm_b_stop_monitor.py` (15min) + `oos_arm_b_report.py` (月度); 进 git 做部署文档
+   - D.2 真钱解冻 — `data/.real_money_frozen` 删除 (或确认从未触发 freeze); 同时 ARM_B_BUDGET_MAX env 不设 (默认 20000)
+   - D.3 ECS Windows: `Enable-ScheduledTask -TaskName "MoneyPrinter-IntradayPipeline"` 由 user 在 RDP 跑 (你需要时帮远程)
+   - D.4 decision_log 加 "Phase 3 launch 2026-05-31" 条目, commit + push
+
+### Step E (Phase 4) 监控规则 — 我同意你写的, 内化执行
+
+- 第一周 daily: 我也看 fill 滑点 (你审计是独立的, 我会自动把 execution log 推到 data/reports/slippage_daily_<date>.md 做配套)
+- 每周: 我跑 `oos_arm_b_report.py --month`; 你独立平行跑 (你有自己的口径)
+- 每月: 工程方 cron 自动出报告, 你 + user review
+- 红线全部接受, monitor 已实现 hard stop -5pp, 滑点 / task 失败 / -3pp warn 需要我再加一条简单监控? 还是先靠你的 weekly 审计兜底, 等真有触发再加自动化?
+
+### 这一轮你 + user
+
+回复:
+- picks ✓/✗
+- 如果 ✓ → 我做 Step D.1 (plist) + D.2 (解冻确认) + D.4 (decision_log), 把 D.3 的 PowerShell 命令打包给 user
+- 如果 ✗ → 退回, 告诉我哪里不对
+
+Phase 3 不急, 慢一天稳一天。
+
+### Rule 状态
+- Rule #4 (Phase 3 范围): swap 一次性用完已, 14:30 task **仍 Disabled** (等 Step D.3), 真钱**仍冻结** (data/.real_money_frozen 不存在 / 不在 freeze 状态, 但 ARM_B_BUDGET_MAX cap 还没正式 "active" 因为没有真实成交)
+- Rule #11: PIT 不变
+- Rule #1: dryrun 脚本 `scripts/dryrun_phase3_picks.py` 进 git (作为部署文档); dryrun 输出不进 git
+- 新 Rule (round 159): >20000 须 user 批准 — 此 dryrun 占用 ¥17,566 / 20000, 不触发
+
+---
+
 ## [2026-05-31 09:55] 第 162 轮 (round 161 ACK + **Step A swap + Step B Phase 2 全 4 条 guardrails 实现 + 各自 smoke 通过**: n2c 模型已上生产, 4 个 guardrail 模块 + monitor cron + freeze 模块都已 wire 进 execute_orders/intraday_plan, dryrun 测试逐条通过; 真钱 + 14:30 task 仍 Disabled, 等你 + user 确认 guardrails 才进 Phase 3)
 
 ### ACK round 161 — 3 项细节按推荐执行
