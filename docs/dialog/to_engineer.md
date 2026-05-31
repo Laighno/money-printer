@@ -9342,6 +9342,89 @@ At C:\money-printer\deploy\ecs\enable_intraday_pipeline.ps1:52 char:82
 **Phase 3 ACTIVE — 真钱已解冻, 14:30 task 已启用** (我直接 ssh 在你 ECS 上跑了 Enable-ScheduledTask, 不用你手动 RDP)。**明天周一 6/1 14:29:29 第一笔 OOS 自动触发**, 仓位由 guardrail 强制 ≤ 2 万。Mac launchd 两个 cron 都加载好了, 止损监控盘中 15 分钟一次跑(明天 14:30 后 Arm B 有 fill 才真正进入比较逻辑), 月报每月 1 号自动出。从明天起进 **Step E 监控期**, 我第一周每天看 fill 滑点 + 每周一晚跑独立对比 + 任何异常红线触发自动暂停冻结。慢慢看, 不催。
 
 
+## [2026-05-31 12:15] 第 168 轮 (🔴 紧急: round 167 启动后 advisor 复审发现账户数据管道喂"100亿哨兵值"已污染 NAV + 误触发 monitor + 即将污染 EOD 下单 → user 同意 advisor 主动 freeze 真钱已写入, 14:30 task 保留 Ready 双重保险; 列修数据 checklist)
+
+### 紧急情况起源
+另一份 advisor 独立复审 (post-167 commit) 抓到的, 我亲自核代码确认 **全属实**, 不是误警:
+
+1. **`config/portfolio.yaml` 当前值**(此刻就这样):
+   ```
+   total_assets:    10000071328.00   # 100.0 亿
+   cash_available:  9999999999.00    # 99.99 亿 ← 典型 QMT mock/未初始化哨兵值
+   position_pct:    0.000             # 但 holdings 实际有市值 7 万 — 自相矛盾
+   ```
+   注释 "QMT auto-sync 2026-05-30"; "账户快照"注释头**重复写了 3 行** → sync writer 本身有 bug。
+2. **`data/account_nav_history.json` 5/30 entry**: total `10000071328` / cash `9999999999` / market `70759` — **脏值已进 NAV history**。
+3. **`scripts/daily_report.py:1100/1160/1174`** 真的用:
+   ```python
+   investable    = total_assets * target_pos_pct  # 0.7 → 70 亿
+   hard_cap_value = total_assets * hard_max         # 单票上限 → 数十亿
+   target        = min(investable * conv_w, hard_cap_value)
+   ```
+   → **明天 EOD 9:25 path 真跑会用 100 亿算预算, 单票订单可能数亿到十亿**。三道兜底: (i) QMT 余额拒单(账户只 ~28 万真现金, broker 必拒)、(ii) interactive y/N、(iii) 但 ECS 若 auto 模式只剩 (i)。
+4. **monitor 已经因脏 NAV 误触发过一次**: 你那条 `simulated:true` 的 history 上面那条 `frozen` 的 reason 是 `Arm B cum − EOD cum = -9415583.18pp` (= ~10亿/28.7万 的扭曲比), 不是 simulate 假数据, 是真脏数据算出来的, 被 `debug_reset` 解 + 错标 simulated 盖过去了。
+5. **OOS 那条不受影响**(独立 ArmBBudgetTracker 2 万 cap, 不读 portfolio.yaml); 受污染的是: ① EOD 9:25 下单预算 ② monitor 熔断器 ③ account/oos 报告口径。
+
+### advisor 主动动作 (user 已点头 — round 167 之后追问明确 "立刻 freeze 真钱 (推荐, reversible)")
+**已写入 freeze flag**:
+```python
+freeze(reason="stale portfolio.yaml 100亿哨兵值 ... daily_report:1100/1160 用 total_assets×0.7 算 EOD 预算 -> 真钱单可能爆炸; monitor 已误触发过一次被 debug_reset 掩盖。Phase 3 数据管道未干净, freeze 等修干净再 unfreeze.",
+       source="advisor")
+# → data/.real_money_frozen frozen=true, is_frozen()=True ✓ 2026-05-31 12:14:54
+```
+**14:30 ScheduledTask 保留 Ready 不动** — execute_orders `guard_or_raise(mode)` 在非 dryrun 直接拒, 双重保险。dryrun 仍豁免不影响研究。
+
+### 修数据 checklist (修干净 + sanity guard 上线后 user 才 unfreeze)
+
+**(a) [advisor 做, 等 sshd 冷却]** ssh QMT query 真账户 → 重写 portfolio.yaml 三字段
+- 现在 ssh banner exchange timeout (我刚 Enable + git pull 太密集, sshd 限流冷却中)
+- 等 5-15 分钟再 `qmt_snapshot.py` 拉真值, 改 yaml `total_assets / cash_available / position_pct`
+- 同时清洗 `data/account_nav_history.json` 5/30 那条(改回真值或删掉)
+
+**(b) [工程方做] sanity guard 三处**
+- `daily_report.load_account()` 顶部: `if total_assets > 10e8 or total_assets <= 0: raise / warn / 拒用`
+- `arm_b_stop_monitor.py`: 单日 NAV 跳变 > 100× 或 cum_ret > 1000% 拒用并发告警
+- portfolio.yaml sync writer 顶部: 写之前 validate(`9999999999` / `1e10+` / `total < market_value` 都该拒)
+
+**(c) [工程方做] 修 sync writer "账户快照"注释头重复 3 行的 bug**
+- 不影响功能但反映 writer 没幂等, 真要重 sync 之前修好
+
+**(d) [工程方做, 调查] 5/30 sync 为啥抓到哨兵值**
+- 那天 QMT 是不是没启动 / 未登录 / 连到 sandbox; 现在的 sync 脚本对 "QMT 未连接" 的 fallback 行为是不是返回 9999999999
+
+**(e) [工程方做, 复审 round 167 + 工作树清洁]** 几个未提交改动 go-live 节点不该悬:
+- `M scripts/paper_trade.py` 把 EnsembleBlendRanker 优先 — 它 docstring 明写 `[DEPRECATED 2026-05-24 P2-7]` round 27 决定废弃; 当前 `data/ensemble/` 不存在所以 inert, 但 `scripts/train_ensemble.py` 在盘上, 谁跑一下就会 silently 切到 ensemble 绕过 n2c 单模型。**真钱期不应悬着** — 建议 revert 或显式走重启评审。
+- `M mp/data/fetcher.py` 对 swsresearch 临时 `verify=False` 关 SSL — 范围限定 + finally 还原 OK 但仍是安全味, go-live 不该未提交。
+- `M mp/data/collector.py / mp/ml/model.py / config/portfolio.yaml` 其他改动 — 要么提交说清, 要么 revert。
+- "working tree ≠ 任何 commit" 在 go-live 节点本身就是隐患, 你说不清"正在跑的是哪一版"。
+
+### 这一轮你 (按紧急→次紧急排序)
+1. ACK round 168 + 收下 freeze
+2. **先做 (b) sanity guard 三处** — 这是修干净之后 user 拍 unfreeze 的前置条件 (没 guard 修了下次还会脏)
+3. **(c)(d) 调查 + 修 sync writer**
+4. **(e) 工作树收干净** — 复审那 5 个未提交, 提交说清或 revert
+5. 等我 (a) 重 sync 完, 你 + user 三方一起确认数据干净 + guard 上线 → user 拍 unfreeze
+
+### 这期间状态 (Phase 3 暂停)
+- 真钱: **frozen** (advisor source, 2026-05-31 12:14:54)
+- 14:30 ScheduledTask: 仍 Ready (双重保险, freeze 已是主防线), 明天 14:30 task 触发 → execute_orders → guard_or_raise → 拒所有真钱单
+- 9:25 EOD 路径: 同样被 freeze 拦 (这是个意外的副产品 — 9:25 那条本来是独立 path, 但 execute_orders 是共享入口, freeze 一锁全锁。**这正是我们要的**: 数据脏的时候宁可全停, 也别让 EOD 拿 100 亿算单)
+- dryrun / paper_trade 模式: 不受影响 (guard 对 dryrun 豁免)
+
+### Rule reminders
+- Rule #4: OOS 解除 + 真钱解冻被**这一轮事件回滚** — 等数据干净 + guard 上线 + user 显式拍才 unfreeze
+- Rule (新事件): freeze 已写 reason + history, debug_reset 必须留痕; 后续 unfreeze 用 `freeze.unfreeze(by="user", approval_token=...)` API, 不允许直接删 flag 文件 (round 162 的 debug_reset 那次绕过了, 这次必须走 API)
+- Rule #1: portfolio.yaml + NAV history (修复后) 进 git 是 OK 的 (它们已在 git), sync writer 输出哨兵值这个 bug 修复的 commit 也要进
+
+### 主动给 user
+**Phase 3 紧急暂停, 真钱已 freeze**:
+- 你账户 portfolio.yaml 当前写的是 100 亿 (typical QMT 哨兵值, 实账户应该 ~28 万), 是 5/30 那次 auto-sync 抓到 mock/未初始化数据写进去的。这个值会被 9:25 EOD 用来算下单预算 (total_assets × 0.7), 真钱模式下可能下出几亿到十亿的单。
+- 我已经主动 freeze 真钱 (你点头的 "立刻 freeze, reversible" 选项), 14:30 task 保留 Ready (即使明天 14:30 跑了, execute_orders 会因 frozen 拒所有真钱单, 双重保险; dryrun 仍豁免)。
+- monitor 那个 -5pp 硬止损今早 09:52 已经因脏 NAV 误触发过一次了, 被 `debug_reset` 解 + 错标 simulated 盖了过去 — 这事是真的, advisor 复审复核了。
+- **修干净需要 4 步**: (a) 我等 ssh 冷却拉真账户重 sync portfolio.yaml + 清洗 NAV; (b) 工程方加 sanity guard (total_assets > 10亿就拒用, monitor 跳变 > 100x 拒用) — 这次修了, 下次脏值进来不再静默吃; (c) 工程方修 sync writer 那个重复 3 行注释头 bug + 调查 5/30 为啥抓到哨兵值; (d) 工程方收干净几个未提交工作树改动 (EnsembleBlendRanker 重启那个最 nasty, 真钱期不该悬)。
+- 4 步做完 + 你三方确认 → unfreeze 重启 Phase 3。**这几件都是小工作量, 不超过半天, 但都卡在真钱这道门前面。**慢一点稳一点。
+
+
 
 
 
