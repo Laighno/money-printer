@@ -14,54 +14,48 @@
 # 新建仓, 002385 减仓, 002439 加仓
 
 # 账户快照（结构化，供 4 点日报订单清单生成用）
+# 2026-05-31 13:14 advisor 从 QMT 直查重 sync 修复 (5/30 auto-sync 抓到 mock 哨兵值 1e10/9999999999)
 account:
-  total_assets: 105074.73      # 总资产 (QMT 实测 2026-05-28 09:08)
-  market_value: 83189.00       # 持仓市值
-  cash_available: 21885.73     # 可用资金
-  position_pct: 0.792          # 仓位 79.2% (5/27 大量买入后)
+  total_assets: 287262.49      # 总资产 (QMT 直查 2026-05-31 13:13)
+  market_value: 70759.00       # 持仓市值
+  cash_available: 216503.49    # 可用资金
+  position_pct: 0.246          # 仓位 = market_value / total_assets
   target_position_pct: 0.70    # 订单生成目标仓位（可调）
-  updated_at: '2026-05-28'
+  updated_at: '2026-05-31'
 
 holdings:
-- name: 大北农
-  code: '002385'
-  type: stock
-  board: ''
-  shares: 3900               # 5/27 减仓 3800 后
-  avg_cost: 3.549            # QMT broker avg cost
-  entry_date: '2026-05-26'
-- name: 启明星辰
-  code: '002439'
-  type: stock
-  board: ''
-  shares: 900                # 5/27 加仓 100 后
-  avg_cost: 15.179
-  entry_date: '2026-05-26'
-- name: 康弘药业
-  code: '002773'
-  type: stock
-  board: ''
-  shares: 600                # 5/27 新建仓
-  avg_cost: 21.188
-  entry_date: '2026-05-27'
 - name: 国药股份
   code: '600511'
   type: stock
   board: ''
-  shares: 500                # 5/27 新建仓
+  shares: 500
   avg_cost: 26.880
-  entry_date: '2026-05-27'
+  entry_date: '2026-05-30'   # auto-sync 写入时间; 实际建仓日未知
 - name: 马钢股份
   code: '600808'
   type: stock
   board: ''
-  shares: 4100               # 5/27 新建仓
-  avg_cost: 3.161
-  entry_date: '2026-05-27'
-- name: 粤电力Ａ
-  code: '000539'
+  shares: 5700
+  avg_cost: 3.119
+  entry_date: '2026-05-30'   # auto-sync 写入时间; 实际建仓日未知
+- name: 启明星辰
+  code: '002439'
   type: stock
   board: ''
-  shares: 2500               # 5/27 新建仓
-  avg_cost: 6.622
-  entry_date: '2026-05-27'
+  shares: 1000
+  avg_cost: 15.136
+  entry_date: '2026-05-30'   # auto-sync 写入时间; 实际建仓日未知
+- name: 康弘药业
+  code: '002773'
+  type: stock
+  board: ''
+  shares: 600
+  avg_cost: 21.188
+  entry_date: '2026-05-30'   # auto-sync 写入时间; 实际建仓日未知
+- name: 青农商行
+  code: '002958'
+  type: stock
+  board: ''
+  shares: 4700
+  avg_cost: 2.861
+  entry_date: '2026-05-30'   # auto-sync 写入时间; 实际建仓日未知
