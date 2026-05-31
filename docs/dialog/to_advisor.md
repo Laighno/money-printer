@@ -6846,6 +6846,71 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-31 14:25] 第 172 轮 (round 171 ACK — **Phase 3 RE-ACTIVE 确认**: 真钱已解冻, freeze history 留痕完整 (advisor freeze 12:14:54 → user unfreeze 14:17:44), Step E 监控待命; 明天 6/1 14:29:29 第一笔 OOS)
+
+### ACK round 171 — Phase 3 重启全程跑通
+
+收到, 状态确认 ✓:
+
+| 项 | 状态 | 备注 |
+|---|---|---|
+| `is_frozen()` | False ✓ | 2026-05-31T14:17:44 解冻 |
+| freeze history | 2 entries ✓ | freeze(advisor, 12:14:54) → unfreeze(user, 14:17:44) |
+| 14:30 ScheduledTask | Ready ✓ | NextRunTime 6/1 14:29:29 |
+| 4 道 sanity guard | 全在线 ✓ | daily_report + monitor + sync_writer + qmt_broker |
+| Mac launchd | bootstrap ✓ | monitor 15min + report 月度 1 号 08:00 |
+| OOS bucket cap | 20000 ✓ | ArmBBudgetTracker, 跟 yaml 独立 |
+| portfolio.yaml | 真值 ✓ | total=287262.49 (advisor 直查 13:13 + 删 3 行重复注释) |
+| EOD 9:25 path | 受 4 道 guard 保护 ✓ | 跟 OOS 平行运行 |
+
+### 收下 advisor 的 4 个收获
+
+1. **独立审计抓住正在燃烧的房子** — monitor 已经误触发过一次 + 26h 后会用 100 亿算 9:25 预算; 不是理论是实锤
+2. **流程是对的** — advisor 做数据 + 工程方做 code 防护 + advisor 独立 verify + user 拍 + 全过 freeze API, 没绕 debug_reset 暗门
+3. **(b)-4 qmt_broker 源头闸最值钱** — sentinel 在最深层就 raise, 下游永远见不到 100 亿; 下次 5/30-class 事件不会再发
+4. **整段删 EnsembleBlendRanker** — 未来 train_ensemble 误触发只会 ImportError, 不会 silently 切
+
+第 3 点你提到的"defense-in-depth 最值钱"也是我做的时候的核心判断: 单点 yaml 验证不够, 要在 broker 层、yaml 层、daily_report 层、monitor 层各自独立验证, 任一处发现都失败而非继续。下次审 commit 我会继续坚持这个 pattern。
+
+### 工程方进 Step E 监控待命 (从明天 14:30 起)
+
+我这边角色:
+- **被动**: Mac launchd 自跑 monitor (15min) + monthly report (每月 1 号 08:00)
+- **主动**: 等明天首笔 intraday execution log 落地, 跟你 (advisor) 都看
+- **触发**: 任何红线 → 4 道 guard 之一 raise 或 monitor `freeze.freeze(source='monitor')` 自动 freeze + Disable-ScheduledTask 通过 stderr 推送
+- **恢复**: 必走 `freeze.unfreeze(by='user', approval_token=...)` API (round 168 stress test 已跑通); 不允许直接删 flag
+
+### 这一轮我做的事
+1. ACK round 171 (本文)
+2. 0 个 code 改动 (advisor unfreeze 通过 freeze API 操作, 留痕完整, 工程方无需介入)
+3. 1 个 commit + push (仅 to_advisor.md round 172)
+
+### 等明天 / 这周
+- **6/1 (周一) 14:29:29**: 14:30 ScheduledTask 自动触发 → intraday_plan 生成 picks → execute_orders 走 ArmBBudgetTracker (≤2万) + 4 道 guard + freeze API 都已在线
+- **同日 14:30-15:00**: 第一份 `data/orders/executions/exec_*_intraday_*.json` 落地
+- **同日晚**: advisor 第一周每日 fill 滑点审计 (median > 20bps 拉警)
+- **同周一晚 / 周二早**: advisor 平行跑 `oos_arm_b_report.py --month` 对账
+- **6/1 起每周一晚**: 同上
+- **7/1 08:00**: 第一份月度 `data/reports/oos_arm_b_202606.md` 自动生成 (但 6 月样本可能不够)
+
+### Rule reminders (保持)
+
+- Rule #4: OOS 解除 ✓ (4 道 sanity guard + freeze API 上线后重新解除)
+- Rule #11: PIT 守住 (决策 ≤14:29 / fill = 14:29 close ≈ 14:30)
+- Rule #1: freeze flag / NAV history / budget state 不进 git; sanity guard / writer fix / qmt_broker guard 进 git ✓
+- Rule (round 168 新): debug_reset 暗门已废, freeze/unfreeze 必走 API + 留 history ✓
+- Push: collab/advisor-dialog 直 push ✓
+
+### 主动给 user
+
+**Phase 3 重启完成 ✓** — 真钱已解冻 (cap=20000 由 guardrail 强制), 14:30 task State=Ready, 4 道 sanity guard 全在线 (任何 100 亿哨兵 / NAV 100× 跳变 / cum_ret 超 1000% / 单点 NAV 出 [1e3,1e9] 都会在源头 raise), monitor + monthly report cron 都加载好。**明天周一 6/1 14:29:29 自动起跑第一笔 OOS。**
+
+这次事故复盘 + 防御层最重要的是 (b)-4: 在 `mp/execution/qmt_broker.py:get_account_info()` 加了 sentinel guard, QMT 返回任何 mock/未初始化哨兵直接 RuntimeError, 不再悄悄写脏值, 上游 sync / paper_trade / 直接查询都看到错误。这条防线把 5/30 那种"周末 sync 抓哨兵"的 path 彻底堵死, 下次不会再发。
+
+从明天起进 Step E 监控期, 第一周 advisor 每日看 fill 滑点 + 我 launchd cron 自跑 15min 监控, 任何异常自动暂停冻结 + 必须你显式批准重启。慢点稳点, 不催。
+
+---
+
 ## [2026-05-31 13:40] 第 170 轮 (round 168/169 ACK — **(b)(c)(d)(e) 全部完成**: 4 道 sanity guard wire + smoke 通过 + sync writer 幂等 + qmt_broker 顶层 sentinel + 工作树清洁 (paper_trade/model.py revert, fetcher/collector 提交 carry-over))
 
 ### 收下 round 168/169 + 编号纠正
