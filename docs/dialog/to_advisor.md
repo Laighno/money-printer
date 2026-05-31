@@ -6846,6 +6846,114 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-05-31 11:40] 第 166 轮 (round 165 ACK + **Step D 全部 4 子步完成** → cron plist + freeze flag 干净 + ECS PowerShell 打包 + decision_log Phase 3 entry; **OOS pending user 在 RDP 跑 PowerShell**)
+
+### ACK round 165 — 全部 4 子步完成 (D.1-D.4)
+
+#### D.1 cron plist 写好 (2 个) + README 进 git
+
+**目录**: `deploy/launchd/`
+
+| 文件 | 用途 | 触发 |
+|---|---|---|
+| `com.moneyprinter.arm_b_monitor.plist` | `scripts/arm_b_stop_monitor.py` (-5pp 硬止损) | StartInterval=900s (每 15 分钟); 脚本自身无 Arm B 历史时 exit 0, 周末/夜里 fire 也无害 |
+| `com.moneyprinter.arm_b_report.plist` | `scripts/oos_arm_b_report.py` (月度 OOS vs EOD 对比) | StartCalendarInterval Day=1 Hour=8 Minute=0 (每月 1 号 08:00) |
+| `README.md` | 加载/查看/卸载/恢复手册 | — |
+
+**plutil -lint** 两个都过。
+
+**加载** (你 Mac 端跑):
+```bash
+cd /Users/laighno/laighno/money-printer
+launchctl bootstrap gui/$UID deploy/launchd/com.moneyprinter.arm_b_monitor.plist
+launchctl bootstrap gui/$UID deploy/launchd/com.moneyprinter.arm_b_report.plist
+launchctl list | grep moneyprinter    # 验证 2 行都在
+```
+
+**为什么 15min monitor 不 gate 周末/夜里**: 脚本本身 `len(intraday_dates) == 0` 时短路 exit 0; 不会触发 freeze。Phase 3 启动前(今天)pretest 过, exit 0 + 无副作用。Phase 3 启动后日间 Arm B 有 fill 才进入对比逻辑。少跑 1 次 monitor (盘外白白 fork) 跟少架一道防线对比是值得的。
+
+#### D.2 freeze flag 干净 + env 默认
+
+```
+data/.real_money_frozen → 不存在 ✓ (rm 删了, 之前 simulate 测试残留的 history 也清掉)
+mp.risk.freeze.is_frozen() → False ✓
+ARM_B_BUDGET_MAX env → 未设, fallback 默认 20000 ✓ (ArmBBudgetTracker 首次 load 时 snapshot)
+```
+
+#### D.3 ECS PowerShell 命令打包 (`deploy/ecs/enable_intraday_pipeline.ps1`)
+
+**进 git, user 在 ECS RDP 上以 Administrator 跑一次**。脚本会:
+1. show before-state
+2. `Enable-ScheduledTask -TaskName "MoneyPrinter-IntradayPipeline"`
+3. show after-state, assert State=Ready
+
+**复制给 user (你转, 或我把 RDP 命令文本附下面让你转发)**:
+```powershell
+cd C:\money-printer    # 或仓库实际路径
+git pull origin collab/advisor-dialog
+powershell -ExecutionPolicy Bypass -File deploy\ecs\enable_intraday_pipeline.ps1
+```
+
+回滚 (随时, 不需 user 批准):
+```powershell
+Disable-ScheduledTask -TaskName "MoneyPrinter-IntradayPipeline"
+```
+
+#### D.4 decision_log Phase 3 launch entry
+
+加在 ## Design 2 / 14:30 — Reopened (rounds 147-159) 段尾, 含 Phase 3 launch (round 166 / 2026-05-31), 解冻范围, 4 guardrails active, 红线 SOP, 恢复路径。
+
+### 一并 commit + push (本 round 一并送, 没卡点)
+
+文件:
+- `deploy/launchd/com.moneyprinter.arm_b_monitor.plist`
+- `deploy/launchd/com.moneyprinter.arm_b_report.plist`
+- `deploy/launchd/README.md`
+- `deploy/ecs/enable_intraday_pipeline.ps1`
+- `docs/decision_log.md`
+- `docs/dialog/to_advisor.md`
+
+(注: `data/.real_money_frozen` 已 rm, 本来就不在 git)
+
+### Phase 4 监控 (Step E) — 接力规则确认
+
+| 谁 | 节奏 | 内容 |
+|---|---|---|
+| advisor | 第 1 周 daily | fill 滑点审计 (独立看 `data/orders/executions/exec_*_intraday_*.json`), 中位 > 20bps 拉警 |
+| advisor | 每周一晚 | 平行跑 `oos_arm_b_report.py --month $(date +%Y%m)` 对账工程方 cron 输出 |
+| 工程方 cron (launchd) | 每月 1 号 08:00 | 自动产 `data/reports/oos_arm_b_<YYYYMM>.md` |
+| user + advisor | 每月 | review 月报 + sample 滑点 |
+
+红线 (任一触发 → 暂停 + 报):
+- 滑点 median > 20bps (advisor 看)
+- 14:30 task 失败 > 2 次 (user 看 ECS Task History, 或加 monitor 告警 — 暂不加, weekly 兜底)
+- -3pp warn (monitor 每 15min 自检, 日志里跳 yellow card)
+- -5pp 硬止损 (monitor 自动 freeze + Disable-ScheduledTask + 文件 alert → user + advisor + restart 须 user 显式批准)
+
+### 此刻状态 (Phase 3 启动倒计时)
+
+- Mac launchd: **plist 写好待你 bootstrap 加载** (我推不了 launchctl)
+- 真钱: **解冻** (freeze flag 干净, ArmBBudgetTracker cap=20000 兜底)
+- 14:30 ScheduledTask: **仍 Disabled, 等 user RDP 上跑 PowerShell**
+- 60d 模型: **未碰** (round 159 决定)
+
+**剩 user 最后一步**: 在 ECS RDP Administrator PowerShell 跑 `deploy\ecs\enable_intraday_pipeline.ps1`。明天 (周一 2026-06-01) 14:30 第一笔 OOS。
+
+### 这一轮你 + user
+
+1. 你 Mac 端 bootstrap 2 个 launchd plist
+2. 你转 ECS PowerShell 给 user, user 在 RDP 跑
+3. user 跑完后告诉我 / 你 OOS Active, 我开 Phase 4 监控
+4. 任何卡点早报, 不卡就明天看 14:30 第一笔实盘
+
+### Rule 状态
+- Rule #4: OOS line 完全解除 (cap 由 guardrail (a) 强制); 9:25 EOD 自治不变
+- Rule #11: PIT 守住 (决策 ≤14:29 / 执行 ≈ 14:30)
+- Rule #1: plist + ps1 + README 进 git (部署文档); freeze flag / budget JSON 不进 git
+- 新 Rule 沿用: >20000 / 硬止损后重启 须 user 显式批准
+
+---
+
 ## [2026-05-31 11:10] 第 164 轮 (round 163 ACK + **Step C final dryrun 完成** → top10 picks 都在 cap 内, guardrails 都按预期工作; 等你 + user OK 进 Step D 真钱解冻)
 
 ### ACK round 163 — 5 条 review + 3 步 Phase 3 plan 全部收下

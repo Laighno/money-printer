@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+                       "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Monthly OOS Arm B vs EOD comparison report — round 161/163 guardrail (c).
+
+  Fires on the 1st of every month at 08:00, generating the prior month's
+  report at data/reports/oos_arm_b_<YYYYMM>.md.
+
+  Load:
+      launchctl bootstrap gui/$UID deploy/launchd/com.moneyprinter.arm_b_report.plist
+
+  Unload:
+      launchctl bootout gui/$UID/com.moneyprinter.arm_b_report
+
+  Logs:
+      data/logs/launchd_arm_b_report.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.moneyprinter.arm_b_report</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/laighno/laighno/money-printer</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/laighno/laighno/money-printer/.venv/bin/python</string>
+    <string>/Users/laighno/laighno/money-printer/scripts/oos_arm_b_report.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>/Users/laighno/laighno/money-printer</string>
+    <key>PYTHONHASHSEED</key>
+    <string>0</string>
+  </dict>
+
+  <!-- Day 1 of every month at 08:00 -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Day</key>
+    <integer>1</integer>
+    <key>Hour</key>
+    <integer>8</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/laighno/laighno/money-printer/data/logs/launchd_arm_b_report.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/laighno/laighno/money-printer/data/logs/launchd_arm_b_report.err.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>AbandonProcessGroup</key>
+  <true/>
+</dict>
+</plist>

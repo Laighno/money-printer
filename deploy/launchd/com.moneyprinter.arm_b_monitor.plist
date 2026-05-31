@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+                       "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Arm B -5pp hard-stop monitor — round 161/163 guardrail (d).
+
+  Fires every 15 minutes (900s). The script itself is harmless when
+  run outside market hours (returns 0 if Arm B has 0 executions in
+  history), so we don't gate by weekday/clock in launchd — the script
+  self-no-ops.
+
+  Load:
+      launchctl bootstrap gui/$UID deploy/launchd/com.moneyprinter.arm_b_monitor.plist
+
+  Unload:
+      launchctl bootout gui/$UID/com.moneyprinter.arm_b_monitor
+
+  Logs:
+      data/logs/launchd_arm_b_monitor.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.moneyprinter.arm_b_monitor</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/laighno/laighno/money-printer</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/laighno/laighno/money-printer/.venv/bin/python</string>
+    <string>/Users/laighno/laighno/money-printer/scripts/arm_b_stop_monitor.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>/Users/laighno/laighno/money-printer</string>
+    <key>PYTHONHASHSEED</key>
+    <string>0</string>
+  </dict>
+
+  <!-- Run every 15 min. Script self-no-ops outside Arm B activity. -->
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/laighno/laighno/money-printer/data/logs/launchd_arm_b_monitor.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/laighno/laighno/money-printer/data/logs/launchd_arm_b_monitor.err.log</string>
+
+  <!-- Don't restart on crash — let it fire next interval. -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>AbandonProcessGroup</key>
+  <true/>
+</dict>
+</plist>
