@@ -9095,6 +9095,48 @@ mean ≈(+0.13pp/+0.02σ noise 内)、跨 seed σ 降 30-58%、MDD −1.8pp 且 
 **这是真钱解冻**(之前一直冻结), 但仓位严格限定在 2 万以内(你 30 万账户的 ~7%, 最坏跑输 9:25 也就 -1000 量级)。分 4 个阶段 rollout, 出问题随时退回上一步; 任何超出 2 万仓位的改动都要你点头。9:25 EOD 那条路同时独立运行作对照。下一轮工程方先报 (1) n2c 模型替换 + dryrun 结果, 我跟你一起看 picks 是否合理再进 (2)。
 
 
+## [2026-05-31 08:00] 第 161 轮 (Phase 1 ACK + **user 拍板 3 个细节都按你推荐** → 放行 swap + 进 Phase 2 写 guardrails)
+
+### ACK round 160 — Phase 1 漂亮
+backup 三件套 ✓ / n2c retrain IC 0.093+0.103 跟 round 158 walk_forward 月度对齐 ✓ / dryrun 加 c2c-FRESH control 把"训练时点漂移 vs label 效应"分离干净是关键洞察(0/10 vs prod 几乎全是 6 天训练时点漂移, 不是 label 问题) ✓ / picks sample sane ✓。
+
+### user 拍板 (3 项都按你推荐, 直接执行)
+- **(i) 只 swap n2c-DRYRUN → `data/blend_*.lgb`** — 不一并刷 prod c2c 漂移 (定期 refresh 是独立常态问题, 不绑 label upgrade)
+- **(ii) 同步 retrain `data/model.lgb`** (n2c label, StockRanker fallback 保持一致)
+- **(iii) 不动 `data/model_60d.lgb`** (60d 独立, 这一轮不动)
+
+### 这一轮你 — 执行 + 起步 Phase 2
+
+**Step A (5 min, 真钱前最后一次 model 改动)**:
+1. swap blend: `data/blend_n2c_DRYRUN_primary.lgb` → `data/blend_primary.lgb`; 同样 `extreme`
+2. retrain n2c StockRanker → `data/model.lgb`(写法你定, 跟 BlendRanker 同 cache, 几分钟)
+3. 一次性 dryrun: 用新生产 `data/blend_*.lgb` + `data/model.lgb` 跑同一天 score, top10 picks 跟你 round 160 报的 (000612 / 002161 / 002194 / 002358 / 002470 / 002491 / 002957 / 600108 / 600525 / 600545) **完全一致**(确认 swap 正确) — 不一致就回滚 backup
+4. 更新 `BASELINE.md` 记 "n2c label 上线 2026-05-31, c2c backup at *_20260530_2050"
+
+**Step B (Phase 2 — guardrails 实现, 你之前 round 160 已起草, 阈值都按你建议默认值)**:
+- (a) **仓位上限**: OOS Arm B bucket ≤ **20000 元**(独立 cash, 9:25 EOD bucket 不动); 实现位置你选(paper_trade / execute_orders / broker), 默认建议是 broker 层最稳
+- (b) **流动性过滤**: 14:30 选股加 `ADV(20d avg amount) ≥ 1 亿` AND `price ≤ 50 元`(intraday_plan / `_cost_aware_select` 之前应用); 触发被过滤的票要 log, 便于后续 audit
+- (c) **周/月 OOS vs EOD 对比报告**: 单独 cron, 输出 `data/reports/oos_arm_b_YYYYMM.md`(累计净值 + 当月对比 + MDD)
+- (d) **硬止损**: 监控脚本读 OOS NAV history vs 同期 EOD NAV, 累计 *(OOS_cum_ret − EOD_cum_ret) ≤ −5pp* 触发 → `Disable-ScheduledTask` "MoneyPrinter-IntradayPipeline" + 真钱开关复位冻结 + 告警(log/邮件/任何你方便的渠道); 重启须 user 显式批准(round 159 新 Rule)
+
+**真钱开关 + 14:30 task 仍 Disabled, 等 Phase 2 完整 + 你确认所有 guardrails 都生效, 才进 Phase 3。** 我和 user 都不催, 慢一点稳一点。
+
+### 这一轮你
+1. ACK round 161 + Step A swap 完成
+2. Step B 4 条 guardrails 实现 + smoke 一遍(每条独立验证: 仓位限制阻止超 20000 / 流动性过滤挡掉 51 元的票 / 报告生成 / 止损在模拟 -5pp 时正确触发)
+3. **Phase 2 完成后报 round 162**, 等 user + 我确认才进 Phase 3 (启用 14:30 task + 真钱解冻)
+4. 真钱 + 14:30 task 维持 Disabled
+
+### Rule reminders
+- Rule #4 (部分解除): swap 允许写 `data/blend_*.lgb` + `data/model.lgb` 一次; 14:30 task 仍 Disabled; 真钱仍冻结 (Phase 3 才解除)
+- Rule #11: PIT 不变 (n2c 只换 label, 推理输入 ≤决策日 factors)
+- Rule #1: backup `*.c2c_backup_*.lgb` + dryrun artifact + 监控 cron log 不进 git; 模型文件 + BASELINE.md + decision_log + guardrails 脚本进 git
+- Rule (新): 任何让 OOS bucket > 20000 元的改动须 user 显式批准; 止损触发后冻结状态须 user 显式重启
+
+### 主动给 user
+你拍的 3 个都按推荐: 工程方现在 (1) 把 n2c 模型正式覆盖到生产 (5 分钟事, 跑完做一次"用新 model 选股是不是跟昨天 dryrun 完全一致"的 sanity check, 不一致就回滚) → (2) 接着实现 4 条 guardrails (仓位 ≤2 万 / 流动性过滤 ADV≥1亿+价格≤50 / 周月对比报告 / 累计跑输 5pp 自动止损 + 冻结真钱) + 一条一条 smoke 测。**Phase 2 全部完成 + 你 + 我都确认 guardrails 生效, 才进 Phase 3 启用盘中自动交易 + 真钱解冻。** 真钱和 2:30 仍冻结。慢一点稳一点。
+
+
 
 
 
