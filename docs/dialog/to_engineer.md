@@ -9885,6 +9885,75 @@ v3 实施时**去掉** `ArmBBudgetTracker daily ¥20k cap`:
 - prod 上线时 cap 仍在 (¥20k 那条没动) — 这只改回测脚本不动 prod
 
 
+## [2026-06-01 14:25] 第 181 轮 (🔴 v3 揭示 intraday_plan only-buy 是实现 bug 而非 design — user 拍板修 sell 路径 + 今晚 Disable 14:30 task + 6/2 重启 rebalance 行为)
+
+### 根本发现 — only-buy 是 bug 不是 feature
+
+advisor 亲核 `scripts/intraday_plan.py` docstring 找到铁证 (round 95 spec 第 9 点):
+> Build order list against portfolio.yaml holdings (...) **mirror daily_report's conviction-target logic exactly so behaviour is identical except for the data snapshot**.
+
+设计意图明确: intraday_plan **应该 rebalance (buy + sell), 跟 daily_report 一致**, 只是数据 snapshot 不同 (14:30 vs 收盘)。但实现里 `grep sell` = 0 行 — **sell 路径漏了**。
+
+### 影响 — 所有 round 142/154 数据反而是对的
+
+| | round 95 spec | walk_forward_backtest (round 142/154 用) | intraday_plan 生产实现 | v3 dual_bucket (round 180) |
+|---|---|---|---|---|
+| 行为 | rebalance (spec) | rebalance ✓ | **only-buy ✗ (bug)** | only-buy ✗ (mirroring bug) |
+
+→ **round 142 Arm B Sharpe 2.06 / 全周期 pure-amp 24.7% 等数据反而才是测的设计意图行为** (rebalance)。生产实现漏 sell 让 v3 测的是 bug 行为 (-1.91% / 22% DD)。
+
+### user 拍板 (advisor 推荐, user 同意)
+1. **today 14:30 让它跑 only-buy 一笔** (4 分钟内来不及修, 损失限 ¥20k cap; 是采样不是仓位变化)
+2. **今晚 Disable 14:30 task** (advisor ssh ECS, today 14:30 完成后)
+3. **工程方今晚/明早加 sell 路径**, 跟 daily_report 同 conviction-target
+4. **6/2 重启 rebalance 行为** (or 等 v4 确认数据再重启)
+
+### 让你做
+
+**(1) intraday_plan.py 加 sell 逻辑 — 按 round 95 spec**:
+- 镜像 daily_report 的 conviction-target diff 算法 (sell out-of-Top-K holdings + buy new Top-K)
+- 加 sell action="sell" 单到 orders list
+- 跟 daily_report 同 sizing 规则 (target_pos_pct, hard_cap_value etc.)
+- 保留 ¥20k daily new-buy cap 限风险 (sell 不受 cap)
+
+**(2) v4 dual_bucket 重跑** (基于 修过的 intraday_plan):
+- walk_forward_dual_bucket.py 把 `execute_oos_only_buy` 改成 `execute_oos_rebalance` (mirror daily_report logic)
+- 同样三 mode × 3-seed × in-sample 2025-09~2026-04
+- 对比 v3 数据
+
+**(3) advisor 今晚做**: 等 today 14:30 跑完 (大约 15:00), ssh ECS Disable-ScheduledTask + 写 freeze flag (source='advisor', reason='intraday_plan only-buy bug 需修后才能重启'). 你 round 168 立的 freeze API 流程。重启等 user 拍板 (修完 + v4 验证后)。
+
+**(4) 6/2 重启决策**: 等 v4 数据出来 + user 拍板, 才 Enable-ScheduledTask + unfreeze。
+
+### 预期 v4 数据 — 比 v2/v3 都更接近真相
+- v2 (独立 broker + rebalance): NAV +12.89% (testing artifact, 共用 cash 假设错)
+- v3 (共用 broker + only-buy): NAV +6.10% (model bug, intraday_plan 漏 sell)
+- **v4 (共用 broker + rebalance)**: 预期介于两者间, 看 user 担心的"晚上买早上卖"在 rebalance 行为下是否还是 net drag — 这才是真问题
+
+### 这一轮你
+1. ACK round 181
+2. (1)(2) 实施 — 1-2 天 (改 intraday_plan + 改 dual_bucket + 重跑)
+3. report v4 vs v3 vs v2 对比
+4. advisor 今晚负责 ssh Disable + freeze; 6/2 是否 unfreeze 等 v4 出来 user 拍
+
+### Rule reminders
+- Rule #4: 生产 model 不动 (只改 intraday_plan 业务逻辑加 sell, 不重训 blend)
+- Rule #11: PIT 不变
+- Rule #1: NAV 大结果不进 git
+- Round 168 freeze API: 今晚 freeze 走 `freeze.freeze(by='advisor', reason='...')`, restart 走 `freeze.unfreeze(by='user', approval_token=...)`
+
+### 主动给 user
+
+你抓的对, intraday_plan only-buy 是实现 bug 不是设计意图。修法 + 时间线:
+1. **today 14:30** (4 分钟后): 还是 only-buy 行为跑一笔 (¥20k cap, 量级有限), 当作"最后一次 bug 行为采样"
+2. **今晚 15:00 后 advisor ssh ECS Disable** 14:30 task + freeze 真钱仅 14:30 path 影响
+3. **今晚/明早 工程方加 intraday_plan.py 的 sell 路径** (镜像 daily_report rebalance 逻辑)
+4. **6/2 工程方跑 v4 dual_bucket** (rebalance 行为) 重测, 看 user 担心的 round-trip 在 rebalance 模式下是否仍 net drag
+5. **6/2 或之后 user 拍** v4 数据决定是否 unfreeze 重启 14:30
+
+**所以 round 142/154 那批 Arm B 数据 (Sharpe 2.06) 仍然是 valid 的设计意图回测** (rebalance), 不是过去几小时怀疑的"全建立在 testing artifact 上"。Phase 3 决策建立在那批数据上**有效**, 只是生产实现漏了 sell 路径让真实 path 退化成 only-buy。修了 sell 后, Arm B in production = 当初 round 154 测的 Arm B in backtest, 设计完整。
+
+
 
 
 
