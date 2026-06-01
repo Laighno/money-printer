@@ -10180,3 +10180,141 @@ if sell_shares <= 0:
 user round 186 抓到 backtest 严重 bug — broker 没模拟 A 股 T+1 锁仓。v4 dual +69.90% 数据中 1422/2835 = 50% Type B 冲突 (EOD 当日买 + OOS 当日卖) 在真盘不可能发生。
 
 修了 T+1 后 v4.1 数据是 dual mode 真实下限期望。如果修后 dual − max(solo) 仍正 → 真信号; 如果反转 → user 原忧虑成立, Phase 3 要重审。
+
+---
+## [2026-06-01 16:00] 第 188 轮 (🔴 v4.1 look-ahead bias — user 抓到 model 训练窗 100% 覆盖测试窗; v4.2 spec: cutoff train + true OOS)
+
+### user round 188 抓到方法论 bug
+
+user 原话:
+> "回测应该拿 2025-09 的数据训练, 测 2025-09 ~ 2026-04, 训练不需要 1m 数据, 只需要日频数据就行了"
+
+advisor 亲核确认:
+
+| 模型 | 训练完成日 | 训练数据窗 |
+|---|---|---|
+| `data/blend_extreme.lgb` | 2026-05-31 08:50 | `--start 20200101`, **无 --end** (用到 5/30 全部) |
+| `data/blend_primary.lgb` | 2026-05-31 08:50 | 同上 |
+| `data/intraday_blend_*.lgb` | 2026-05-27 | `--start 20200101 --end default=None` (用到 5/27 全部) |
+
+**v4.1 backtest 测试窗 2025-09-01 ~ 2026-04-30 完全包含在训练窗内** → look-ahead bias
+
+→ v4.1 dual +100.49% 是模型"已经见过 future" 的 cherry-pick, 不是真 OOS alpha
+→ v4.1 数据**不能用来做真盘决策**
+
+`walk_forward_dual_bucket.py:31` 自己写: "Pure research (`--skip-update` style): **no model retrain**, no disk" — 你为简化跳过 retrain, 牺牲了 OOS 真实性, user 直接抓到。
+
+### user 拍板 A: cutoff train + true OOS
+
+> "A, 训练是日频数据, 测的时候记得用 1m 数据"
+
+### v4.2 spec (round 188 user-approved)
+
+**(1) Train 一版 cutoff = 2025-08-31 的 model** (日频训练, 不动 prod 5/31 model):
+
+```bash
+# EOD model (train_ensemble.py): 加 --end / --cutoff 参数
+.venv/bin/python scripts/train_ensemble.py \
+  --start 20200101 \
+  --end 20250831 \              # 新加参数, 训练数据 cutoff
+  --output-dir data/blend_cutoff20250831  # 独立路径, 不覆盖 prod
+# 产出: data/blend_cutoff20250831/primary.lgb + extreme.lgb
+
+# OOS model (train_intraday.py 已有 --end 参数):
+.venv/bin/python scripts/train_intraday.py \
+  --start 20200101 \
+  --end 20250831 \
+  --output-prefix data/intraday_blend_cutoff20250831  # 独立路径
+# 产出: data/intraday_blend_cutoff20250831_primary.lgb + extreme.lgb
+```
+
+**train_ensemble.py 需新加 --end 参数** (亲核现 line 47 只有 --start), 实施时 mirror train_intraday.py 第 392 行已有 --end 模式。
+
+**训练只用日频** (user 明确): 不需要 1m intraday 数据, train_ensemble + train_intraday 现在的 feature 都是日频派生的, 改个 cutoff 即可 (mp/data/store 日频历史 2020 ~ 2026-05 全有, 不缺数据)。
+
+**(2) Backtest 用 cutoff model 测 2025-09 ~ 2026-04** (1m intraday 数据现有):
+
+`scripts/walk_forward_dual_bucket.py` 加 model path override:
+
+```python
+# 新加 CLI args:
+ap.add_argument("--eod-model-prefix", default="data/blend",
+                help="EOD model glob prefix (default: data/blend_*.lgb)")
+ap.add_argument("--oos-model-prefix", default="data/intraday_blend",
+                help="OOS model glob prefix (default: data/intraday_blend_*.lgb)")
+
+# load 时:
+eod_ranker = BlendRanker(feature_cols=list(FACTOR_COLUMNS))
+eod_ranker.load_from(args.eod_model_prefix)
+oos_ranker = BlendRanker(feature_cols=list(INTRADAY_FEATURE_COLS))
+oos_ranker.load_from(args.oos_model_prefix)
+```
+
+跑 v4.2:
+```bash
+.venv/bin/python scripts/walk_forward_dual_bucket.py \
+  --start 20250901 --end 20260428 \
+  --eod-model-prefix data/blend_cutoff20250831/  \
+  --oos-model-prefix data/intraday_blend_cutoff20250831 \
+  --seeds 1,2,3 --top-k 10 --initial 200000
+```
+
+**OOS 测试时 inference 用 1m morning bars** (user 明确, 现 `make_oos_panel_for` 已用 morning_bars ✓ 不需改)。
+
+**(3) 报告新增 v4.1 vs v4.2 对比**:
+
+| 版本 | Train cutoff | Test window | Look-ahead? | dual NAV | dual − max(solo) |
+|---|---|---|---|---:|---:|
+| v4 (round 185) | 2026-05-30 (prod) | 2025-09 ~ 2026-04 | ✗ (训练窗覆盖测试窗) | ¥339,810 | +¥78,497 |
+| v4.1 (round 187) | 2026-05-30 (prod) | 2025-09 ~ 2026-04 | ✗ (同上, T+1 fix) | ¥400,970 | +¥139,657 |
+| **v4.2 (本轮)** | **2025-08-31** | **2025-09 ~ 2026-04** | **✓ 真 OOS** | ? | ? |
+
+**关键问 v4.2 数据**: dual − max(solo) 是否仍正?
+- 仍正 → look-ahead 修了之后 dual alpha 仍真, user 原忧虑数据上不成立, 真盘有信心
+- 反转或大幅缩水 → v4 / v4.1 的 +100% 是 look-ahead 假象, 真盘 dual 期望要重审
+
+### 预期 (我猜, 你跑出来看实际)
+
+v4.2 数据**应该明显低于 v4.1 +100%**, 但希望 dual − max(solo) 仍正 (~ +¥30~50k 这种, 不会到 +¥139k)。如果反转成负, 是 user round 95 spec 设计的根本问题, Phase 3 决策要重审。
+
+### Rule reminders
+
+- **Rule #4 严格守**: cutoff model 必须独立路径 (`data/blend_cutoff20250831/` 和 `data/intraday_blend_cutoff20250831_*.lgb`), **绝对不能覆盖 prod `data/blend_*.lgb` / `data/intraday_blend_*.lgb`**
+- Rule #11: PIT — train cutoff date 严格意味着 train 数据 ≤ 2025-08-31, test 数据 ≥ 2025-09-01, **没 overlap**
+- Rule #1: cutoff model 文件不进 git (data/ 大文件按规矩 ignore), 训练日志 + report 进
+- 训练日志保 `data/logs/train_ensemble_cutoff20250831.log` + `data/logs/train_intraday_cutoff20250831.log` 留痕
+
+### advisor 同步说
+
+- P4 (无 cap) 拍板暂不实施, 等 v4.2 数据出来再决定 cap 节奏 (无 cap 是基于 v4.1 +100%, 现在前提倒了, 等 true OOS 数据)
+- ECS task fix 完成 ✓ (14:28:00 verified)
+- cron `bd421665` 每分钟监 dual_bucket 数据状态
+
+### 这一轮我做的事
+1. 亲核 train_ensemble.py:47 (无 --end) + train_intraday.py:392 (有 --end) + walk_forward_dual_bucket.py:31 (no retrain)
+2. 确认 v4.1 +100% 是 look-ahead 假象
+3. 给 v4.2 spec (本文)
+4. push round 188
+
+### 等工程方 round 189
+
+1. 加 train_ensemble.py --end 参数
+2. 训 cutoff=2025-08-31 EOD + OOS model (独立路径)
+3. walk_forward_dual_bucket.py 加 model path override
+4. 跑 v4.2 in-sample 三 mode × 3-seed
+5. report 加 v4.1 vs v4.2 对比
+
+ETA 估算 (你算):
+- train EOD ensemble cutoff: ~? min (5 seeds × 2020-2025 数据)
+- train intraday cutoff: ~? min
+- v4.2 backtest: ~? min (跟 v4.1 同, 工程方 round 185 跑了 1-2h)
+- 全套 ~2-3h?
+
+### 主动给 user
+
+工程方 round 189 跑完 v4.2 时报告里也讲清楚:
+- v4.1 +100% 是 look-ahead 假象, 不是真 dual alpha
+- v4.2 是真 OOS 数据, 决策应建立在 v4.2 上
+- v4.2 dual − max(solo) 仍正 vs 反转, 是 user 原始忧虑的真实答案
+
+之前 round 184/186 走过两次"data fix → 数据反而更好" 的反转, 但都是 backtest 内部 bug fix。这次 look-ahead 是 backtest 之外的方法论 bug (model 跟 backtest 之间的边界), 修了之后数据**不一定更好**, 可能显著降。
