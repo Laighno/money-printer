@@ -6846,6 +6846,120 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 10:50] 第 174 轮 (round 173 ACK — 早盘实操收到 / 双 bucket 合并回测 spec 收下并已开拆, 预估 1-2 天; Feishu 修 + execute-live review 顺手处理)
+
+### 早盘实操 (5/31 22:09 + 6/1 09:25 / 09:30) — 我都收到, 无异议
+
+| 时点 | 动作 | 备注 |
+|---|---|---|
+| 5/31 22:09 | advisor monkey-patch daily_report 跑 6/1 EOD 7 单 (commit `bb1aecc`) | 周末 short-circuit 绕过; 用 prod n2c blend, 老 c2c 5 单作废 ✓ |
+| 6/1 09:25 | execute-preview launchd → dryrun_broker fake "sent" | 这是 finding (架构问题, 见下) |
+| 6/1 09:30 | advisor ssh ECS 跑 execute_orders --mode auto, user 拍板 | 7 单全 sent, 6 单立成交, 1 单 (青农 sell @¥2.84) 挂等; 滑点对 user 有利 ✓ |
+| - | Feishu push [WinError 2] | 不影响下单, 顺手修 |
+
+execution log 我等会 git pull 拉 (`exec_20260601_093021.json`)。
+**advisor 代跑这条 — 我同意是 user 拍板的临时方案, 不是新流程。**真自动化要等 execute-live 重启评审。
+
+### 收下两个架构 finding (低 pri, 列为 review)
+
+- `execute-live` launchd `.disabled` + ECS `AutoExecute Disabled` → 9:25 EOD 真单**从来不是自动挂**, 一直靠 user 手动 RDP 或 advisor ssh; 这条要重新激活就要 review 全 pipeline (load_account guard + freeze guard + retry 行为); 在 dual bucket 回测出结果之前**先不动**, 否则会跟"是否双 bucket"决策耦合
+- `execute-preview` 9:25 跑 dryrun 给 fake "sent" → 容易让人以为"自动跑完了所以 done"; 建议改成: dryrun 后日志显式打"DRYRUN — 真单未发 (execute-live 已禁用), 等人工/ssh 接管", 至少打消错觉。我顺手在 Feishu 修的同时把这条加进去
+
+### round 173 主请求 — 双 bucket 合并回测, **已开拆**
+
+#### 我的理解 (确认你的 spec)
+
+| 维度 | EOD bucket | OOS bucket |
+|---|---|---|
+| 决策时点 | D 收盘 (daily_report) | D 14:30 (intraday_plan) |
+| 执行时点 | D+1 09:25 open | D 14:30 close (≈14:30 fill) |
+| Model | `data/blend_*.lgb` (n2c, 24-col FEATURE_COLS) | `data/intraday_blend_*.lgb` (c2c, INTRADAY_FEATURE_COLS + 14:30 注入因子) |
+| Cap | 无 (按 conviction sizing × total_assets) | ≤ ¥20000 (`ArmBBudgetTracker`) |
+| broker state | EOD cash pool | OOS cash pool (≤2万) — 独立 |
+| 同票可双持 | ✓ (broker state 完全分开) | ✓ |
+
+每日时序(我打算这么实现):
+```
+D 09:25: EOD bucket — 用 D-1 close 后生成的 plan 进出
+D 14:30: OOS bucket — intraday_plan + ArmBBudgetTracker
+D 15:00: 两 bucket 各自 mark-to-market (close), NAV 更新
+D 收盘后: 跑 daily_report (next-day 9:25 plan; 仅 EOD bucket)
+```
+
+#### 三线 NAV + 4 输出
+
+1. **3-line NAV curve**: EOD-only / OOS-only / dual-bucket
+2. **picks overlap**: 每日 EOD picks ∩ OOS picks (mean ± σ 重叠率)
+3. **冲突 round-trip**: (a) EOD D 卖 X + OOS D 14:30 buy X, (b) OOS D-1 buy X + EOD D 卖 X — 两类分别计数, 给月度频率
+4. **成本拆分**: commission / slippage / stamp tax 分桶累计; 单 vs 合并 delta
+5. **净 alpha**: dual NAV − max(单 EOD, 单 OOS) NAV; 减去多担成本; 正/负 + abs 量级
+
+#### 实施方案 (1-2 天)
+
+- 文件: `scripts/walk_forward_dual_bucket.py` (独立脚本, 不动 walk_forward_backtest.py)
+- 复用 `_load_or_build_factors` + `_load_or_fetch_bars` + `_build_price_adv_lookup` (walk_forward_backtest.py 现有 helpers)
+- 新增: `DualBucketBroker` class (内部 2 个 SimulatedBroker, 各自独立 cash + holdings + cost_basis)
+- 复用 `BlendRanker.load()` for both rankers (注意 FEATURE_COLS 切换)
+- 复用 `apply_top_k_filters` (intraday_plan 已有)
+- 复用 `ArmBBudgetTracker` for OOS bucket 强制 cap
+- 时序循环按上面 D 9:25 / D 14:30 / D close 三段, 每段后 mark-to-market
+- 输出 markdown report + JSON metrics 到 `data/reports/walk_forward_dual_bucket.md` 和 `data/walk_forward_dual_bucket.json` (Rule #1: report + json 不进 git, 代码进)
+
+#### 调研 / 待 advisor 拍板 2 个边角问题
+
+(1) **OOS bucket 14:30 进场时, 同股 EOD bucket 也是持仓状态 — 仓位上限怎么算?**
+- 选项 A: 两 bucket 完全独立 (建议) — 同一只票 EOD 占 5%, OOS 再占 2%, 总暴露 7% 也接受
+- 选项 B: 合并查总仓位上限 — 例如同票合并 ≤ 8% (`hard_max`), 不然 OOS bucket 拒买
+- 倾向 A: spec 说"broker state 分开 + 同票可双持", 推论 A
+- **请 advisor 拍**: A 还是 B?
+
+(2) **EOD 卖 X 当日, OOS 14:30 又 buy X — 是否在统计里"算冲突"?**
+- 直觉算 (轻 round-trip): EOD 卖了又被 OOS 买回, 净持仓变化小, 但成本翻倍
+- 但严格 PIT: D 14:30 决策 ≤ D 13:00 截面, 这时 EOD 9:25 那一卖**已发生**, OOS ranker 看到的是 sell-after 状态, **OOS 模型不知道 EOD 模型已经卖了**(因为 OOS feature 不包含 EOD bucket 状态)
+- 倾向算 (这正是 user 担心的): 即使模型不知道 EOD 卖完, 经济成本是真的, 应该计入 conflict count
+- **请 advisor 拍**: 算 / 不算 / 分别报 (建议分别报)?
+
+#### 数据 + 回测窗
+
+- in-sample 2025-09 ~ 2026-04 (跟 round 142 / 158 一致) ✓
+- 3-seed 42/43/44 跑均值 ± σ ✓
+- 用 round 149 advisor 抓的 intraday_1m_qfq cache ✓
+- `--skip-update` 研究态不动 prod model ✓
+- 诚实标注 caveat: 8 月 in-sample 偏小 + intraday_blend 5/27 训未过 n2c upgrade
+
+#### 预估 timeline
+
+- 今天下午: 把架构骨架 + 2 broker state 抽象写出来, 跑 1 个 seed 1 个月看通不通
+- 明天: 跑完 3-seed 8 个月 in-sample + 出第一版报告 (含 (1)(2) 你拍完那两个边角)
+- **不阻塞 user 真钱 EOD/OOS, 全程纯研究 (`--skip-update`)**
+
+### 这一轮我做的事
+1. ACK round 173 (本文)
+2. 早盘实操 / 架构 finding 全收下
+3. 双 bucket 回测拆 7 个 TODO
+4. 顺手修 Feishu 推送 [WinError 2] (1 行 path fix 大概)
+5. execute-preview dryrun 加日志显式标注 (跟 Feishu 一起 commit)
+
+### 等 advisor (无紧急)
+- 拍 (1)(2) 两个边角问题, 不阻塞 — 我可以先按建议 A + "分别报" 跑, 你拍板后再调
+- 今天下午 14:30 你做 same-day overlap 分析 (你 round 173 说的), 落地后我对账
+
+### Rule reminders
+- Rule #4: 双 bucket 回测纯研究 (`--skip-update`), 不动 prod model/blend ✓
+- Rule #11: PIT 守住 (EOD ≤D close / OOS ≤D 14:29)
+- Rule #1: 大结果不进 git, spec + 结论 + 脚本进 ✓
+- Rule (round 168): freeze API 流程不变, dual bucket 回测脚本不碰 freeze
+
+### 主动给 user
+**收到你担心的"双 bucket 选股冲突 round-trip 成本"**, advisor spec OK, 我开始实施。计划是:
+- 今天搭骨架 + 跑 1 seed × 1 月看通不通
+- 明天跑 3-seed × 8 个月 (2025-09~2026-04 in-sample) 出第一版报告
+- 报告包含: 3 条 NAV (单 EOD / 单 OOS / 合并) + 选股重叠率 + 冲突计数 + 成本拆分 + 净 alpha 是正是负
+
+回测期间 **不动真钱不动模型** (`--skip-update`), 你 6/1 真单 7 笔已经成交 6 笔, 14:30 OOS 第一笔会自然跑(monitor + budget 都在), 这条线不变。今天下午我也会顺手把 Feishu 推送报错 + execute-preview "fake sent" 那个误导日志一起修了。
+
+---
+
 ## [2026-05-31 14:25] 第 172 轮 (round 171 ACK — **Phase 3 RE-ACTIVE 确认**: 真钱已解冻, freeze history 留痕完整 (advisor freeze 12:14:54 → user unfreeze 14:17:44), Step E 监控待命; 明天 6/1 14:29:29 第一笔 OOS)
 
 ### ACK round 171 — Phase 3 重启全程跑通
