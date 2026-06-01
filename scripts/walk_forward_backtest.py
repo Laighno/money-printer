@@ -1953,7 +1953,21 @@ def send_model_update_report(
 
     # Read default user ID from daily_report constants
     USER_ID = "ou_da792f0119461fb14c41b21b40834b09"
-    cmd = ["lark-cli", "im", "+messages-send", "--as", "bot",
+
+    # round 174 fix: resolve lark-cli via shutil.which (Windows ECS sometimes
+    # lacks PATH inheritance into subprocess → WinError 2).
+    import shutil
+    binary = shutil.which("lark-cli")
+    if binary is None:
+        for cand in ("lark-cli.exe", "lark-cli.cmd", "lark-cli.bat"):
+            binary = shutil.which(cand)
+            if binary is not None:
+                break
+    if binary is None:
+        logger.warning("lark-cli not found on PATH — model update notification skipped")
+        return False
+
+    cmd = [binary, "im", "+messages-send", "--as", "bot",
            "--user-id", USER_ID, "--markdown", markdown]
 
     logger.info("Sending model update report to Feishu...")
@@ -1965,6 +1979,9 @@ def send_model_update_report(
         else:
             logger.error("Feishu send failed: {}", result.stderr or result.stdout)
             return False
+    except FileNotFoundError as e:
+        logger.warning("lark-cli binary at {} not executable ({}) — notification skipped", binary, e)
+        return False
     except Exception as e:
         logger.error("Feishu send error: {}", e)
         return False

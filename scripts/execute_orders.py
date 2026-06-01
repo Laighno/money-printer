@@ -100,13 +100,26 @@ def _confirm(prompt: str) -> bool:
     return ans in ("y", "yes")
 
 
-def _format_summary(results: list[dict]) -> str:
+def _format_summary(results: list[dict], mode: str = "dryrun") -> str:
+    """round 174: prefix title with DRYRUN tag so consumers (Feishu / log
+    readers) don't mistake a preview run for a real fill summary. The 6/1
+    09:25 execute-preview launchd run fills DryRunBroker (autofill=True) →
+    every row shows ``sent ✅`` even though no real order hit QMT.
+    """
     sent = sum(1 for r in results if r["status"] == "sent")
     skipped = sum(1 for r in results if r["status"] == "skipped")
     failed = sum(1 for r in results if r["status"] == "failed")
+    title = "# 实盘执行汇报" if mode != "dryrun" else "# 🧪 DRYRUN — 真单未发 (预览模式)"
     lines = [
-        f"# 实盘执行汇报",
+        title,
         f"已发 {sent} / 跳过 {skipped} / 失败 {failed}",
+    ]
+    if mode == "dryrun":
+        lines.append("")
+        lines.append("> ⚠️ 这是预览模式 (execute-preview launchd 9:25 触发)。"
+                     "下面表格里的 ✅sent 是 DryRunBroker 模拟撮合, **没有真单进 QMT**。"
+                     "真单走 execute-live (当前 `.disabled`) 或人工 RDP / ssh 跑 `--mode auto`。")
+    lines += [
         "",
         "| 股票 | 方向 | 股数 | 限价 | 状态 | 备注 |",
         "|---|---|---:|---:|---|---|",
@@ -500,6 +513,21 @@ def main() -> int:
                 plan_path, plan.get("generated_at"),
                 len(plan.get("orders", [])), len(plan.get("alerts", [])))
 
+    # round 174: loud banner so log readers cannot mistake dryrun for live.
+    if args.mode == "dryrun":
+        logger.warning(
+            "═══════════════════════════════════════════════════════════════"
+        )
+        logger.warning(
+            "  DRYRUN MODE — 真单不会发到 QMT (DryRunBroker autofill 模拟)"
+        )
+        logger.warning(
+            "  真单走 execute-live (当前 .disabled) 或人工 ssh `--mode auto`"
+        )
+        logger.warning(
+            "═══════════════════════════════════════════════════════════════"
+        )
+
     # Broker selection
     if args.mode == "dryrun":
         plan_acct = plan.get("account_snapshot", {}) or {}
@@ -553,7 +581,7 @@ def main() -> int:
         arm_b_tracker=arm_b_tracker,
     )
 
-    summary_md = _format_summary(results)
+    summary_md = _format_summary(results, mode=args.mode)
     print("\n" + summary_md)
 
     # Persist execution log. Per P11-5 round 97 decision (4): co-locate

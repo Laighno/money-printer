@@ -2195,10 +2195,33 @@ def send_to_feishu(
     user_id: Optional[str] = None,
     card: Optional[dict] = None,
 ) -> bool:
-    """Send report via lark-cli. Uses card (interactive) if provided, else markdown."""
-    import json
+    """Send report via lark-cli. Uses card (interactive) if provided, else markdown.
 
-    cmd = ["lark-cli", "im", "+messages-send", "--as", "bot"]
+    round 174 fix: 6/1 09:30 execute_orders saw `[WinError 2] cannot find
+    the file specified` because lark-cli was not on the ECS PATH the way
+    the script-side subprocess inherited it. Resolve the binary via
+    shutil.which() first, log a clear warning if missing instead of the
+    cryptic WinError, and fall through gracefully (return False) so the
+    caller's order-execution path is unaffected by notification failure.
+    """
+    import json
+    import shutil
+
+    binary = shutil.which("lark-cli")
+    if binary is None:
+        # Windows fallback: try common .exe / .cmd extensions explicitly
+        for candidate in ("lark-cli.exe", "lark-cli.cmd", "lark-cli.bat"):
+            binary = shutil.which(candidate)
+            if binary is not None:
+                break
+    if binary is None:
+        logger.warning(
+            "send_to_feishu: lark-cli not found on PATH — notification skipped "
+            "(check ECS PATH / install location). Order/execution path is unaffected."
+        )
+        return False
+
+    cmd = [binary, "im", "+messages-send", "--as", "bot"]
 
     if chat_id:
         cmd.extend(["--chat-id", chat_id])
@@ -2221,6 +2244,13 @@ def send_to_feishu(
         else:
             logger.error("Failed to send: {}", result.stderr or result.stdout)
             return False
+    except FileNotFoundError as e:
+        # Catches the WinError 2 from older Python / Windows subprocess paths
+        logger.warning(
+            "send_to_feishu: lark-cli binary at {} not executable ({}); "
+            "notification skipped — order path unaffected.", binary, e,
+        )
+        return False
     except Exception as e:
         logger.error("Feishu send error: {}", e)
         return False
