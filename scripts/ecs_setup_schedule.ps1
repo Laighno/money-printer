@@ -77,18 +77,19 @@ Register-MPTask `
     -Description "Money Printer: 9:30 entry path (git pull + execute_orders --mode auto). Skips when previous trading day's 14:30 path succeeded (intraday_success flag)." `
     -ExecutionLimitMinutes 30
 
-# ── Task 2: 14:29:55 intraday pipeline (14:30 entry path, P11-5) ────
-# 14:29:55 (not 14:30:00) gives intraday_plan.py 5s lead time. Inside
-# it, sleep_to_trigger() blocks until 14:30:00 exactly (Rule #11).
-# Hard deadline 14:30:30 inside the script means there's still a 25s
-# operational buffer for the task scheduler itself to fire on time.
-# Execution limit is 35min: plan generation typically 1-3min + execute
-# ~2-5min, but xtdata fetch can occasionally take longer; 35min keeps
-# us safely under the 15:00 close.
+# ── Task 2: 14:28:00 intraday pipeline (14:30 entry path, P11-5) ────
+# round 185 fix (advisor 184): trigger 90s before 14:30:00, NOT 5s.
+# Old 14:29:55 left only 5s for the task scheduler + `git pull` to
+# complete before intraday_plan.py's sleep_to_trigger 14:30:30 deadline.
+# 6/1 14:30 run actually fired exit 2 because `git pull` took 33s (cold
+# cache after weekend) and missed the deadline by ~3s — see round 184.
+# 14:28:00 gives 120s of slack: git pull typically <10s but can hit 60s+
+# on a cold cache; sleep_to_trigger still anchors execution to exactly
+# 14:30:00 (Rule #11 unchanged).
 Register-MPTask `
     -TaskName "MoneyPrinter-IntradayPipeline" `
     -Script "$REPO\scripts\ecs_intraday_execute.ps1" `
-    -RunTime "14:29:55" `
+    -RunTime "14:28:00" `
     -Description "Money Printer: 14:30 entry path (intraday_plan + preflight + execute_orders). Writes intraday_success flag on success -- next morning's 9:25 task skips." `
     -ExecutionLimitMinutes 35
 

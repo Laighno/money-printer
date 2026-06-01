@@ -79,7 +79,7 @@ FACTORS_CACHE = PROJECT_ROOT / "data" / "wf_cache" / "factors_label_next_open_to
 INTRADAY_DIR = PROJECT_ROOT / "data" / "intraday_1m_qfq"
 
 # Backtest defaults (round numbers; research mode)
-DEFAULT_SEEDS = (42, 43, 44)
+DEFAULT_SEEDS = (1, 2, 3)   # round 184 (advisor): use 1/2/3 labels
 DEFAULT_TOP_K = 10
 DEFAULT_INITIAL_CAPITAL = 200_000.0
 OOS_DAILY_BUDGET = 20_000.0
@@ -655,33 +655,40 @@ def run_seed(seed: int, mode: str,
         key = (t.get("date", ""), t["code"])
         log_by_date_code.setdefault(key, []).append(t)
 
-    for picks_row in result.picks_log:
+    # round 185 (advisor round 184 spec): refined Type A/B definitions
+    # both = "buy then sell" round-trips, just different day/strategy patterns:
+    # Type A: D 14:30 BUY_OOS X  →  D+1 09:25 SELL X (EOD next morning)
+    #         "OOS 持仓被 EOD 隔夜踩"
+    # Type B: D 09:25 BUY X (EOD) →  D 14:30 SELL_OOS X (OOS 当天卖)
+    #         "EOD 早买, OOS 下午就卖"
+    for idx, picks_row in enumerate(result.picks_log):
         d = picks_row["date"]
-        oos_today = set(picks_row.get("oos_picks_executed_today_1430", []))
-        eod_today = set(picks_row.get("eod_picks_executed_today_open", []))
-        # Type A: same-day EOD-sell + OOS-buy. EOD action is "SELL" or
-        # action != "BUY_OOS"; OOS action is "BUY_OOS".
-        for code in oos_today:
-            trades_today = log_by_date_code.get((d, code), [])
-            had_sell_today = any(t.get("action") == "SELL" for t in trades_today)
-            if had_sell_today:
+        # Type B (same-day): trades on this day include both BUY (EOD)
+        # and SELL_OOS on the same code.
+        # Use trade_log indexing for direct evidence (not picks_log).
+        trades_today_all_codes: Dict[str, List[dict]] = {}
+        for t in result.eod_trades:
+            if t.get("date") == d:
+                trades_today_all_codes.setdefault(t["code"], []).append(t)
+        for code, trades_today in trades_today_all_codes.items():
+            actions = {t.get("action") for t in trades_today}
+            if "BUY" in actions and "SELL_OOS" in actions:
                 result.conflicts.append({
-                    "date": d, "type": "A_eod_sell_then_oos_buy_same_day", "code": code,
+                    "date": d, "type": "B_eod_buy_then_oos_sell_same_day", "code": code,
                 })
 
-    for idx, picks_row in enumerate(result.picks_log):
+        # Type A (overnight): D 14:30 BUY_OOS + D+1 09:25 SELL (EOD).
+        # picks_log[idx-1] is D-1 (yesterday); if today (D) has SELL of
+        # something OOS bought yesterday, count it.
         if idx == 0:
             continue
-        d = picks_row["date"]
-        # OOS picks from yesterday
-        prev_oos = set(result.picks_log[idx - 1].get("oos_picks_executed_today_1430", []))
-        # EOD sells today (action=SELL on the shared trade_log)
-        for code in prev_oos:
+        prev_oos_buys = set(result.picks_log[idx - 1].get("oos_picks_executed_today_1430", []))
+        for code in prev_oos_buys:
             trades_today = log_by_date_code.get((d, code), [])
-            had_sell_today = any(t.get("action") == "SELL" for t in trades_today)
-            if had_sell_today:
+            had_eod_sell = any(t.get("action") == "SELL" for t in trades_today)
+            if had_eod_sell:
                 result.conflicts.append({
-                    "date": d, "type": "B_oos_bought_yesterday_eod_sells_today", "code": code,
+                    "date": d, "type": "A_oos_buy_then_eod_sell_next_morning", "code": code,
                 })
 
     return result
@@ -704,6 +711,7 @@ def summarize_results(results: List[BacktestResult], initial_capital: float) -> 
         total_commission = []
         total_slippage = []
         total_stamp = []
+        trades_total = []   # round 185 (advisor 184): turnover column
         for r in mode_results:
             # v3: single shared broker → use canonical "nav" column. Fall
             # back to legacy column for compat with v2 nav_records.
@@ -732,6 +740,9 @@ def summarize_results(results: List[BacktestResult], initial_capital: float) -> 
             total_slippage.append(slippage)
             total_stamp.append(stamp)
             total_friction.append(friction)
+            # round 185: turnover = total trade count (sell + buy combined)
+            # — measure of execution intensity, complements friction (¥)
+            trades_total.append(len(trades))
         # round 176: strict conflict count = Type A + Type B (advisor 175 (2))
         n_conflicts_total = []
         n_conflicts_A = []
@@ -770,6 +781,7 @@ def summarize_results(results: List[BacktestResult], initial_capital: float) -> 
             "conflict_typeB_mean": float(np.mean(n_conflicts_B)),
             "picks_jaccard_mean": float(np.mean(pick_overlap)),
             "oos_skipped_mean": float(np.mean(n_oos_skipped_merged_cap)),
+            "turnover_mean": float(np.mean(trades_total)),
         }
     return summary
 
@@ -778,15 +790,24 @@ def write_report(summary: dict, out_path: Path, initial_capital: float,
                   start: str, end: str, n_seeds: int, top_k: int) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
-        f"# Walk-Forward Dual-Bucket Backtest Report (v3 production-faithful)",
+        f"# Walk-Forward Dual-Bucket Backtest Report (v4 spec-faithful, round 185)",
         f"",
-        f"_Generated by `scripts/walk_forward_dual_bucket.py` (round 180, v3)_",
+        f"_Generated by `scripts/walk_forward_dual_bucket.py` (round 185, v4)_",
         f"",
-        f"**v3 changes vs v2** (advisor round 178 spec):",
-        f"- Single SHARED `SimulatedBroker` (matches real QMT account 8886933837)",
-        f"- OOS path strictly **only buys** (matches production `intraday_plan` 0-sell)",
+        f"**v4 spec** (advisor round 184 final, after round 183 push-back ACK):",
+        f"- Single SHARED `SimulatedBroker(¥200k)` (matches real QMT 8886933837 single-account)",
+        f"- **OOS path = rebalance** (sell exits + buy new, action-tagged SELL_OOS / BUY_OOS)",
+        f"  - matches production `intraday_plan.generate_orders` which delegates to",
+        f"    `daily_report.generate_order_list` (full rebalance, NOT only-buy)",
         f"- No merged-cap check (production has none)",
-        f"- Post-hoc conflict detection from `broker.trade_log` (not preemptive)",
+        f"- No `ArmBBudgetTracker` cap in backtest (advisor 179: cap is prod risk control,",
+        f"  not part of model-alpha evaluation; prod cap ¥20k unchanged)",
+        f"- Same `target_pos_pct=0.70` sizing for EOD and OOS (apples-to-apples)",
+        f"- Post-hoc conflict detection from `broker.trade_log` (round 185 refined Type A/B)",
+        f"",
+        f"**Conflict types (round 184)**:",
+        f"- **Type A**: `BUY_OOS X` on D 14:30 → `SELL X` on D+1 09:25 (OOS 持仓被 EOD 隔夜踩)",
+        f"- **Type B**: `BUY X` on D 09:25 (EOD) → `SELL_OOS X` on D 14:30 (EOD 早买, OOS 下午就卖)",
         f"",
         f"## Inputs",
         f"- Window: {start} → {end}",
@@ -799,7 +820,7 @@ def write_report(summary: dict, out_path: Path, initial_capital: float,
         f"",
         f"## Results (mean ± std across {n_seeds} seeds)",
         f"",
-        f"| Mode | Final NAV | Return | Max DD | Friction (¥) | Pick overlap (Jaccard) | Conflicts (A+B) | OOS skips (merged-cap + budget) |",
+        f"| Mode | Final NAV | Return | Max DD | Friction (¥) | Turnover (#trades) | Conflicts (A+B) | Pick overlap (Jaccard) |",
         f"|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for mode in ("eod_only", "oos_only", "dual"):
@@ -809,16 +830,16 @@ def write_report(summary: dict, out_path: Path, initial_capital: float,
         c_total = s.get("conflict_total_mean", 0)
         c_a = s.get("conflict_typeA_mean", 0)
         c_b = s.get("conflict_typeB_mean", 0)
-        c_str = f"{c_total:.1f} (A={c_a:.1f} / B={c_b:.1f})"
+        c_str = f"{c_total:.0f} (A={c_a:.0f} / B={c_b:.0f})"
         lines.append(
             f"| {mode} | "
             f"¥{s['final_nav_mean']:,.0f} ± {s['final_nav_std']:,.0f} | "
             f"{s['total_ret_mean']*100:+.2f}% | "
             f"{s['max_drawdown_mean']*100:.2f}% | "
             f"¥{s['friction_mean']:,.0f} | "
-            f"{s['picks_jaccard_mean']*100:.1f}% | "
+            f"{s.get('turnover_mean', 0):.0f} | "
             f"{c_str} | "
-            f"{s.get('oos_skipped_mean', 0):.0f} |"
+            f"{s['picks_jaccard_mean']*100:.1f}% |"
         )
 
     if "dual" in summary and "eod_only" in summary and "oos_only" in summary:

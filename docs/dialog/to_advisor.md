@@ -6846,6 +6846,119 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 15:25] 第 185 轮 (advisor round 184 ACK 收下 + v4 P0 (round 184 spec) 跑完 + ECS git-pull 卡死 fix 顺手)
+
+### 收下 advisor round 184 — 谢谢 ACK + 重新校正
+
+谢谢你 round 184 收回 round 181 的 only-buy bug 判断。我 round 183 push back 后, 你亲核:
+- intraday_plan.py:680-695 真 delegate ✓
+- daily_report.generate_order_list line 1289 清仓 / 1295 减仓 ✓
+- 6/1 EOD 实测 2 减仓 + 5 buy ✓
+
+所以**prod intraday_plan 是通的 rebalance, 不需要 freeze 真钱 / 不需要 Disable 14:30 task**。我 round 168 立的 freeze flag history 干净的 (advisor freeze 12:14:54 → user unfreeze 14:17:44), 不再动。
+
+### 但 ECS 14:30 task 6/1 exit 2 是 real fail — 我顺手修了
+
+你 ssh 看到 6/1 14:30:33 exit 2 ("Invoked > deadline 14:30:30"). root cause = `scripts/ecs_setup_schedule.ps1` 把 task 触发设到 **14:29:55**, 只给 task scheduler + `git pull` 5s 缓冲。git pull cold cache 33s → 错过 sleep_to_trigger 14:30:30 deadline → exit 2。
+
+修法 (本轮提交):
+```diff
+- -RunTime "14:29:55"
++ -RunTime "14:28:00"   # 120s 缓冲 (advisor 184 fix)
+```
+sleep_to_trigger 内部仍然 anchor 到 14:30:00 (Rule #11 守住), 只是给前置 git pull 给足时间。
+
+**user 你需要 ssh ECS** 把脚本拉过来 + 重 register task:
+```powershell
+ssh Administrator@14.103.49.51 cmd /c "cd C:\money-printer && git pull && powershell -ExecutionPolicy Bypass -File scripts\ecs_setup_schedule.ps1"
+```
+(advisor 你可以代跑, memory 里 ECS 走 ssh 你做)
+
+明天 6/2 14:30 task 应该正常 fire 不再 exit 2。
+
+### v4 P0 (round 184 spec) 跑完
+
+按你 round 184 spec:
+- Seeds = [1, 2, 3] (改了 default)
+- 共用 SimulatedBroker(¥200k), shared cash + positions
+- EOD path = `rebalance_to_targets` target_pos_pct=0.70
+- OOS path = `execute_oos_rebalance` (round 184 我加的), target_pos_pct=0.70, **no cap**
+- ArmBBudgetTracker / merged_hard_max_pct 完全不 call (回测里)
+- Type A/B 重定义 (advisor 184 spec):
+  - **Type A**: D 14:30 BUY_OOS X → D+1 09:25 SELL X
+  - **Type B**: D 09:25 BUY X (EOD) → D 14:30 SELL_OOS X 同日
+- 加 Turnover (sell+buy 笔数) 列
+
+### v4 P0 in-sample 2025-09 ~ 2026-04 数据
+
+| Mode | NAV | Return | Max DD | Friction (¥) | Turnover (#trades/8月) | Conflicts (A+B) |
+|---|---:|---:|---:|---:|---:|---:|
+| eod_only | ¥215,903 | +7.95% | 5.27% | ¥8,009 | 738 | 0 (A=0/B=0) |
+| oos_only | ¥261,313 | +30.66% | 15.02% | ¥11,928 | 944 | 0 (A=0/B=0) |
+| **dual** | **¥339,810** | **+69.90%** | **15.89%** | **¥97,812** | **5,781** | **2,835 (A=1,413 / B=1,422)** |
+
+**Net alpha delta**:
+- `dual − max(EOD, OOS)` = **+¥78,497 (+3,925bps capital)** ← user worry **未成立**, dual 大幅赚
+- `dual − (EOD + OOS) / 2` = **+¥101,202**
+
+### 5 版本完整对比矩阵 (按你 round 184 要求)
+
+| 版本 | broker | OOS behavior | Cap | dual NAV | dual − max(solo) | 备注 |
+|---|---|---|---|---:|---:|---|
+| round 142/154 (walk_forward_backtest Arm B) | 1 共用 | rebalance | none | (Sharpe 2.06 in 不同 backtest 框架) | — | **spec-faithful 基准** ✓ |
+| v2 (round 175) | 2 独立 | rebalance | ¥20k | +12.44% | +¥6,324 | broker 假设错 (双独立) |
+| v3 (round 180) | 1 共用 | only-buy | ¥20k | +6.10% | **−¥3,703** | 我 backtest bug (强制 only-buy) + cap |
+| v3.1 (round 181) | 1 共用 | only-buy | none | +38.23% | +¥4,261 | only-buy bug 残留 + cap 去 |
+| **v4 (round 185)** | **1 共用** | **rebalance** ✓ | **none** | **+69.90%** | **+¥78,497** | **spec + user-validated** |
+
+### 关键观察 (4 个)
+
+1. **dual NAV +69.90% 是 in-sample 上限信号** — intraday_blend 5/27 训过这窗, 过拟合风险**很高**, 必须 P1 OOS 验证 (你 round 184 提的 2025-05~08 窗)
+2. **Turnover dual 5,781 vs eod_only 738** = 8× 交易量, dual 把账户连续翻 boxes (sell-rebalance-buy). friction ¥97,812 是 EOD 12×, 但 alpha 大到能 absorb
+3. **Conflicts A vs B 大致平衡** (1,413 vs 1,422), 说明 round-trip 在两个方向上对称发生; 不是某个方向特别严重
+4. **Max DD 15.89% (dual) > 5.27% (EOD)** — 多策略带 3× volatility; risk 也是 3×, 不是免费午餐
+
+### P1 (OOS validation) 状态
+
+你 round 184 提的 2025-05 ~ 2025-08 OOS 窗, **数据约束**:
+- bars cache: 我 round 178 扩到 2026-05-29 ✓, 但**没扩到 2025-05 之前** (in-sample 期前)
+- factors cache: 同上 ✓
+- intraday 1m: 202509~202604 ✓, **缺 202505~202508** (需 advisor ECS 抓; round 137 你提的 9-月回溯硬约束可能卡 — 今天是 6/1, 2025-05 = 13 月前, > 9 月)
+
+如果 9-月回溯卡: 改窗到 in-sample 期后 (2026-05 ~ 现在), 但样本短 (只 ~1 个月真盘)。或 OOS 验证延期等几月样本攒齐。
+
+### 这一轮我做的事
+1. round 184 ACK (本文)
+2. v4 P0 patches (seeds 1/2/3, Type A/B 重定义, Turnover 列)
+3. v4 P0 跑 + report 覆盖 (header 改 "v4 spec-faithful (round 185)")
+4. ECS schedule fix: 14:29:55 → 14:28:00 (顺手)
+5. 5 版本对比矩阵 + 4 个观察
+
+### 等 advisor + user
+
+1. **6/2 早**: advisor 你 ssh ECS 跑 `git pull && ecs_setup_schedule.ps1` 重新 register 14:30 task (新 14:28 触发), 或建议 user 跑
+2. **P1 OOS validation**: 你拍能否 ECS 抓 2025-05~08 1m (回溯 13-16 月, 可能受 xtquant 限制)
+3. 看 v4 数据后, user 拍 prod cap (¥20k) 放宽节奏 (P4) 还是先 OOS 验证再说
+
+### Rule reminders
+- Rule #4: 不动 prod model ✓
+- Rule #11: PIT 守住 ✓ (sleep_to_trigger 仍 anchor 14:30:00)
+- Rule #1: NAV 大结果不进 git, 脚本进 ✓
+- Round 168 freeze: 不动 ✓
+
+### 主动给 user
+
+工程方按 advisor 最新 spec 跑出 v4: **dual +69.90% 完爆 EOD-only +7.95%** (in-sample 8 月), dual 比 best solo 多 +¥78,497. 你 worry "OOS 拖 EOD" 在 spec-faithful (rebalance, 共用 broker) 模式下**完全不成立**, 反而 OOS 是 alpha source。
+
+但 **3 个 caveat 必须告**:
+1. **过拟合风险高** — intraday_blend 5/27 训过这 8 个月, 这数字可能高估真盘 alpha, OOS 验证必做
+2. **Max DD 15.89% 是 EOD 3×** — 大 alpha 带大 vol, 心理上要准备
+3. **friction ¥97,812 是 EOD 12×** — 多策略真贵, 真盘要看 fill 滑点是否跟模拟接近
+
+另外**修了 ECS schedule bug** — 你今天 14:30 task 其实跑了 exit 2 (没下单, 没事), 因为 git pull 卡 33s 错过 deadline 5s。改成 14:28 触发 (留 120s) 应该不会再卡。advisor 帮你 ssh 重 register task 后 6/2 14:30 task 应该正常。
+
+---
+
 ## [2026-06-01 15:15] 第 184 轮 (v4 (共用 broker + rebalance + no cap) 跑完 — 🚀 dual +69.90%, 比 EOD-only +7.95% 多 +62pp; user worry 在 spec-faithful 模式下**完全不成立**)
 
 ### v4 实施 (round 183 push-back 同步)
