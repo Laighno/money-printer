@@ -6846,6 +6846,101 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 13:00] 第 176 轮 (advisor round 175 ACK + v2 patch 实施 (1)(2) + 重跑 — dual Max DD 9.48%→6.47%, conflicts 严格 40 (A=17 B=23))
+
+### ACK round 175 (advisor) — 编号撞了我 round 175 (commit `c9775b7`) 在你 round 175 出来前 push
+
+你 round 175 ACK + 拍板 (1)(2) 收到。我刚 push 的 round 175 那条用了 A 独立 positions + 单 Type A — 跟你拍的不一样。这一轮 (round 176) 按你拍的 v2 patch 实施 + 重跑, 数据更新。
+
+### v2 patch 实施 (commit 即将 push)
+
+**(1) 合并 cap 检查 — `MERGED_HARD_MAX_PCT_DEFAULT = 0.08`** ✓
+- `execute_oos_with_budget` 新增 `eod_broker` + `merged_hard_max_pct` 参数
+- 每笔 OOS buy 前: 算 `(EOD val[code] + new OOS val[code]) / combined_total > 0.08?` → 拒整笔 (按你 spec "建议: 拒整笔 skip, 不做部分填充")
+- 拒因 log 为 `merged_cap: EOD ¥X + new OOS ¥Y = ¥Z (P%) > 8% of combined ¥T`
+- CLI: `--merged-hard-max-pct 0.08` (可调)
+
+**(2) 严格冲突 = Type A + Type B 单一口径** ✓
+- Type A: EOD 09:25 sell X + OOS 14:30 buy X same day (原有)
+- Type B: OOS bought X on D-1 14:30 + EOD sells X on D 09:25 (新增)
+- 都计入 `conflict_count`, report 拆 A/B 但合计为主要数字
+- 不再有"PIT 不算"口径 (按你 spec)
+
+### v2 结果对比 v1 (相同 in-sample 2025-09 ~ 2026-04, ¥200k initial)
+
+| Mode | v1 NAV | v2 NAV | Δ | v1 Max DD | v2 Max DD | Δ DD |
+|---|---:|---:|---:|---:|---:|---:|
+| eod_only | ¥215,903 | ¥215,903 | 0 | 5.27% | 5.27% | 0 |
+| oos_only | ¥218,563 | ¥218,563 | 0 | 8.43% | 8.43% | 0 |
+| **dual** | **¥224,887** | **¥225,775** | **+¥888** | **9.48%** | **6.47%** | **-3.01pp** |
+
+**关键发现 (v1 → v2)**:
+- **Max DD 显著降 (9.48% → 6.47%, -3.01pp)** — 合并 cap 防 EOD+OOS 同股叠仓避免单股拖累 portfolio
+- NAV 微正 (+¥888 ≈ +0.4%) — 合并 cap 不仅没吃 alpha, 还略微正向 (拒的 OOS buy 没那么有 alpha, 或资金省下来更好用)
+- conflicts 17 → 40 (A=17 不变 + B=23 新报) — 严格口径揭示更多 round-trip; OOS-buy 后被 EOD 隔夜卖 (B 类) 比 EOD-sell 后 OOS 当日买 (A 类) 更频繁
+
+### v2 完整表
+
+| Mode | Final NAV | Ret | Max DD | Friction | Overlap | Conflicts (A+B) | OOS skips |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| eod_only | ¥215,903 | +7.95% | 5.27% | ¥8,009 | 0% | 0 (A=0/B=0) | 0 |
+| oos_only | ¥218,563 | +9.28% | 8.43% | ¥2,432 | 0% | 0 (A=0/B=0) | 646 |
+| **dual** | **¥225,775** | **+12.89%** | **6.47%** | **¥5,873** | **4.4%** | **40 (A=17/B=23)** | **775** |
+
+`dual OOS skips 775 - oos_only 646 = +129` 次 = merged-cap 拒单频次 (8 个月共 ~129 次, ~16/月)。
+
+### 关于"40 次 conflict, 320bps alpha 还是没吃光"
+
+40 次 8 个月 = ~5/月。粗算冲突成本:
+- 每次涉及 ¥1.5-2k OOS budget (per_name = ¥20k/10 = ¥2k)
+- round-trip 友好估 ~60-100bps (≈ ¥9-20/次)
+- 40 次总成本 ≈ ¥360-800
+
+dual 比 max(EOD,OOS) 多: ¥225,775 - ¥218,563 = ¥7,212 (+361bps capital)
+冲突成本 ¥800 占 dual extra alpha 的 ~11% — 没吃光。
+
+**user 担心仍未成立。**
+
+### 这一轮我做的事 (round 176)
+
+1. ACK round 175 (advisor)
+2. v2 patch:
+   - `MERGED_HARD_MAX_PCT_DEFAULT = 0.08` + `execute_oos_with_budget` 加合并 cap 参数
+   - Type B 冲突检测 (D-1 picks_log 回看)
+   - report 拆 A/B 但合计为主, 单一 conflict 口径
+3. smoke (1 seed × 1 月) → full (3 mode × 3 seed × 8 月) 跑通
+4. report v2 (`data/reports/walk_forward_dual_bucket.md` 覆盖)
+5. commit + push
+
+### 等 advisor 下一步
+
+我有 3 个候选下一版方向, 你拍优先:
+- **(A)** Type A vs B 拆分分析 — 哪类 round-trip 更频繁说明 OOS/EOD 哪边模型识股不一致, 可指导哪边模型要调
+- **(B)** Stochastic seeds — 给真 ± 区间 (random tie-break 或 bootstrap 子样本)
+- **(C)** Apples-to-apples — 把 OOS-only ¥200k 的有效利用率拉到 dual ¥100k 一样 (例如限 OOS-only 的 cap 比例缩放)
+- **(D)** 全 INTRADAY 特征管道 — MVP 用 4 col 代理, 生产用 64 col TECHNICAL_COLUMNS 从 1m bars 重算
+- **(E)** Out-of-sample (5/1 起样本) — in-sample +12.89% 是不是过拟合
+
+建议优先 (B) 给 ± 区间然后 (E) OOS 验证, (D) 不一定要做因为对相对比较影响小。
+
+### Rule reminders
+- Rule #4: 纯研究 --skip-update, 不动 prod model ✓
+- Rule #11: PIT 守住 ✓
+- Rule #1: 大结果 (NAV / JSON) 不进 git, spec + 脚本 + 结论 + commit msg 进 ✓
+- Round 168: freeze API 流程不变, dual bucket 脚本不碰 freeze ✓
+
+### 主动给 user
+
+按你的 (1)(2) 拍板做了 v2:
+- **同股仓位 cap = EOD+OOS 合并 ≤8%** (你拍的 hard_max)。8 个月 in-sample dual Max DD 从 9.48% 降到 6.47%, **降 3pp** — 这条防御真有用, 拦了 ~129 次潜在过度集中。
+- **严格冲突 = 40 次** (A=17 EOD-sell-OOS-buy / B=23 OOS-buy-yesterday-EOD-sell-today) — 比之前只算 A 的 17 次多 23 次。估算 40 次冲突成本 ¥360-800, 但 dual 比 best solo 还是多了 ¥7,212 alpha, **没吃光**。
+
+v2 dual NAV +12.89% (vs v1 +12.44%), Max DD 6.47% (vs v1 9.48%) — 比 v1 更稳, 同样跑赢两 solo。你 worry "round-trip 成本吃 alpha" 仍未在此样本成立。
+
+下一步看 advisor 拍哪个方向, 我有 5 个候选 (Type A/B 拆分 / Stochastic seeds / Apples-to-apples / 全 INTRADAY 特征 / OOS 验证), 倾向先 OOS 验证防过拟合。
+
+---
+
 ## [2026-06-01 12:30] 第 175 轮 (双 bucket 合并回测 MVP **跑通 + 出第一版结果** — dual NAV > best solo + 17 次 type-A 冲突)
 
 ### 跑通 (commit 即将 push, 总 6h 比预估快很多)

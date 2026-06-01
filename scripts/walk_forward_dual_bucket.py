@@ -86,6 +86,13 @@ OOS_DAILY_BUDGET = 20_000.0
 DEFAULT_START = "2025-09-01"
 DEFAULT_END = "2026-04-28"
 
+# round 176 (advisor round 175 拍板):
+# (1) MERGED hard-cap on per-code position across BOTH buckets.
+# Hard-coded to match daily_report.py default (hard_single_weight=0.40 is
+# the conservative production setting; advisor spec example used 8% so we
+# default to 0.08 here for research and surface as CLI flag).
+MERGED_HARD_MAX_PCT_DEFAULT = 0.08
+
 
 # ───────────────────────────────────────────────────────────────────
 # Data loading
@@ -278,8 +285,20 @@ def execute_oos_with_budget(broker: SimulatedBroker, tracker: ArmBBudgetTracker,
                              oos_picks: pd.DataFrame,
                              prices: Dict[str, float],
                              adv_lookup: Dict[str, float],
-                             sim_date: str) -> Tuple[List[str], List[dict]]:
-    """OOS bucket: equal-weight rebalance with daily budget cap. Returns (picks, skipped_events)."""
+                             sim_date: str,
+                             eod_broker: Optional[SimulatedBroker] = None,
+                             merged_hard_max_pct: Optional[float] = None,
+                             ) -> Tuple[List[str], List[dict]]:
+    """OOS bucket: equal-weight rebalance with daily budget cap.
+
+    round 176 (advisor 175 拍板 (1)): when ``eod_broker`` and
+    ``merged_hard_max_pct`` are passed, refuse OOS buys whose post-buy
+    MERGED position (EOD bucket value + OOS bucket value, expressed
+    as fraction of combined total) would exceed ``merged_hard_max_pct``.
+    Reject the WHOLE order (no partial fill).
+
+    Returns (executed_picks, skipped_events).
+    """
     skipped: List[dict] = []
     if oos_picks.empty:
         return [], skipped
@@ -291,7 +310,7 @@ def execute_oos_with_budget(broker: SimulatedBroker, tracker: ArmBBudgetTracker,
     for code in list(broker.positions.keys()):
         if code not in pick_set:
             price = prices.get(code)
-            if price is None or price <= 0:
+            if price is None or price <= 0 or pd.isna(price):
                 continue
             adv = adv_lookup.get(code)
             trade = broker.sell(code, price, date=sim_date, adv=adv)
@@ -300,8 +319,12 @@ def execute_oos_with_budget(broker: SimulatedBroker, tracker: ArmBBudgetTracker,
                 # Don't credit the tracker for sells (the daily cap is buy-only).
                 pass
 
-    # Then: buy with budget gating
+    # Then: buy with budget + merged-cap gating
     per_name = OOS_DAILY_BUDGET / max(1, len(pick_codes))
+    # Combined total for merged-cap base (computed once at this 14:30 snapshot)
+    combined_total = broker.total_value
+    if eod_broker is not None:
+        combined_total += eod_broker.total_value
     for code in pick_codes:
         price = prices.get(code)
         if price is None or price <= 0 or pd.isna(price):
@@ -313,6 +336,23 @@ def execute_oos_with_budget(broker: SimulatedBroker, tracker: ArmBBudgetTracker,
         if shares_target <= 0:
             skipped.append({"code": code, "reason": "below_lot_size"})
             continue
+        # round 176 (advisor 175 (1)): merged-cap check BEFORE tracker.check
+        if eod_broker is not None and merged_hard_max_pct is not None and combined_total > 0:
+            cur_eod_val = (eod_broker.positions[code].market_value
+                           if code in eod_broker.positions else 0.0)
+            cur_oos_val = (broker.positions[code].market_value
+                           if code in broker.positions else 0.0)
+            new_oos_val = cur_oos_val + shares_target * price
+            merged_val = cur_eod_val + new_oos_val
+            merged_pct = merged_val / combined_total
+            if merged_pct > merged_hard_max_pct:
+                skipped.append({
+                    "code": code,
+                    "reason": (f"merged_cap: EOD ¥{cur_eod_val:.0f} + new OOS ¥{new_oos_val:.0f} "
+                               f"= ¥{merged_val:.0f} ({merged_pct*100:.2f}%) > "
+                               f"{merged_hard_max_pct*100:.1f}% of combined total ¥{combined_total:.0f}"),
+                })
+                continue
         ok, msg = tracker.check_buy(code, shares_target, price)
         if not ok:
             skipped.append({"code": code, "reason": msg})
@@ -455,7 +495,9 @@ def run_seed(seed: int, mode: str,
              trading_dates: List[pd.Timestamp],
              initial_capital: float, top_k: int,
              eod_ranker: BlendRanker, oos_ranker: BlendRanker,
-             adv_lookup: Dict[Tuple[str, pd.Timestamp], float]) -> BacktestResult:
+             adv_lookup: Dict[Tuple[str, pd.Timestamp], float],
+             merged_hard_max_pct: float = MERGED_HARD_MAX_PCT_DEFAULT,
+             ) -> BacktestResult:
     """Run a single seed in mode={eod_only | oos_only | dual}."""
     np.random.seed(seed)
     fees = FeeSchedule()
@@ -525,6 +567,8 @@ def run_seed(seed: int, mode: str,
                                   adv_floor=100_000_000.0)
                 oos_picks_executed, oos_skipped = execute_oos_with_budget(
                     oos_broker, oos_tracker, top, oos_prices, adv_today, sim_date_str,
+                    eod_broker=eod_broker if mode == "dual" else None,
+                    merged_hard_max_pct=merged_hard_max_pct if mode == "dual" else None,
                 )
 
         # ─── 3. Mark-to-market at D close ───
@@ -565,19 +609,35 @@ def run_seed(seed: int, mode: str,
         }
         result.picks_log.append(picks_row)
 
-        # Conflict Type A: EOD just sold X on today's open AND OOS bought X same day at 14:30
+        # round 176 (advisor 175 (2)): strict conflict count, single metric.
+        # Type A: EOD sells X on D 09:25 (open) AND OOS buys X on D 14:30
+        # Type B: OOS bought X on D-1 14:30 AND EOD sells X on D 09:25 (open)
+        # Both count toward `conflict_count` — economic cost is real (round-trip
+        # friction) regardless of model-level PIT awareness.
         if mode == "dual" and eod_broker is not None and oos_broker is not None:
             eod_sold_today = set()
             for trade in eod_broker.trade_log:
                 if trade.get("date") == sim_date_str and trade.get("action") == "SELL":
                     eod_sold_today.add(trade["code"])
+            # Type A
             for code in oos_picks_executed:
                 if code in eod_sold_today:
                     result.conflicts.append({
                         "date": sim_date_str,
-                        "type": "A_eod_sell_oos_buy_same_day",
+                        "type": "A_eod_sell_then_oos_buy_same_day",
                         "code": code,
                     })
+            # Type B: was X bought by OOS on D-1, and EOD sells X today?
+            # picks_log entries are appended in order; the most-recent prior is len-2.
+            if len(result.picks_log) >= 2:
+                prev_oos_picks = set(result.picks_log[-2].get("oos_picks_executed_today_1430", []))
+                for code in eod_sold_today:
+                    if code in prev_oos_picks:
+                        result.conflicts.append({
+                            "date": sim_date_str,
+                            "type": "B_oos_bought_yesterday_eod_sells_today",
+                            "code": code,
+                        })
 
         if i % 20 == 0:
             logger.info("[seed={} {}] D={} ({}/{}) NAV: eod={:.0f} oos={:.0f} dual={:.0f}",
@@ -636,11 +696,18 @@ def summarize_results(results: List[BacktestResult], initial_capital: float) -> 
             total_slippage.append(slippage)
             total_stamp.append(stamp)
             total_friction.append(friction)
-        # Conflict + overlap counts (only meaningful for dual)
+        # round 176: strict conflict count = Type A + Type B (advisor 175 (2))
+        n_conflicts_total = []
         n_conflicts_A = []
+        n_conflicts_B = []
         pick_overlap = []
+        n_oos_skipped_merged_cap = []
         for r in mode_results:
-            n_conflicts_A.append(sum(1 for c in r.conflicts if c.get("type") == "A_eod_sell_oos_buy_same_day"))
+            ta = sum(1 for c in r.conflicts if c.get("type", "").startswith("A_"))
+            tb = sum(1 for c in r.conflicts if c.get("type", "").startswith("B_"))
+            n_conflicts_A.append(ta)
+            n_conflicts_B.append(tb)
+            n_conflicts_total.append(ta + tb)
             overlaps_per_day = []
             for row in r.picks_log:
                 e_set = set(row.get("eod_picks_executed_today_open", []))
@@ -650,6 +717,7 @@ def summarize_results(results: List[BacktestResult], initial_capital: float) -> 
                     inter = e_set & o_set
                     overlaps_per_day.append(len(inter) / max(1, len(union)))
             pick_overlap.append(np.mean(overlaps_per_day) if overlaps_per_day else 0.0)
+            n_oos_skipped_merged_cap.append(sum(row.get("oos_skipped_count", 0) for row in r.picks_log))
         summary[mode] = {
             "n_seeds": len(mode_results),
             "final_nav_mean": float(np.mean(final_navs)),
@@ -661,8 +729,11 @@ def summarize_results(results: List[BacktestResult], initial_capital: float) -> 
             "commission_mean": float(np.mean(total_commission)),
             "slippage_mean": float(np.mean(total_slippage)),
             "stamp_mean": float(np.mean(total_stamp)),
+            "conflict_total_mean": float(np.mean(n_conflicts_total)),
             "conflict_typeA_mean": float(np.mean(n_conflicts_A)),
+            "conflict_typeB_mean": float(np.mean(n_conflicts_B)),
             "picks_jaccard_mean": float(np.mean(pick_overlap)),
+            "oos_skipped_mean": float(np.mean(n_oos_skipped_merged_cap)),
         }
     return summary
 
@@ -686,13 +757,17 @@ def write_report(summary: dict, out_path: Path, initial_capital: float,
         f"",
         f"## Results (mean ± std across {n_seeds} seeds)",
         f"",
-        f"| Mode | Final NAV | Return | Max DD | Friction (¥) | Pick overlap (Jaccard) | Conflict-A (EOD-sell+OOS-buy same day) |",
-        f"|---|---:|---:|---:|---:|---:|---:|",
+        f"| Mode | Final NAV | Return | Max DD | Friction (¥) | Pick overlap (Jaccard) | Conflicts (A+B) | OOS skips (merged-cap + budget) |",
+        f"|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for mode in ("eod_only", "oos_only", "dual"):
         if mode not in summary:
             continue
         s = summary[mode]
+        c_total = s.get("conflict_total_mean", 0)
+        c_a = s.get("conflict_typeA_mean", 0)
+        c_b = s.get("conflict_typeB_mean", 0)
+        c_str = f"{c_total:.1f} (A={c_a:.1f} / B={c_b:.1f})"
         lines.append(
             f"| {mode} | "
             f"¥{s['final_nav_mean']:,.0f} ± {s['final_nav_std']:,.0f} | "
@@ -700,7 +775,8 @@ def write_report(summary: dict, out_path: Path, initial_capital: float,
             f"{s['max_drawdown_mean']*100:.2f}% | "
             f"¥{s['friction_mean']:,.0f} | "
             f"{s['picks_jaccard_mean']*100:.1f}% | "
-            f"{s['conflict_typeA_mean']:.1f} |"
+            f"{c_str} | "
+            f"{s.get('oos_skipped_mean', 0):.0f} |"
         )
 
     if "dual" in summary and "eod_only" in summary and "oos_only" in summary:
@@ -741,13 +817,19 @@ def write_report(summary: dict, out_path: Path, initial_capital: float,
         f"",
         f"Net implication: `dual` is *not* mechanically additive vs `eod_only` + `oos_only` because changing OOS capital from ¥{initial_capital:,.0f} → ¥{initial_capital/2:,.0f} barely changes OOS turnover (cap-bound), but doubles its return rate per ¥ invested. Treat the absolute `dual − solo` deltas with this in mind.",
         f"",
+        f"## round 176 (advisor round 175 拍板)",
+        f"- **(1) Merged position cap** active in dual mode: an OOS buy on code X is REJECTED (whole order, no partial) if EOD position(X) + new OOS position(X) > `hard_max_pct` (default 8%) of combined total. This is more conservative than independent positions and protects against same-stock double exposure.",
+        f"- **(2) Single conflict metric** = Type A + Type B count:",
+        f"  - Type A: EOD sells X on D 09:25 open → OOS buys X on D 14:30 same day",
+        f"  - Type B: OOS bought X on D-1 14:30 → EOD sells X on D 09:25 open",
+        f"  Both count toward `Conflicts` total. Per advisor: no PIT excuse, economic round-trip cost is real.",
+        f"",
         f"## Caveats",
         f"- 8-month in-sample window — sample size is small; treat as directional, not definitive",
         f"- **Seed std is 0** for all modes: the pipeline (factors → predict → top-K → execute) is deterministic. Different seeds label runs but do not produce variation. A real ± needs a stochastic source (random tie-break, bootstrap, or train-time seed). Out of MVP scope.",
         f"- `data/intraday_blend_*.lgb` was trained 2026-05-27, BEFORE the n2c label upgrade (round 162). This is the *currently-shipped* OOS model so its drag is what user asked us to measure.",
         f"- OOS panel uses D-1 factor row + 4 INTRADAY_EXTRA_COLUMNS proxies (MVP). Production intraday_plan re-derives 64 TECHNICAL_COLUMNS from morning bars — this would tighten OOS scoring",
         f"- OOS execution price = 1m close at 14:29 from `data/intraday_1m_qfq/`; real fills are next-second auction (~5bps optimistic)",
-        f"- Conflict types: only Type A (EOD-sell + OOS-buy same day) implemented; Type B (overnight: OOS-buy D-1 + EOD-sell D) for next iteration",
         f"- Sells in OOS bucket don't credit back the daily budget (production logic too); so a bucket-internal rotation eats budget twice",
         f"",
         f"## Rule reminders",
@@ -775,6 +857,8 @@ def main() -> int:
     ap.add_argument("--json-out", default="data/walk_forward_dual_bucket.json")
     ap.add_argument("--modes", default="eod_only,oos_only,dual",
                     help="comma-separated subset of {eod_only, oos_only, dual}")
+    ap.add_argument("--merged-hard-max-pct", type=float, default=MERGED_HARD_MAX_PCT_DEFAULT,
+                    help="round 176: per-code combined EOD+OOS cap (dual mode only)")
     ap.add_argument("--smoke", action="store_true",
                     help="single seed × 1 month — fast sanity check")
     args = ap.parse_args()
@@ -827,7 +911,8 @@ def main() -> int:
             t1 = time.time()
             res = run_seed(seed, mode, factors, bars, morning_bars,
                            list(trading_dates), args.initial_capital, args.top_k,
-                           eod_ranker, oos_ranker, adv_lookup)
+                           eod_ranker, oos_ranker, adv_lookup,
+                           merged_hard_max_pct=args.merged_hard_max_pct)
             logger.info("  done in {:.1f}s; final NAV: eod={:.0f} oos={:.0f} dual={:.0f}",
                        time.time() - t1,
                        res.nav_records[-1]["eod_nav"] if res.nav_records else 0,
@@ -860,10 +945,14 @@ def main() -> int:
     # Print summary to stdout
     print("\n=== Dual-bucket backtest summary ===")
     for mode, s in summary.items():
+        c_total = s.get('conflict_total_mean', 0)
+        c_a = s.get('conflict_typeA_mean', 0)
+        c_b = s.get('conflict_typeB_mean', 0)
         print(f"{mode}: NAV={s['final_nav_mean']:,.0f} (±{s['final_nav_std']:,.0f}) "
               f"ret={s['total_ret_mean']*100:+.2f}% DD={s['max_drawdown_mean']*100:.2f}% "
               f"friction=¥{s['friction_mean']:,.0f} overlap={s['picks_jaccard_mean']*100:.1f}% "
-              f"conflictA={s['conflict_typeA_mean']:.1f}")
+              f"conflicts={c_total:.0f} (A={c_a:.0f}, B={c_b:.0f}) "
+              f"oos_skips={s.get('oos_skipped_mean', 0):.0f}")
     return 0
 
 
