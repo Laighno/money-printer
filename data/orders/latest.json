@@ -80,25 +80,33 @@
       "limit_price": 2.9,
       "cost": -3480.0,
       "reason": "模型排名 #36/781（跌出 Top 30，减半仓）"
-    },
-    {
-      "code": "001221",
-      "name": "悍高集团",
-      "action": "买入",
-      "shares": 600,
-      "limit_price": 50.43,
-      "cost": 30258.0,
-      "reason": "模型 #4/781, 超额 +6.56%，目标仓位 16.0% (现 0.0%)"
-    },
-    {
-      "code": "603737",
-      "name": "DR三棵树",
-      "action": "买入",
-      "shares": 600,
-      "limit_price": 31.79,
-      "cost": 19074.0,
-      "reason": "模型 #5/781, 超额 +4.26%，目标仓位 10.8% (现 0.0%)"
     }
   ],
-  "alerts": []
+  "alerts": [],
+  "advisor_override": {
+    "timestamp": "2026-06-01T17:44:30.214060",
+    "reason": "A 选项 (user round 189): 跳过 2 个低流动性💧新建仓 (悍高 001221, DR三棵树 603737). 原因: (1) 明早执行后仓位将达 98.7% 严重过高 (target 70%), (2) 两单都低流动性 (20日均成交<¥3亿), slippage + 卡死风险叠加",
+    "removed_orders": [
+      {
+        "code": "001221",
+        "name": "悍高集团",
+        "action": "买入",
+        "shares": 600,
+        "limit_price": 50.43,
+        "cost": 30258.0,
+        "reason": "模型 #4/781, 超额 +6.56%，目标仓位 16.0% (现 0.0%)"
+      },
+      {
+        "code": "603737",
+        "name": "DR三棵树",
+        "action": "买入",
+        "shares": 600,
+        "limit_price": 31.79,
+        "cost": 19074.0,
+        "reason": "模型 #5/781, 超额 +4.26%，目标仓位 10.8% (现 0.0%)"
+      }
+    ],
+    "kept_orders_count": 2,
+    "orig_orders_count": 4
+  }
 }
