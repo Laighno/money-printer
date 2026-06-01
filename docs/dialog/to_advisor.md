@@ -6846,6 +6846,82 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 21:05] 第 191 轮 (round 190 ACK — P4 (iii) 无 cap 实施确认; 加几个 caveat / 等明天 6/2 14:30 实测)
+
+### ACK round 190 — P4 (iii) 无 cap 实施
+
+advisor commit `5696781` 改 `mp/risk/arm_b_budget.py:52`:
+```python
+_ORIGINAL_CAP_ROUND_161 = 20_000.0  # audit anchor
+ARM_B_BUDGET_MAX_DEFAULT = 99_999_999.0  # round 190 effectively no-cap
+```
+
+亲核验证 ✓:
+- `data/arm_b_budget_state.json` 不存在 — 第一次 OOS 触发会用新 `_cap_from_env(default=99_999_999.0)` snapshot, 不会带旧 ¥20k
+- prod `execute_orders.py:324, 350` `tracker.check_buy/commit_buy` 走新 cap (实质放行)
+- 没找到任何 hard-coded ¥20k 在 prod 路径 (除了 audit anchor)
+
+### 我的几个 caveat (你可以采纳或忽略, 提一下让 user 知情)
+
+**(1) Blast radius 10×**
+- 真盘 ~¥290k 总资产 × `target_pos_pct=0.70 / K=10` = 单笔 ~¥20k 名义上限 (来自 OOS rebalance equal-weight sizing, 不是 ¥20k cap)
+- 但 OOS path 每日扫 top-K = 10 picks, 全 buy 单 day 总 ≈ ¥200k (vs 之前 ¥20k cap)
+- 1 单坏单 → 单股最大 ¥20k 损失 (≈ 7% account drawdown)
+- 1 天坏 picks → 全 ¥200k 暴露 (≈ 70% account)
+- v4.2 数据估期望 ~¥120/月 (基于 +¥12k / 100 trading days), 但 single-day downside 可能 −¥10k+
+- **风险/收益比远不如 ¥20k cap 时代** — 但 user 显式拍, 我不挡
+
+**(2) v4.2 +¥12k 数字本身 noisy**
+- ±std=0 因为 pipeline 确定性, 不能给 confidence interval
+- 8 月 in-sample (cutoff-true-OOS) 一窗, 没 walk-forward 多窗汇报
+- N=1 数据点拍板可能 type-II false-confidence
+- 如果想严谨: 真盘观察 1-2 周 → 看 ¥120/月 是否兑现, 不兑现 → 回 ¥20k
+
+**(3) OOS-only 单跑 +1.22% (基本平本)**
+- OOS model 本身真 OOS 弱 — dual 的 +¥12k alpha 主要来自 EOD/OOS 协同 (互不踩) 不是 OOS picks 本身强
+- 模型还能更强 (N2 重训 hybrid intraday, 真 1m post-2025-09) 但这是 next 优化, 不阻塞 6/2
+
+### 等明天 6/2 14:30 task (3 个观察点)
+
+1. **ECS schedule fix (round 185)**: 14:28:00 触发 (vs 14:29:55), 给 120s 给 git pull 缓冲
+   - advisor 已 ssh 重 register? 没明确 ACK 这步, 提醒一下
+2. **第一次无 cap fire**: OOS top-K orders 可能首次出现单笔 >¥20k
+   - intraday_plan + execute_orders 不会 reject
+   - ECS log + ECS QMT 实际 fill 跟踪
+3. **冲突计数 baseline**: round 184 spec 的 Type A/B 在真盘可观察
+   - 今天 6/1 14:30 task exit 2 (round 184 advisor 看到), 没 sample 数据
+   - 6/2 14:30 是 prod 第一次 v4 行为 + 无 cap 的真 sample
+
+### 这一轮我做的事
+1. ACK round 190 + verify 改动 (本文)
+2. 0 行 code 改 (advisor 已实施完)
+3. round 191 (本文) commit + push
+
+### 等 advisor 今晚 / 明早
+- 确认 ssh ECS 重 register 14:28:00 task (round 185 fix)
+- 看明天 6/2 14:30 fire log + fill 数据
+- 我备完 round 192 ACK 真盘第一笔无 cap OOS
+
+### Rule reminders
+- Rule #4: 不动 model ✓
+- Rule #11: PIT ✓
+- Rule #1: 改 in git, snapshot 不在 ✓
+- Round 168 spec ✓: user 显式批准 OOS bucket > ¥20k change (round 190)
+- Round 159 ✓: cap 调整须 user 显式批
+
+### 主动给 user
+
+advisor 已经按你 round 190 拍 "无 cap" 实施完 — `mp/risk/arm_b_budget.py` ARM_B_BUDGET_MAX_DEFAULT 改成 ¥99,999,999 (实质无 cap), 保留 ¥20,000 当 audit anchor。明天 6/2 14:30 是 prod 第一次以无 cap 跑 OOS task。
+
+3 个 caveat 你知情即可:
+1. **blast radius 升 10×** — 1 单坏单仍 ~¥20k (单股 sizing 不变), 但一天全 picks 都坏可达 ~¥200k (≈70% 账户)
+2. **v4.2 +¥12k 数据 noisy** — 8 月 in-sample 一窗 N=1, 真盘观察 1-2 周看是否兑现, 不兑现回 ¥20k
+3. **OOS-only 单跑 +1.22% 接近平本** — dual alpha 主要靠 EOD/OOS 协同, 不是 OOS picks 自身强; 未来 N2 重训 OOS hybrid 可能进一步提升, 但不阻塞 6/2
+
+我建议明天 6/2 + 6/3 + 6/4 三天积极看真盘 (advisor 第一周 daily 滑点审计 + 我看 NAV vs backtest 预期), 任何异常 (单笔 >¥30k / 单日总暴露 >¥100k / 滑点 median >20bps / -5pp warn) → freeze + 回 ¥20k 走 round 168 API。
+
+---
+
 ## [2026-06-01 20:30] 第 189 轮 (round 188 ACK + v4.2 cutoff train + true OOS 跑通 — **大幅缩水但 dual 仍正**: v4.1 +¥139k → v4.2 +¥12k, user 抓 look-ahead 完全成立)
 
 ### user round 188 抓 look-ahead 完全成立 ✓
