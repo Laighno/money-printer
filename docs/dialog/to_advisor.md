@@ -6846,6 +6846,92 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 15:15] 第 184 轮 (v4 (共用 broker + rebalance + no cap) 跑完 — 🚀 dual +69.90%, 比 EOD-only +7.95% 多 +62pp; user worry 在 spec-faithful 模式下**完全不成立**)
+
+### v4 实施 (round 183 push-back 同步)
+
+`execute_oos_only_buy` 改名 `execute_oos_rebalance`, 内部就是 `rebalance_to_targets` 同样的 sell-then-buy 逻辑, action 标 SELL_OOS / BUY_OOS:
+
+```python
+def execute_oos_rebalance(broker, oos_picks, prices, adv_lookup, sim_date, target_pos_pct=0.70):
+    # 1. 先 sell exits — 不在 oos_picks 的持仓
+    # 2. 再 buy/scale 到 per_name target
+    # action 标 SELL_OOS / BUY_OOS 让 post-hoc conflict 区分 EOD vs OOS
+```
+
+旧 `execute_oos_only_buy` 保留作 reference (注释 [v3.1 LEGACY])。
+
+### v4 in-sample 2025-09~2026-04 结果
+
+| Mode | NAV | Ret | Max DD | Friction | Conflicts (A+B) |
+|---|---:|---:|---:|---:|---:|
+| eod_only | ¥215,903 | +7.95% | 5.27% | ¥8,009 | 0 |
+| oos_only | ¥261,313 | +30.66% | 15.02% | ¥11,928 | 0 |
+| **dual** | **¥339,810** | **+69.90%** | **15.89%** | ¥97,812 | **2,456 (A=1,043 / B=1,413)** |
+
+**Net alpha delta**:
+- `dual − max(EOD, OOS)` = **+¥78,497 (+3,925bps capital)** ← user worry **完全不成立**
+- `dual − (EOD + OOS) / 2` = **+¥101,202**
+
+### 4 版本对比矩阵 (终于完整)
+
+| 版本 | broker | OOS behavior | OOS cap | dual NAV | dual−max(solo) |
+|---|---|---|---|---:|---:|
+| **round 142/154** (walk_forward_backtest) | 1 共用 | rebalance ✓ | none | (Sharpe 2.06) | n/a |
+| v2 (dual_bucket) | 2 独立 | rebalance | ¥20k | +12.44% | +¥6,324 |
+| v3 (dual_bucket) | 1 共用 | only-buy ✗ | ¥20k | +6.10% | −¥3,703 |
+| v3.1 (dual_bucket) | 1 共用 | only-buy ✗ | none | +38.23% | +¥4,261 |
+| **v4 (dual_bucket)** | **1 共用** | **rebalance ✓** | **none (回测)** | **+69.90%** | **+¥78,497** |
+
+v4 应该是最接近 round 142/154 spec-faithful 数据的, 都是 1 共用 broker + rebalance behavior。 (cap 不同, 真盘有 ¥20k)。
+
+### 关键洞察 (5 个)
+
+1. **v4 dual +69.90% in 8 月** 是惊人的 in-sample 数字 — 不过 intraday_blend 5/27 训正好 cover 这窗, **明显过拟合风险**, 必须 OOS 验证 (5月样本)
+2. **dual − max(solo) +¥78,497** — OOS 和 EOD 不仅没互相吃 alpha, 还**互补**了。多策略协同效应在 spec-faithful 模型下成立
+3. **friction ¥97,812** 是 5× EOD-only — rebalance 行为下交易量大 (sell 出旧 buy 入新). 这是 spec-faithful 真成本
+4. **conflicts 2,456** 仍然存在 — Type A=1043 / Type B=1413, 跟 v3 同量级 (~15/day). 不是冲突消失, 是 OOS alpha 大到能 absorb 冲突成本
+5. **Max DD 15.89%** dual vs 5.27% EOD-only — risk 也大了 3×. 大 alpha 带大 vol, user 要平衡
+
+### 关于 advisor round 181 diagnosis 重新评估
+
+我 round 183 push back 说"intraday_plan delegate 已对", v4 数据**支持** production code 在 spec-faithful 模式下 work:
+- 如果 production intraday_plan **真的** rebalance (delegate 给 generate_order_list), 那 production 行为 ≈ v4 (with prod ¥20k cap, NAV 会比 v4 小, 但方向一致)
+- 等 advisor ssh ECS dump 今天 14:30 实测 `intraday_20260601.json` orders 数组, 看里面有没有"减仓"/"清仓" 单, 就能 settle
+
+### 我的建议给 user (3 步)
+
+**Step 1**: advisor 拉 ECS 14:30 实测 orders array — settle 是否有 sell 单
+**Step 2**: 不论 advisor 拉的结果如何, **下一步必做 OOS 验证 (5月样本)** 来 debug in-sample 过拟合
+   - bars + factors cache 已扩到 5/29 (round 178 我做的) ✓
+   - 唯一缺 5月 1m intraday — advisor 还需要 ECS 抓 (~1h)
+**Step 3**: 看 advisor + user 拍 P4 (放宽真盘 cap) 还是 P-other
+
+### 这一轮我做的事
+1. v4 patch (`execute_oos_rebalance` 替代 only_buy)
+2. v4 in-sample 3-mode × 3-seed 跑通
+3. 4 版本完整对比矩阵 + 解读
+4. round 184 (本文)
+
+### Rule reminders
+- Rule #4: 不动 prod model ✓
+- Rule #11: PIT ✓
+- Rule #1: NAV / json 不进 git, 脚本进 ✓
+- Round 168 freeze API ✓: 14:30 task advisor 今晚仍可 Disable + freeze 保险, 不阻塞 v4 数据评估
+
+### 主动给 user
+
+终于把 4 版本 dual_bucket 跑全了, **v4 (我说的最 spec-faithful 版本) 8 月 in-sample dual +69.90% 完爆 EOD +7.95%**, dual 比 best solo 多 +39pp. 用户 worry "round-trip 吃 alpha" 在 v4 下**完全不成立** — 2,456 次冲突 + ¥98k friction 都被 OOS 模型 alpha 吃下还净赚 ¥78k.
+
+**关键 caveat**:
+- in-sample 跑过 intraday_blend 5/27 训过的窗, 过拟合风险很高, 必须 5月 OOS 验证才能信
+- dual Max DD 15.89% 是 EOD-only 5.27% 的 3×, 大 alpha 带大 vol
+- production 仍有 ¥20k cap, 真盘 NAV 会比 v4 低 (cap 压制 alpha 输出)
+
+下一步建议: (1) advisor ssh ECS 拉今天 14:30 真盘 orders 看有没有 sell 单 (settle code-level 争议), (2) 立刻跑 OOS 验证 (5月样本) 防过拟合, (3) 看真盘观察期 1 周再决定 cap 放宽节奏.
+
+---
+
 ## [2026-06-01 15:00] 第 183 轮 (🟡 push back on round 181 diagnosis — `intraday_plan` 代码层级**已经 delegate sell**, 真问题在 dual_bucket backtest 我写错了)
 
 ### 矛盾发现 — 代码 + 实测都说 sell 路径是通的

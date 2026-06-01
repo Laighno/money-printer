@@ -283,13 +283,72 @@ def rebalance_to_targets(broker: SimulatedBroker, top_picks: pd.DataFrame,
     return pick_codes
 
 
+def execute_oos_rebalance(broker: SimulatedBroker,
+                           oos_picks: pd.DataFrame,
+                           prices: Dict[str, float],
+                           adv_lookup: Dict[str, float],
+                           sim_date: str,
+                           target_pos_pct: float = 0.70) -> Tuple[List[str], List[dict]]:
+    """round 184 (v4 spec-faithful, after round 183 push-back):
+
+    OOS path now mirrors EOD ``rebalance_to_targets`` — sell out-of-picks
+    holdings first, then buy/scale into top-K targets. This matches the
+    production ``intraday_plan.generate_orders`` which delegates to
+    ``daily_report.generate_order_list`` (full rebalance with sells).
+
+    The "only-buy" v3 implementation was a backtest-only bug I wrote;
+    production code has always delegated to rebalance.
+
+    Trades are tagged ``action="SELL_OOS"`` / ``"BUY_OOS"`` so post-hoc
+    conflict detection can distinguish EOD (action="SELL"/"BUY") from
+    OOS (action="SELL_OOS"/"BUY_OOS"). round 142/154 walk_forward_backtest
+    Arm B Sharpe 2.06 used this exact rebalance behavior, so v4 should
+    converge toward those numbers.
+    """
+    skipped: List[dict] = []
+    if oos_picks.empty:
+        return [], skipped
+
+    total = broker.total_value
+    investable = total * target_pos_pct
+    pick_codes = [str(c).zfill(6) for c in oos_picks["code"].tolist()]
+    n = max(1, len(pick_codes))
+    per_name = investable / n
+    pick_set = set(pick_codes)
+
+    # First: sell exits — anything currently held but NOT in OOS picks
+    for code in list(broker.positions.keys()):
+        if code not in pick_set:
+            price = prices.get(code)
+            if price is None or price <= 0 or pd.isna(price):
+                continue
+            adv = adv_lookup.get(code)
+            broker.sell(code, price, date=sim_date, adv=adv, action="SELL_OOS")
+
+    # Then: buy/scale to per_name target
+    for code in pick_codes:
+        price = prices.get(code)
+        if price is None or price <= 0 or pd.isna(price):
+            skipped.append({"code": code, "reason": "no_price_or_nan"})
+            continue
+        adv = adv_lookup.get(code)
+        trade = broker.buy(code, price, target_value=per_name,
+                           date=sim_date, adv=adv, action="BUY_OOS")
+        if trade is None:
+            skipped.append({"code": code, "reason": "insufficient_cash_or_below_lot"})
+
+    skipped_codes = {s["code"] for s in skipped}
+    executed = [c for c in pick_codes if c not in skipped_codes]
+    return executed, skipped
+
+
 def execute_oos_only_buy(broker: SimulatedBroker,
                           oos_picks: pd.DataFrame,
                           prices: Dict[str, float],
                           adv_lookup: Dict[str, float],
                           sim_date: str,
                           target_pos_pct: float = 0.70) -> Tuple[List[str], List[dict]]:
-    """round 181 (advisor round 179 spec patch, v3.1 no-cap):
+    """[v3.1 LEGACY — kept for reference, do NOT use] round 181:
 
     OOS bucket = strictly **only buy, never sell**. Production
     ``intraday_plan`` has no sell logic (grep ``def.*sell`` = 0 lines).
@@ -526,8 +585,11 @@ def run_seed(seed: int, mode: str,
                                   price_map=oos_prices, cap_price=50.0,
                                   adv_lookup={c: adv_today.get(c, 0.0) for c in oos_scores["code"]},
                                   adv_floor=100_000_000.0)
-                # v3.1: only-buy, shared broker, NO cap
-                oos_picks_executed, oos_skipped = execute_oos_only_buy(
+                # v4: rebalance (mirror production intraday_plan delegation
+                # to daily_report.generate_order_list, which is full rebalance).
+                # Sells tagged SELL_OOS so post-hoc conflict count can split
+                # EOD vs OOS sells.
+                oos_picks_executed, oos_skipped = execute_oos_rebalance(
                     broker, top, oos_prices, adv_today, sim_date_str,
                 )
 
