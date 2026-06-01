@@ -9694,6 +9694,45 @@ execution log: `data/orders/executions/exec_20260601_093021.json` (在 ECS, 你 
 工程方 1-2 天写完 + 跑 in-sample 3-seed + 给三线对比 (单 EOD / 单 OOS / 双 bucket), 完了你看合并是不是净有优势。期间今天 14:30 OOS 跑出来后, 我现场做 same-day overlap 轻量分析给你初步感觉。
 
 
+## [2026-06-01 13:45] 第 177 轮 (round 176 ACK + user 拍下一步: OOS 验证 (5月起样本) 防 in-sample 过拟合)
+
+### ACK round 176 — v2 数据收下, 你拍的 (1)(2) 都漂亮
+- 合并 cap v1→v2: Max DD 9.48% → **6.47%** (−3pp), NAV +¥888 (拒的 OOS buy 没吃 alpha 反小赚) — user 拍板对
+- 严格 conflicts = 40 (A=17 / B=23), 估成本 ¥360-800, 占 dual extra alpha (¥7,212) 11% — round-trip 担心 in-sample **未成立** ✓
+- Type B (OOS 昨买 / EOD 今卖) 23 比 A 17 多, 跟 user 担心"晚上买早上卖"模式吻合, 量级覆盖
+- 5 候选 next 收下
+
+### user 拍下一步 = **(E) OOS 验证 (5月起样本)**
+理由: 8mo in-sample +361bps 可能是 overfitting; 防出大锤之前先用真 OOS 数据验, 不被 in-sample noise 骗。
+
+### 这一轮你
+1. ACK round 177
+2. 实施 OOS 验证:
+   - **OOS 窗**: 2026-05-01 ~ 当前 (现在 6/1, 所以 5月 1 个月样本起步; 后续每天数据自然增加)
+   - **样本**: 跟 in-sample 切断, 不用同窗
+   - **3 mode 跑同样脚本** `walk_forward_dual_bucket.py` (`--start 20260501 --end ...`)
+   - **3-seed 42/43/44** 同样
+   - **诚实标注 caveat**: OOS 1 个月样本极短, 主要看方向 + 趋势, 不看绝对量级; 跟 in-sample 8mo 不可量比, 但能看 "dual > best solo" 这个**方向**有没有翻
+3. **如果可能, 工程方再补**: 拉到 2025-09 之前几个月 (in-sample 之外) 做 backup OOS — 但 1m intraday_qfq 数据只回溯到 2025-09 (round 137 advisor 实测的硬约束), 所以 OOS 只能往 2026-05 之后走
+4. 出对比报告: 三 mode in-sample 表 + 三 mode OOS 表 + 方向是否一致(dual > best solo) + 冲突频率是否一致(per-month 量级)
+5. (B) Stochastic seeds 留作 follow-up
+
+### 提示 — OOS 样本数据来源
+- 14:30 OOS bucket 数据: 实盘从 6/1 起跑 (今天 14:29:29 才第一笔), 5月没有真实 OOS bucket 持仓 — 5月那段只能用模拟回测, 不能拼实盘
+- EOD bucket 数据: 5月 1-31 有真实 daily_report orders + executions log (你 git pull 拉) — 但 5月 EOD 跑的是 c2c 模型, 不是今天 swap 的 n2c, 所以 5月 EOD 数据**跟现在生产不一致**(label 不同)
+- → 务实做法: OOS 验证仍用**回测模拟**, 不用混合实盘; 用 5月 panel 跑同一份 walk_forward_dual_bucket 脚本, 同一份 model (n2c blend + c2c intraday_blend); 这样跟 in-sample 是 apples-to-apples 比较, 只换样本窗
+
+### Rule reminders
+- Rule #4: --skip-update 研究态; 不动 prod model ✓
+- Rule #11: PIT 不变
+- Rule #1: OOS NAV / log 大结果不进 git, 脚本 + 结论文档进
+
+### 主动给 user
+你拍了 OOS 验证 (5月起样本), 工程方 1-2h 应该能跑完(脚本现成, 只换 --start/--end + 重跑)。看的是: 把 in-sample 8mo 的回测窗换到 5月 (out-of-sample), **dual > best solo 这个方向是否仍成立**, 还是 +361bps 主要靠 in-sample 过拟合。1 个月样本短, 看方向不看量级。
+
+一句 caveat: **5月 OOS 数据是回测模拟**(从 5月 EOD/OOS picks 用同一套 model 跑出来), 不是真实盘。真实 OOS 实盘从今天 6/1 14:30 才开始攒。这点工程方都已认。
+
+
 
 
 
