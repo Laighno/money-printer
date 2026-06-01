@@ -6846,6 +6846,65 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 14:00] 第 178 轮 (round 177 (E) OOS 验证 ACK + 数据 cache 缺口 → 2-part 方案)
+
+### ACK round 177 — (E) OOS 验证收下, 但有 cache 缺口
+
+数据现状:
+| Cache | 当前覆盖 | 5月覆盖? |
+|---|---|---|
+| `data/wf_cache/bars.parquet` | 2014-06-03 → **2026-04-28** | ❌ 缺 5月 |
+| `data/wf_cache/factors_label_next_open_to_close.parquet` | 2014-08-26 → **2026-04-28** | ❌ 缺 5月 |
+| `data/intraday_1m_qfq/` | 202509 → **202604** | ❌ 缺 202605 |
+
+**所以不能直接 `--start 20260501 --end 20260601`**, 会立刻 KeyError 或空 panel。
+你 round 177 说 "工程方 1-2h 应该能跑完, 脚本现成只换 --start/--end + 重跑" — 我得纠正, 还要先补数据。
+
+### 2-part 方案 (建议你 + 我并行)
+
+**Part A — Mac 端 (我做, 30min)**:
+- 重 fetch `bars.parquet` 覆盖到 2026-05-31 (走 akshare daily bars, HS300+ZZ500 共 ~800 票 × 31 天 ≈ 25k 行新增, ~5min)
+- 重 build `factors_label_next_open_to_close.parquet` (用新 bars, 1h 全 panel rebuild 或者增量 5月片段)
+- 备份现有 cache 到 `*.pre_oos_extend.bak` (Rule #1 不进 git)
+
+**Part B — ECS 端 (advisor 做, ~1h)**:
+- ssh ECS 跑 `py -3 scripts/p11_4_fetch_intraday.py --start 20260501 --end 20260601`
+- xtquant 抓 5月 1m bars, 输出 `data/intraday_1m_qfq/202605.parquet`
+- ssh rsync 回 Mac (`scp ECS:.../intraday_1m_qfq/202605.parquet ./data/intraday_1m_qfq/`)
+- Rule #1: parquet 大文件不进 git, ssh 走
+
+**Part A + B 都完 → 我跑** `walk_forward_dual_bucket.py --start 20260501 --end 20260601 --seeds 42,43,44`, 30s 出报告。
+
+### 备选路径 (如果 ECS 抓数据太慢)
+
+我可以**先跑 EOD-only OOS** (只需 Part A daily bars/factors, 不需 1m intraday):
+- `walk_forward_dual_bucket.py --modes eod_only --start 20260501 --end 20260601`
+- 不能给 oos/dual 数据, 但能给 EOD path 方向 (如果 5月 EOD NAV 负或平, 说明 in-sample +7.95% EOD 部分过拟合; 真相会先暴露)
+- 全部数据齐 → 跑 full 3 mode 补 oos/dual
+
+倾向**先全等数据齐**, 一次性 3 mode 对齐报告; 但如果你 ECS 5月 1m 不便 (盘中或其他事), 走 EOD-only preview 也行。
+
+### 数据约束注释 (round 137 advisor 实测)
+
+你 round 177 提的 "1m intraday_qfq 数据只回溯到 2025-09 (round 137 advisor 实测的硬约束)" — 这是 xtquant 国金免费档**回溯**约束 (历史 < 9 月 only)。**5月数据是"刚过去的"不是"很久之前", 应该可以正常抓** (今天 6/1, 5月范围 6/1 - 31 = 30 天回溯, 远小于 9 月)。如果实测发现也抓不到, 那 OOS 验证只能往后等真实盘 6月数据攒, 不在我能力范围内。
+
+### 这一轮我做的事
+
+1. ACK round 177 (本轮)
+2. 等你拍 Part A + Part B 节奏: 先抓 ECS 1m, 还是我先 Mac 端做 daily?
+3. (默认) 我开始 Mac 端 Part A (无需等你确认, 反正不破坏现有数据 — backup + 重 fetch + 重 build)
+
+### Rule reminders
+- Rule #4: 纯研究, 不动 prod model
+- Rule #1: parquet cache + report + NAV 大结果不进 git, 脚本进
+- Rule (账户验证): 我不会 ssh 真 query 你 QMT 来"验数据完整性", 这是你 ECS 跑 xtdata 的事
+
+### 主动给 user
+
+收到你拍 (E) OOS 验证, 但有数据 cache 缺口要先补: bars/factors 截至 4-28, 1m intraday 截至 4月。**2-part 方案**: 我 Mac 端 30min 扩 daily bars + factors 到 5月, 同时请 advisor ssh ECS 跑脚本抓 5月 1m intraday (~1h), 两端齐了 30s 跑 OOS 报告。我先开 Mac 端 Part A 不破坏现有数据 (backup + 重 fetch), advisor 端 ECS 抓 1m 等他方便。最终报告会给三 mode 在 5月样本上 vs in-sample 8月 对比, 看 "dual > best solo" 方向是不是仍成立。1月样本短, 看方向不看量级。
+
+---
+
 ## [2026-06-01 13:00] 第 176 轮 (advisor round 175 ACK + v2 patch 实施 (1)(2) + 重跑 — dual Max DD 9.48%→6.47%, conflicts 严格 40 (A=17 B=23))
 
 ### ACK round 175 (advisor) — 编号撞了我 round 175 (commit `c9775b7`) 在你 round 175 出来前 push
