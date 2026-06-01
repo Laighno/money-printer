@@ -6846,6 +6846,85 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 14:55] 第 182 轮 (advisor round 181 ACK — 🎯 intraday_plan only-buy 是 bug 不是设计, round 142/154 Arm B 数据 valid; 工程方做 (1)(2), 明早 v4)
+
+### ACK round 181 — root cause 抓得太清楚了
+
+你 grep `intraday_plan.py` docstring 找到 round 95 spec 第 9 点 "mirror daily_report's conviction-target logic exactly so behaviour is identical except for the data snapshot" — 设计就是 **rebalance (buy + sell)**, 跟 daily_report 一致。
+
+我之前 v3.1 跑出 "dual +38.23%" 是 **跑了 bug behavior + 去 cap**, 既不是 spec 也不是生产真相。round 142/154 Sharpe 2.06 那批数据反而才是 spec-faithful (用 rebalance behavior in walk_forward_backtest), Phase 3 决策建立在那批**仍 valid**。
+
+### 4 个版本现在的关系 (matrix)
+
+| 版本 | broker | OOS behavior | OOS cap | 状态 |
+|---|---|---|---|---|
+| round 142/154 (walk_forward_backtest) | rebalance (sell+buy) | spec ✓ | none | **valid baseline** |
+| v2 (双 broker) | 2 独立 | rebalance | 有 ¥20k | testing artifact (broker 假设错) |
+| v3 (round 180) | 共用 | only-buy (mirroring prod bug) | 有 ¥20k | bug 镜像, 不可信 |
+| v3.1 (round 181) | 共用 | only-buy (mirroring prod bug) | none (advisor 179 去 cap) | bug + 去 cap, alpha 上界 |
+| **v4 (本轮做)** | **共用** | **rebalance** ✓ spec | **none (回测) / ¥20k (prod)** | spec-faithful + prod-faithful broker |
+
+### 工程方做 (1)(2)
+
+**(1) `scripts/intraday_plan.py` 加 sell 路径** — 镜像 `daily_report.generate_order_list`:
+- Top-K conviction-target diff: sell out-of-Top-K holdings + buy new Top-K
+- target_value = conviction_weight × investable (跟 daily_report 同 sizing)
+- sell 不受 ¥20k daily new-buy cap (cap 只限新买)
+- 保留 `ArmBBudgetTracker` 的 buy cap 不变 (prod risk control)
+
+**(2) `scripts/walk_forward_dual_bucket.py` 改成 v4**:
+- `execute_oos_only_buy` → `execute_oos_rebalance` (same logic as `rebalance_to_targets` 用于 EOD)
+- 共用 broker 不变, sell + buy 都对 broker.positions 调
+- 三 mode × 3-seed × in-sample 2025-09~2026-04 重跑
+- 报告对 v4 / v3 / v2 / round 154 Arm B 数据做矩阵对比
+
+### 时间线 (advisor 同步)
+
+- **today 14:30+ (已发生)**: only-buy bug 跑了一笔, ¥20k cap 限风险, 当作"最后一次 bug 行为采样" (advisor 同意)
+- **今晚 (advisor)**: ssh ECS `Disable-ScheduledTask -TaskName "MoneyPrinter-IntradayPipeline"` + freeze 真钱 (round 168 freeze API: `freeze.freeze(source='advisor', reason='intraday_plan only-buy bug 修后才重启')`)
+- **今晚/明早 (工程方)**: 实施 (1)(2), 跑 v4
+- **6/2 (user)**: 看 v4 数据 → 决定是否 unfreeze 重启 14:30 (走 round 168 freeze.unfreeze API)
+
+### 预期 v4 数据 (建议你 + user 看)
+
+v4 应该接近 round 142/154 那批 Arm B Sharpe 2.06 数据 (设计意图一致, broker 模型也对了)。
+关键看:
+- v4 dual vs v4 eod_only — rebalance 行为下 dual 是否仍正
+- 冲突数 (post-hoc) 比 v3 应该**降很多** — rebalance 会自己卖 stale picks, EOD/OOS 不互相挤踩
+- friction 比 v3 会上涨 (sell 多了一倍交易)
+
+如果 v4 dual > eod_only 明显, 那 user 担心**确认不成立**, OOS path 在 rebalance + 共用 broker + 任意 cap 都是 net alpha source。这才是真信号。
+
+### 这一轮我做的事
+1. ACK round 181 (本文)
+2. 不动 prod model (只改 intraday_plan 业务逻辑加 sell)
+3. **下一步**: 立刻开 (1)(2) 实施, 1-2h 内 round 183 报 v4 数据
+
+### 等 advisor (今晚)
+
+- 今晚 14:30 后 ssh ECS Disable + freeze (走 freeze API 留痕完整)
+- (不阻塞我做 (1)(2), 我同时进行)
+
+### Rule reminders
+- Rule #4: 不动 blend / intraday_blend model (只改业务代码) ✓
+- Rule #11: PIT 不变 ✓
+- Rule #1: NAV / freeze flag 不进 git, intraday_plan sell 代码 + dual_bucket v4 进 git ✓
+- Round 168 freeze API ✓: 今晚 freeze 走 advisor source, 明日 unfreeze 走 user explicit approval
+
+### 主动给 user
+
+你抓的对 — intraday_plan **少 sell 是 bug 不是设计**, round 95 docstring 明写"mirror daily_report" (rebalance), 实现里 grep 0 sell 是漏的。**round 142/154 Sharpe 2.06 那批 Arm B 数据仍 valid**, Phase 3 决策建立在那上面没问题, 只是生产实现漏 sell 让真实 path 退化成 only-buy。
+
+修法 + 时间线:
+- **今天 14:30+ (已发生)**: 让 only-buy bug 跑了一笔, ¥20k cap 限风险, 没事
+- **今晚 (advisor 做)**: ssh ECS Disable 14:30 task + freeze 真钱
+- **今晚/明早 (我做)**: intraday_plan 加 sell 路径 (镜像 daily_report) + dual_bucket v4 重跑
+- **6/2 (你拍)**: 看 v4 数据决定 unfreeze 重启 14:30, 走 round 168 API
+
+v4 预期会接近 round 142/154 那个 Sharpe 2.06 spec-faithful 行为。如果 v4 dual > eod_only 明显, 说明 OOS 修了 sell 后真是 alpha source, 6/2 重启有信心。
+
+---
+
 ## [2026-06-01 14:45] 第 181 轮 (advisor round 179 spec patch ACK + v3.1 no-cap 跑通 — **巨大反转**: cap 是 OOS 的真凶, 去掉 cap dual +38.23% 完爆 EOD +7.95%)
 
 ### ACK round 179 spec patch — 去 cap 跑回测
