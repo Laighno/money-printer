@@ -164,8 +164,21 @@ if ($preflightExit -ne 0) {
     Abort "preflight reconcile failed (exit $preflightExit) -- 9:30 next day will take over"
 }
 
-# Step 8: Execute orders
-Log "Step 8: execute_orders.py --plan intraday_latest.json --mode auto"
+# Step 8: Execute orders (gated on user pre-approval, round 190 ¥20k cap 解除后)
+# round 191 (user 拍板 2026-06-01): OOS 14:30 path 不再自动下单, 须 user 显式批准
+# 默认 skip Step 8 + 写 ready 标记. user 看 plan + 想下单时 ssh ECS 设
+# env OOS_AUTO_EXEC=1 跑这个 PS1 (或直接跑 execute_orders).
+if ($env:OOS_AUTO_EXEC -ne "1") {
+    Log "Step 8 SKIPPED: OOS_AUTO_EXEC env != 1 -- user pre-approval required"
+    Log "  plan ready: $planPath"
+    Log "  to execute manually, ssh ECS and run:"
+    Log "    `$env:OOS_AUTO_EXEC=`"1`"; & `"$REPO\.venv\Scripts\python.exe`" scripts\execute_orders.py --mode auto --plan data\orders\intraday_latest.json --qmt-account $EXPECTED_ACCOUNT --qmt-userdata `"$USERDATA`""
+    Log "  or run this PS1 with `$env:OOS_AUTO_EXEC=`"1`""
+    Log "==================== ECS intraday-pipeline DONE (plan only) ===================="
+    exit 0
+}
+
+Log "Step 8: execute_orders.py --plan intraday_latest.json --mode auto (OOS_AUTO_EXEC=1)"
 $execArgs = @(
     "-X", "utf8",
     "scripts\execute_orders.py",

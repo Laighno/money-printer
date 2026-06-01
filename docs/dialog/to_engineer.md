@@ -10357,3 +10357,69 @@ ETA 估算 (你算):
 ### 等明早 6/2 14:30 task 实测
 
 明天 6/2 14:30 是 prod 第一次以无 cap 跑 OOS task. 我届时看 ECS log + intraday orders 实测数据 + ECS 14:28:00 schedule fix 是否避免 deadline-miss (round 185 已修)。
+
+---
+## [2026-06-01 21:30] 第 191 轮 (OOS 14:30 path 加 user pre-approval gate — round 190 无 cap 后的安全闸)
+
+### user round 191 拍板
+
+> "oos 执行前需要我确认"
+
+round 190 我把 ARM_B_BUDGET_MAX_DEFAULT ¥20k → ¥99,999,999 后, OOS 14:30 单次 blast radius 从 ¥20k → ~¥200k (10×). user 立刻意识到需要 user-in-the-loop pre-approval, 不让 ECS 自动 fire.
+
+### 我做的实施
+
+`scripts/ecs_intraday_execute.ps1` Step 8 改成 env-gated:
+- **默认行为**: Step 1-7 跑完 (plan 生成 + verify + preflight reconcile), **Step 8 SKIP** + 写 ready log
+- **OOS_AUTO_EXEC=1 env 才跑 Step 8** (user 显式批准的回路)
+
+Step 1-7 仍然自动跑:
+- Step 1: git pull
+- Step 2: intraday_plan.py 生成 plan
+- Step 3: verify entry_path tag
+- Step 4: verify plan mtime fresh
+- Step 5: verify XtMiniQmt running
+- Step 6: verify portfolio.yaml account
+- Step 7: preflight reconcile (5% tolerance)
+- **Step 8: SKIP (默认), 写 plan 路径 + 提示 user 怎么手动跑**
+
+### user workflow (每天 14:30)
+
+1. ECS task fire 14:28:00 → Step 1-7 跑通 → Step 8 skip, plan 在 `data\orders\intraday_latest.json`
+2. user 看 ECS log 知道 plan ready (advisor 也会监 + push 提示)
+3. user 判断要不要跑:
+   - **要跑**: ssh ECS 设 `$env:OOS_AUTO_EXEC="1"` 跑 PS1, 或直接跑 `execute_orders.py --mode auto`
+   - **不跑**: 什么都不做, plan 自动过期, 9:25 next day reconcile fills gap (round 103 已设)
+
+### 6/2 第一次效果
+
+明早 6/2:
+- 09:25 EOD task: 自动跑 (round 189 已 enable, AutoExecute), 减仓 2 单 (advisor 1bade9e 已 override)
+- 14:30 OOS task: 自动跑 Step 1-7 (plan 生成 + verify), **Step 8 不跑**
+- user 想下 OOS 单时, 看 plan 后 ssh ECS 手动 enable 跑
+
+### 9:25 EOD path 不受影响
+
+`scripts/ecs_auto_execute.ps1` (EOD 9:25 path) 不动. EOD 仍 fully auto.
+**只有 OOS 14:30 加 pre-approval gate**.
+
+### 自我审视: 这跟原 ¥20k cap 是不是变相回到老路?
+
+不一样:
+- 原 ¥20k cap: 自动跑 + 算法级限额 (硬 reject 大单)
+- 新 gate: 自动生成 plan + 不下单, user 审批后才执行 — **量级无限制, 时机受控**
+
+新 gate 给 user 决策权 ("看 plan 后决定"), 算法仍按 v4.2 model 出全量 plan; user 想要小心时 skip 或减量, 想 aggressive 时 full ack.
+
+### Rule reminders
+- Rule #1 ✓: code 进 git
+- Rule #4 ✓: 不动 model
+- Rule #11 ✓: PIT (plan 仍 14:30 决策时点不变)
+- Round 168 ✓: hard-stop 恢复 user 显式批准 (这次 round 191 也满足)
+
+### 等 user (今晚或明早)
+
+如果 6/2 14:30 plan 看起来 OK, user 可以:
+- ssh ECS 设 env + 跑 execute_orders 手动批准
+- 或者拍板 unfreeze 这个 gate (改 default OOS_AUTO_EXEC=1 让它 auto)
+- 第 1 周观察期 user 每天看一次, 第 2 周以后看舒不舒服决定
