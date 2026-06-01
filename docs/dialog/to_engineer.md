@@ -9836,6 +9836,55 @@ D close:  broker.update_prices(close_prices) (单一 mark)
 **预期变化**: dual NAV 大概率不再 +361bps over best solo — 真实架构下 OOS 抢 EOD cash + EOD sell 自动卖 OOS 持仓, **你原本担心的 round-trip 成本吃 alpha 可能反而成立**。但这才是真正的对比, 不是 v2 那种"两份独立钱"的假数据。
 
 
+## [2026-06-01 14:05] 第 179 轮 (round 178 spec 补丁: 回测中去掉 OOS daily ¥20k cap — user 拍, prod guardrail 不污染 alpha-of-model 评估)
+
+### 改动 (在 round 178 v3 spec 上)
+v3 实施时**去掉** `ArmBBudgetTracker daily ¥20k cap`:
+- 那是 **prod risk guardrail** (user round 154 拍小仓 OOS), 跟模型本身 alpha 没关系
+- 回测目的 = 看 model alpha 上限, 不该被 cap 压制
+- 公平比较 EOD vs OOS vs dual: 同 initial_capital + 同 sizing 规则 + 共用 broker, 不要 OOS 被 cap 拉跨
+
+### v3 修正后 spec 完整版
+
+**单一共用 SimulatedBroker** (round 178 不变)
+**Per-mode 行为**:
+| mode | EOD path | OOS path |
+|---|---|---|
+| eod_only | D 09:25 sell out-of-picks + buy 新 picks (target_pos_pct=0.70) | 不跑 |
+| oos_only | 不跑 | D 14:30 buy top-K (按 broker.cash + conviction sizing, **无 daily cap**); **只 buy 不 sell** (intraday_plan 生产模型行为) |
+| dual | 同 eod_only | D 14:30 同 oos_only — 但用共用 broker, 跟 EOD 抢 cash |
+
+**OOS sizing (去掉 cap 之后)**:
+- 跟 EOD 同 conviction-weighted (target = conviction × broker.cash) 或 equal-weight top-K (你选, 建议跟 EOD 同 conviction 保证 apples-to-apples)
+- broker.cash 不够买完 top-K 时, OOS 按 conviction 排序优先, cash 抢光为止
+- OOS 只 buy 不 sell — 单边累积仓位, broker.cash 会慢慢耗光 (这是 oos_only mode 长期 dynamic, 看 NAV 自然反映)
+
+**冲突自然发生**:
+- OOS D 14:30 buy X 进共用 positions
+- D+1 09:25 EOD 看共用 positions, 如果 X 不在 EOD picks → sell X (全部)
+- → 真冲突, NAV 直接损失
+
+### 不变的 (round 178 已写)
+- 单一共用 broker / 共用 cash / 共用 positions
+- 删除合并 cap 单向检查
+- 冲突 post-hoc 从 positions diff 算
+- 三 mode × 3-seed 同 initial_capital apples-to-apples
+- OOS 验证 (round 177) 仍暂停
+
+### 这一轮你
+1. ACK round 179 (round 178 + 179 合起来看)
+2. v3 实施: round 178 全部 + round 179 去 cap; 一次 commit
+3. 跑 + 对比 v2
+
+### 主动给 user
+你说的"去掉 OOS 持仓限制"在 v3 spec 里加上了:
+- 回测里**完全去掉 ¥20k/日 cap** — 那是 prod guardrail 防小仓上线时下行风险, 跟"模型本身 alpha 多少"无关
+- OOS 跟 EOD 同 conviction sizing, 同 broker.cash, 抢光为止
+- 这样三 mode 比较干净: 同 initial_capital + 同 sizing 规则 + 同 broker — 公平 apples-to-apples 看 model alpha
+- OOS 仍只 buy 不 sell (intraday_plan 真实行为) — OOS 会单边累积持仓, 慢慢吃光 cash; oos_only mode 后期 cash 耗光后会"无新买" 退化, 这是真实 dynamic 让 NAV 反映
+- prod 上线时 cap 仍在 (¥20k 那条没动) — 这只改回测脚本不动 prod
+
+
 
 
 
