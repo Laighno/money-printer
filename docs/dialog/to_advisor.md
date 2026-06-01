@@ -6846,6 +6846,110 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 20:30] 第 189 轮 (round 188 ACK + v4.2 cutoff train + true OOS 跑通 — **大幅缩水但 dual 仍正**: v4.1 +¥139k → v4.2 +¥12k, user 抓 look-ahead 完全成立)
+
+### user round 188 抓 look-ahead 完全成立 ✓
+
+亲核确认:
+- 5/30 prod blend train --start 20200101, **无 --end** → 训过 2025-09~2026-04 整个测试窗
+- v4.1 dual +100.49% 是模型"已经见过 future" 的 cherry-pick, 不是真 OOS alpha
+- → v4/v4.1 数据**不能用来做真盘决策**
+
+### v4.2 实施
+
+**(1) `scripts/train_blend_cutoff.py` (新)** — EOD cutoff training:
+- 用 `data/wf_cache/factors_label_next_open_to_close.parquet` 直接 train (skip slow build_dataset)
+- 加 cross-sectional excess_ret (cache 里 excess_ret 全 NaN)
+- Monkey-patch `BlendRanker._filter_extremes` 补 `.reset_index(drop=True)` (pandas group_keys=False 仍 leak date 到 index)
+- output: `data/blend_cutoff20250831_(primary|extreme).lgb`
+- 跑 27.5s ✓ primary IC=0.106, extreme IC=0.138
+
+**(2) `/tmp/train_oos_cutoff.py` (临时一次性)** — OOS cutoff training:
+- 用同 cache + `compute_extras_for_panel` (EOD-proxy 4 INTRADAY_EXTRA_COLUMNS)
+- cutoff=2025-08-31 全部 training window 没真 1m bars (xtquant 回溯硬约束), 全 EOD-proxy 路径
+- output: `data/intraday_blend_cutoff20250831_(primary|extreme).lgb`
+- 跑 1.4min ✓ primary IC=0.084, extreme IC=0.119
+
+**(3) walk_forward_dual_bucket.py 加 `--eod-model-prefix` / `--oos-model-prefix` CLI args** — 让 backtest 可指定任意训好的 model
+
+### v4.2 in-sample 2025-09~2026-04 结果 (true OOS)
+
+| Mode | NAV | Ret | Max DD | Friction (¥) | Conflicts (A+B) |
+|---|---:|---:|---:|---:|---:|
+| eod_only | ¥226,608 | +13.30% | 4.89% | ¥8,179 | 0 (A=0/B=0) |
+| oos_only | ¥202,433 | +1.22% | 6.01% | ¥8,212 | 0 (A=0/B=0) |
+| **dual** | **¥238,724** | **+19.36%** | **7.50%** | **¥41,100** | **1,111 (A=937 / B=174)** |
+
+**Net alpha delta**:
+- `dual − max(EOD, OOS)` = **+¥12,116 (+606bps capital)** ← 仍正, 但比 v4.1 +¥139k **缩水 91%**
+- `dual − (EOD + OOS) / 2` = **+¥24,204**
+
+### v4 / v4.1 / v4.2 完整对比 — look-ahead 假象量化
+
+| | EOD | OOS | DUAL | DUAL−MAX(solo) |
+|---|---:|---:|---:|---:|
+| v4 (look-ahead, no T+1) | +7.95% | +30.66% | +69.90% | +¥78,497 |
+| v4.1 (look-ahead, T+1) | +7.95% | +30.66% | +100.49% | +¥139,657 |
+| **v4.2 (cutoff, true OOS)** | **+13.30%** | **+1.22%** | **+19.36%** | **+¥12,116** |
+
+**关键发现 (4 个)**:
+
+1. **OOS-only 单跑 +1.22% (vs v4.1 +30.66%)** — OOS 模型在真 OOS 上几乎赚不到, EOD-proxy training (全 2020~2025-08 没真 1m) 是天花板
+2. **dual NAV 缩水 76%** (v4.1 +100.49% → v4.2 +19.36%) — 大部分 dual alpha 来自 model 见过 future labels
+3. **dual − max(solo) 缩水 91%** (+¥139k → +¥12k) — 但**仍正**, dual 仍超过 best solo +606bps
+4. **EOD-only +13.30% (vs v4.1 +7.95%)** — eod_only 升而非降, 因 cutoff model 在 2025-09~2026-04 是 true OOS test 但模型架构本身保留 alpha
+
+### 解读 — user worry 在 true OOS 下答案?
+
+**"OOS 拖 EOD" 担心**: dual (+19.36%) > eod_only (+13.30%) + ¥6,300 alpha 净加, 所以 **dual 真盘可能有 alpha**, 不是 net drag. 但量级远小于 in-sample 想象 (¥12k vs ¥139k).
+
+但有一个角度更担心: **OOS-only 单跑只 +1.22%**, 模型在真 OOS 上单独表现弱. dual 那个 +¥12k alpha 主要来自 EOD/OOS 之间的协同 (互不踩 / 多样化), 不是 OOS 模型本身的强 alpha.
+
+### 这一轮我做的事
+1. round 188 ACK (本文)
+2. `scripts/train_blend_cutoff.py` 新, 用 wf_cache 快速 train + cross-section excess_ret
+3. `/tmp/train_oos_cutoff.py` (临时, 不入 git) train OOS cutoff
+4. walk_forward_dual_bucket.py `--eod/oos-model-prefix` args
+5. 跑 v4.2 真 OOS 三 mode
+6. 报告 v4 / v4.1 / v4.2 三版本完整对比
+7. round 189 (本文)
+
+### 等 advisor + user 拍下一步
+
+3 个候选:
+- **(N1)** 实施 P4 真盘 cap 节奏 (基于 v4.2 数据, 不是 v4.1)
+   - v4.2 dual − max +¥12k = +606bps capital × ¥20k cap = 真盘期望 ¥120 / 月 (small)
+   - 建议 cap 仍守 ¥20k 1-2 周看真盘 fill, 不急放宽
+- **(N2)** 重训 OOS 模型 with **真 hybrid intraday** (2025-09 之后用真 1m, 之前 EOD-proxy)
+   - 这是 prod intraday_blend 5/27 的 training 方式 (--hybrid)
+   - 用 cutoff = 2025-08-31 + hybrid 重训, 看 OOS-only +1.22% 是否上升
+   - 如果上升明显 → confirm OOS model 在真 1m 数据上有 edge
+- **(N3)** OOS sample 验证 (round 184 spec, 2025-05~08 窗) — 需 advisor ECS 抓 1m 数据
+   - 但 9-月回溯硬约束 vs 13-16 月前数据, 大概率卡
+
+倾向 (N1) 真盘观察期 + (N2) 重训正式 cutoff OOS model. (N3) 数据约束硬, 先放着.
+
+### Rule reminders
+- Rule #4: 不动 prod model ✓ (新 cutoff model 独立路径)
+- Rule #11: PIT — train ≤ 2025-08-31, test ≥ 2025-09-01 ✓
+- Rule #1: cutoff `.lgb` 不进 git, scripts 进 ✓
+- Round 168 freeze: 不动 ✓
+
+### 主动给 user
+
+你 round 188 抓的 look-ahead bias 完全成立 — 工程方按 v4.2 spec 训了 cutoff=2025-08-31 model + 跑真 OOS test 2025-09~2026-04:
+
+**关键数字**:
+- v4.1 dual +100% (look-ahead) → **v4.2 dual +19.36%** (真 OOS) — **76% 是假象**
+- v4.1 dual − max(solo) +¥139k → **v4.2 +¥12k** — **91% 是假象**
+- v4.2 dual 仍超 EOD-only +6pp, **dual 协同效应仍存在但小很多**
+
+实操含义: 你 worry "OOS 拖 EOD" 在 true OOS 下 **没成立**, dual 是 net positive (+¥12k), 但量级比之前想象的小 (不是 +¥139k 暴利, 是 +¥12k 微利). 真盘 ¥20k cap 下期望边际 ~¥120/月 量级。
+
+下一步建议: 真盘观察期 1-2 周不动 cap, 平行重训 OOS model with --hybrid (2025-09 之后真 1m, 之前 EOD-proxy) 看 OOS 模型在真 1m 上的真 alpha 有没有显著提升, 再决定 cap 节奏。
+
+---
+
 ## [2026-06-01 15:40] 第 187 轮 (round 186 ACK + T+1 broker fix + v4.1 跑通 — **意外反转**: dual +100.49% UP, Max DD DOWN, conflicts DOWN, user worry **仍不成立**)
 
 ### user round 186 抓的 T+1 锁仓 backtest 缺失 — 完全成立 ✓

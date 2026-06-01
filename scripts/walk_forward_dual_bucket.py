@@ -921,6 +921,13 @@ def main() -> int:
                     help="comma-separated subset of {eod_only, oos_only, dual}")
     ap.add_argument("--merged-hard-max-pct", type=float, default=MERGED_HARD_MAX_PCT_DEFAULT,
                     help="round 176: per-code combined EOD+OOS cap (dual mode only)")
+    ap.add_argument("--eod-model-prefix", default="data/blend",
+                    help="round 189 (advisor 188 spec): EOD model glob prefix. "
+                         "For look-ahead-free true OOS, use a cutoff-trained model "
+                         "like 'data/blend_cutoff20250831'.")
+    ap.add_argument("--oos-model-prefix", default="data/intraday_blend",
+                    help="round 189: OOS model glob prefix. For true OOS, "
+                         "use cutoff-trained 'data/intraday_blend_cutoff20250831'.")
     ap.add_argument("--smoke", action="store_true",
                     help="single seed × 1 month — fast sanity check")
     args = ap.parse_args()
@@ -952,18 +959,22 @@ def main() -> int:
     trading_dates = sorted(bars["date"].unique())
     logger.info("Window: {} → {}, {} trading dates", args.start, args.end, len(trading_dates))
 
-    # ─── Load both rankers ───
+    # ─── Load both rankers (round 189 supports cutoff models) ───
     eod_ranker = BlendRanker(feature_cols=list(FACTOR_COLUMNS))
-    if not eod_ranker.load("data/blend"):
-        logger.error("Failed to load EOD BlendRanker from data/blend_*.lgb")
+    if not eod_ranker.load(args.eod_model_prefix):
+        logger.error("Failed to load EOD BlendRanker from {}_*.lgb",
+                     args.eod_model_prefix)
         return 1
-    logger.info("EOD ranker loaded: feature_cols={}", len(eod_ranker.feature_cols))
+    logger.info("EOD ranker loaded from {}: feature_cols={}",
+               args.eod_model_prefix, len(eod_ranker.feature_cols))
 
     oos_ranker = BlendRanker(feature_cols=list(INTRADAY_FEATURE_COLS))
-    if not oos_ranker.load("data/intraday_blend"):
-        logger.error("Failed to load OOS BlendRanker from data/intraday_blend_*.lgb")
+    if not oos_ranker.load(args.oos_model_prefix):
+        logger.error("Failed to load OOS BlendRanker from {}_*.lgb",
+                     args.oos_model_prefix)
         return 1
-    logger.info("OOS ranker loaded: feature_cols={}", len(oos_ranker.feature_cols))
+    logger.info("OOS ranker loaded from {}: feature_cols={}",
+               args.oos_model_prefix, len(oos_ranker.feature_cols))
 
     # ─── Run all (mode × seed) combos ───
     all_results: List[BacktestResult] = []
