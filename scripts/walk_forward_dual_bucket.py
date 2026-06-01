@@ -283,60 +283,51 @@ def rebalance_to_targets(broker: SimulatedBroker, top_picks: pd.DataFrame,
     return pick_codes
 
 
-def execute_oos_only_buy(broker: SimulatedBroker, tracker: ArmBBudgetTracker,
+def execute_oos_only_buy(broker: SimulatedBroker,
                           oos_picks: pd.DataFrame,
                           prices: Dict[str, float],
                           adv_lookup: Dict[str, float],
-                          sim_date: str) -> Tuple[List[str], List[dict]]:
-    """round 180 (advisor 178 spec, v3 production-faithful):
+                          sim_date: str,
+                          target_pos_pct: float = 0.70) -> Tuple[List[str], List[dict]]:
+    """round 181 (advisor round 179 spec patch, v3.1 no-cap):
+
     OOS bucket = strictly **only buy, never sell**. Production
     ``intraday_plan`` has no sell logic (grep ``def.*sell`` = 0 lines).
 
     Cash comes from the SHARED broker pool (single QMT account model).
-    Daily new-buy cap enforced by ``ArmBBudgetTracker`` (¥20k default).
-    When ``broker.cash`` is short — because EOD path already spent it
-    on its own picks at 09:25 — ``broker.buy`` returns None and the
-    pick is skipped. This is the production behavior the user worried
-    about: OOS competes for cash with EOD on the SAME account.
+    **No ¥20k daily cap in backtest** (advisor 179: that's a prod risk
+    guardrail, not part of model-alpha evaluation). OOS picks size each
+    name as ``broker.cash × target_pos_pct / K`` (equal-weight on
+    available cash, matching EOD's sizing for apples-to-apples
+    comparison).
 
-    No merged-cap check (production has none). No sells (production has none).
+    When ``broker.cash`` is short — because EOD path already spent
+    it on its own picks at 09:25 — ``broker.buy()`` auto-truncates
+    or returns None. This is the production behavior the user worried
+    about: OOS competes for cash with EOD on the SAME account.
     """
     skipped: List[dict] = []
     if oos_picks.empty:
         return [], skipped
 
     pick_codes = [str(c).zfill(6) for c in oos_picks["code"].tolist()]
-    per_name = OOS_DAILY_BUDGET / max(1, len(pick_codes))
+    # round 181 sizing: equal-weight on currently-available cash × target_pos_pct
+    # (matches EOD rebalance_to_targets formula)
+    investable = broker.cash * target_pos_pct
+    per_name = investable / max(1, len(pick_codes))
 
     for code in pick_codes:
         price = prices.get(code)
         if price is None or price <= 0 or pd.isna(price):
             skipped.append({"code": code, "reason": "no_price_or_nan"})
             continue
-        from mp.account.broker import LOT_SIZE
-        shares_target = int(per_name / price / LOT_SIZE) * LOT_SIZE
-        if shares_target <= 0:
-            skipped.append({"code": code, "reason": "below_lot_size"})
-            continue
-        ok, msg = tracker.check_buy(code, shares_target, price)
-        if not ok:
-            skipped.append({"code": code, "reason": msg})
-            continue
         adv = adv_lookup.get(code)
-        # broker.buy enforces broker.cash availability — when EOD spent
-        # most cash at 09:25, OOS gets fewer shares or skipped entirely.
-        trade = broker.buy(code, price, shares=shares_target, date=sim_date, adv=adv, action="BUY_OOS")
+        # broker.buy with target_value auto-truncates when cash short
+        trade = broker.buy(code, price, target_value=per_name,
+                           date=sim_date, adv=adv, action="BUY_OOS")
         if trade is None:
-            skipped.append({"code": code, "reason": "insufficient_cash_or_broker_refused"})
+            skipped.append({"code": code, "reason": "insufficient_cash_or_below_lot"})
             continue
-        # Commit only what actually filled
-        filled_shares = trade["shares"]
-        filled_price = trade["price"]
-        try:
-            tracker.commit_buy(code, filled_shares, filled_price, order_id=f"sim_{sim_date}_{code}")
-        except Exception as e:
-            logger.warning("tracker.commit_buy failed: {}", e)
-            skipped.append({"code": code, "reason": f"commit_failed: {e}"})
 
     # Return only codes that successfully bought (filtered against skipped)
     skipped_codes = {s["code"] for s in skipped}
@@ -482,9 +473,10 @@ def run_seed(seed: int, mode: str,
     np.random.seed(seed)
     fees = FeeSchedule()
 
-    # v3: single shared broker for ALL modes (apples-to-apples capital)
+    # v3.1: single shared broker for ALL modes (apples-to-apples capital).
+    # round 181: no daily cap (advisor 179 patch — prod guardrail removed
+    # from backtest so model alpha isn't compressed).
     broker = SimulatedBroker(initial_capital=initial_capital, fees=fees, silent=True)
-    oos_tracker = make_in_memory_tracker(OOS_DAILY_BUDGET, "init")
 
     enable_eod = mode in ("eod_only", "dual")
     enable_oos = mode in ("oos_only", "dual")
@@ -519,7 +511,6 @@ def run_seed(seed: int, mode: str,
         oos_picks_executed: List[str] = []
         oos_skipped: List[dict] = []
         if enable_oos:
-            reset_tracker_for_day(oos_tracker, sim_date_str)
             oos_panel = make_oos_panel_for(factors, bars, morning_bars, D)
             oos_scores = score_panel(oos_ranker, oos_panel)
             if not oos_scores.empty:
@@ -535,9 +526,9 @@ def run_seed(seed: int, mode: str,
                                   price_map=oos_prices, cap_price=50.0,
                                   adv_lookup={c: adv_today.get(c, 0.0) for c in oos_scores["code"]},
                                   adv_floor=100_000_000.0)
-                # v3: only-buy, shared broker
+                # v3.1: only-buy, shared broker, NO cap
                 oos_picks_executed, oos_skipped = execute_oos_only_buy(
-                    broker, oos_tracker, top, oos_prices, adv_today, sim_date_str,
+                    broker, top, oos_prices, adv_today, sim_date_str,
                 )
 
         # ─── 3. Mark-to-market at D close ───

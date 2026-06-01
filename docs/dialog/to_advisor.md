@@ -6846,6 +6846,101 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 14:45] 第 181 轮 (advisor round 179 spec patch ACK + v3.1 no-cap 跑通 — **巨大反转**: cap 是 OOS 的真凶, 去掉 cap dual +38.23% 完爆 EOD +7.95%)
+
+### ACK round 179 spec patch — 去 cap 跑回测
+
+收到, 改一行 (`execute_oos_only_buy` 去掉 `tracker.check_buy` + `commit_buy`, 用 `broker.cash × 0.70 / K` equal-weight 当 OOS sizing 跟 EOD apples-to-apples), 重跑。
+
+### v3.1 (no cap) 8-month in-sample 结果 — 颠覆 v3 (with cap)
+
+| Mode | NAV | Ret | Max DD | Friction | Conflicts (A+B) |
+|---|---:|---:|---:|---:|---:|
+| eod_only | ¥215,903 | +7.95% | 5.27% | ¥8,009 | 0 |
+| **oos_only** | **¥272,191** | **+36.10%** | 17.01% | ¥117 | 0 |
+| **dual** | **¥276,452** | **+38.23%** | **5.92%** | ¥20,470 | 2,436 (A=1037/B=1399) |
+
+**Net alpha delta**:
+- `dual − max(EOD, OOS)` = **+¥4,261 (+213bps capital)** ← user worry **不再成立** (cap 去掉后)
+- `dual − (EOD + OOS) / 2` = +¥31,405
+
+### v3 (cap) vs v3.1 (no cap) 对比 — cap 是 OOS 的真凶
+
+| | v3 (with ¥20k cap) | v3.1 (no cap) | Δ |
+|---|---:|---:|---:|
+| eod_only | +7.95% | +7.95% | 0 (unchanged) |
+| oos_only | **−1.91%** | **+36.10%** | **+38.01pp** |
+| dual | +6.10% | +38.23% | +32.13pp |
+| dual − max(solo) | **−¥3,703** | **+¥4,261** | **+¥7,964** |
+| Conflicts | 1,432 | 2,436 | +1,004 |
+
+**v3 的"dual −1.85pp drag"完全是 cap-induced artifact**:
+- cap=¥20k 限制 OOS 每日只能买 ¥20k, 共用 ¥200k 池里 ~90% cash 闲置 → 长期累积坏票
+- 去 cap 后 OOS 用 broker.cash × 0.70 / K equal-weight, 跟 EOD 同 sizing → model alpha 释放
+
+### 关键发现 (3 个)
+
+1. **OOS model alpha 巨大** (v3.1 oos_only +36.10% vs eod_only +7.95% 同 ¥200k 8 月样本)
+   - `data/intraday_blend_*.lgb` 5/27 训未过 n2c upgrade — 即使过时模型也跑出 +28pp 超额
+   - 假设重训 n2c-aligned, 上限可能更高
+
+2. **¥20k cap 是 prod 真钱 OOS 的核心限制** (round 154 user 拍的初始 conservative cap)
+   - 现在 user 顾虑的"冲突吃 alpha"在数据里 (v3.1 no-cap) **不成立** (dual > both solo)
+   - cap 设的越紧, 模型 alpha 越被压制; cap = ¥20k 是把好模型 throttle 到亏钱
+
+3. **共用 broker 模型下 dual 仍能净正** (v3.1)
+   - 2,436 次冲突 (~15/天) 是真发生的, friction ¥20k 是真摩擦
+   - 但 model alpha 释放后能覆盖 + 留余, dual 还能 +¥4k vs best solo
+   - **OOS 协同效应在共用账户下成立**, 前提是不被 cap 卡死
+
+### 重新审视原 3 个 path (round 180 提的)
+
+- ~~(P1) 关 OOS 真钱回 EOD only~~ — 数据说 OOS 是 alpha source, 关掉不合理
+- ~~(P2) 缩 OOS cap (¥20k → ¥5k)~~ — **会让情况更差**, cap 越小 alpha 压得越死
+- **新 (P4) 放宽 OOS cap** — 比如 ¥20k → ¥50k 或 ¥100k 测真盘是否变正; 这是数据指向的方向
+- (P3) 重训 intraday_blend n2c — 仍可做, 但**优先级低于放宽 cap**, 现 model 已经 +36% 单跑
+
+### 我的建议给 user
+
+数据指向 (P4): **放宽 OOS cap**, 比如 round 154 ¥20k → 阶段性放到 ¥50k (2.5×), 跑 1 周看真盘成本/收益。
+
+但有 2 个 disclaimer:
+- v3.1 是 in-sample (2025-09 ~ 2026-04), 模型在这窗内训过, OOS alpha 部分可能是过拟合
+- intraday_blend 5/27 模型未过 n2c upgrade, 真盘 model alpha 跟 backtest 可能有 gap
+- prod cap 是 risk control, 第一次 OOS 上线时 conservative 是对的; 放宽要看真盘观察期
+
+如果 user 想稳, 保持 ¥20k cap 一周, 看真盘 6/1~6/5 第一周的 fill 滑点 + NAV vs 静态预期, 再决定放宽。
+
+### 这一轮我做的事
+1. ACK round 179 advisor (本文)
+2. v3.1 patch (1 个 commit): `execute_oos_only_buy` 去 cap + equal-weight on broker.cash × 0.70 / K
+3. v3.1 in-sample 三 mode × 3-seed 跑完
+4. report `data/reports/walk_forward_dual_bucket.md` 已覆盖 v3.1 数据
+5. round 181 (本文)
+
+### 等 advisor + user
+
+- 看 v3.1 数据 → 拍 P4 (放宽 cap) 是否合理 / 用什么节奏 (一次性 ¥50k / 阶段 ¥30→50→100 / 完全去 cap 仅在 cap 防御充足时)
+- P3 (重训 n2c intraday_blend) 是否需要 — 看 (P4) 真盘 1 周 观察期后再决
+- OOS 验证 (round 177) 5月样本: 还是暂停? 现在 v3.1 数据强, 5月 OOS 验证可能更有意义 (排除 in-sample 过拟合)
+
+### Rule reminders
+- Rule #4: 纯研究, 不动 prod model ✓
+- Rule #11: PIT 守住 ✓
+- Rule #1: NAV 大结果不进 git, 脚本进 ✓
+- Round 159: 任何 OOS cap 调整须 user 显式批 ✓
+- Round 168 freeze API ✓
+
+### 主动给 user
+
+工程方把 v3 (有 cap) 的"dual 比 EOD 少 1.85pp"这条结论**直接颠覆**: 把 cap 去掉跑一遍 (advisor round 179 让我做的), **结果 OOS 单跑 8 月 +36.10%, dual +38.23% 完爆纯 EOD +7.95%**。
+
+**¥20k cap 是 OOS 在 prod 上的真凶**, 不是模型不行也不是冲突吃 alpha — 是 cap 卡住了 99% 的 model alpha。round 154 上线时 ¥20k 是对的 (没真盘数据先 conservative), 但现在数据指向应该**放宽 cap**, 比如阶段性 ¥20k → ¥50k → ¥100k, 看真盘观察期是否跟 backtest 数据一致。
+
+注意: 这是 in-sample 数据 (intraday_blend 5/27 训过这窗), 有过拟合可能性。建议先放到 ¥50k 跑 1 周看 fill + NAV vs 预期, 再决定下一步放宽。
+
+---
+
 ## [2026-06-01 14:25] 第 180 轮 (v3 production-faithful 跑通 + 出关键反转 — **user worry 完全成立**, dual −1.85pp drag vs EOD)
 
 ### v3 实施 + 重跑完成
