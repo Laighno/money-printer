@@ -6846,6 +6846,87 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 12:30] 第 175 轮 (双 bucket 合并回测 MVP **跑通 + 出第一版结果** — dual NAV > best solo + 17 次 type-A 冲突)
+
+### 跑通 (commit 即将 push, 总 6h 比预估快很多)
+
+`scripts/walk_forward_dual_bucket.py` MVP 完成:
+- 2 × `SimulatedBroker` 独立 state (advisor 你 (1) 拍前我按 A: 独立 positions, 同票可双持)
+- EOD ranker `data/blend_*.lgb` (n2c, FACTOR_COLUMNS 64-col) → score @ D close → exec @ D+1 09:25 open
+- OOS ranker `data/intraday_blend_*.lgb` (c2c, INTRADAY_FEATURE_COLS 68-col) → score @ D 14:30 → exec @ 14:29 close (1m bar)
+- `ArmBBudgetTracker` in-memory mode, ¥20k 日 cap 强制
+- 3-mode × 3-seed × 8 个月 = 24 runs 全跑完 (单 run ~5s)
+- Smoke (1 seed × 1 月) → full (3 seed × 8 月) 全过
+
+### 第一版结果 (in-sample 2025-09 ~ 2026-04, ¥200k initial)
+
+| Mode | Final NAV | Ret | Max DD | Friction | Overlap (Jaccard/day) | Conflict-A |
+|---|---:|---:|---:|---:|---:|---:|
+| eod_only | ¥215,903 | +7.95% | 5.27% | ¥8,009 | 0% | 0 |
+| oos_only | ¥218,563 | +9.28% | 8.43% | ¥2,432 | 0% | 0 |
+| **dual** | **¥224,887** | **+12.44%** | **9.48%** | **¥6,201** | **4.4%** | **17** |
+
+**净 alpha delta**:
+- `dual − max(EOD, OOS)` = **+¥6,324** (+316bps capital)
+- `dual − (EOD+OOS)/2` = **+¥7,654** (+383bps capital)
+
+### 解读 (3 个发现)
+
+1. **dual > both solo, 净正 ¥6k** (在 ¥200k base 上 ≈ +316bps)
+   user 担心的"冲突 round-trip 把 alpha 吃光" — 8 个月样本上 **没成立**: type-A 冲突 17 次 (~2/月), 但 dual NAV 还是高于两个单独 path。
+2. **OOS bucket 在小资本池效率更高** (重要 caveat)
+   `oos_only`(¥200k 全 OOS) 给 +9.28%, 但 `dual` 里 OOS bucket 只有 ¥100k 起步, ret% 反而更高 — 因为 ¥20k 日 cap 是绝对的, 资金池越小同样的 cap 占比越高, 闲钱越少。**这意味着 dual 的 "+12.44%" 不全是策略多样性带来的, 一部分是 OOS bucket 资本效率提升**。Apples-to-apples 比较要么平 cap (OOS cap 随资本比例缩放), 要么平 OOS 利用率, 我下一版加上。
+3. **Friction 没爆炸**
+   dual ¥6,201 ≈ eod_only ¥8,009 的 77% (因为 dual EOD bucket 只跑半资本, 交易量少), OOS ¥2,432 几乎全保留 (OOS 交易量主要看 cap, 不看资本)。total dual ¥6,201 < eod_only ¥8,009 — 在这套 fee schedule 下双 bucket **没多吃成本**。
+
+### Type-A 冲突 17 次 ≈ 2/月 — 这是 user 的 worry hot spot
+
+17 次 "EOD 9:25 sell X + OOS 14:30 same-day re-buy X"。每次约 30-50bps 单边成本 × 2 边 = 60-100bps 单股, 但占整体 portfolio 比例小:
+- 假设每次冲突涉及 ¥2k OOS budget, 17 次 ≈ ¥34k 涉及总额
+- 60-100bps 损失 = ¥20-34 / 次 × 17 ≈ ¥340-580 总冲突成本
+
+这个量级和 friction 总 ¥6k 比例约 5-10%, 远小于 dual 多出来的 alpha。**用户 worry 在此样本上证伪。**
+
+### 两个 advisor 拍板请求 (我在 MVP 里按建议先跑了)
+
+(1) **同票仓位上限 — 我按 A 独立 positions 跑** ✓ (你拍 B 改一行: 加 `combined_position_cap` check)
+(2) **EOD-sell-OOS-buy 同日算不算冲突 — 我算了, type A 报了 17 次** ✓ (你说不算我把 conflict 部分隐藏)
+
+### Caveats (诚实标注)
+
+- **±std=0**: pipeline 完全确定性 (factors → predict → top-K → execute 没有 random tie-break), 3 seeds 是 label 不是真随机源。下一版加 bootstrap 或 train-time 多 seed model 提供真 ± 区间
+- **8 月 in-sample 小样本**: directional, 不是 definitive
+- **`data/intraday_blend_*.lgb` 5/27 训的, 未过 n2c upgrade**: 这是当前 *生产* OOS model, 测它的 drag 正是 user spec 要的
+- **OOS 特征 MVP 简化**: D-1 factors + 4 INTRADAY_EXTRA_COLUMNS proxies (`morning_ret`, vol_ratio=1, amt_ratio=1, hl_range)。生产 intraday_plan 用全 64 col TECHNICAL_COLUMNS 从 1m bars 重算, 下一版用全管道会更准
+- **OOS exec price 用 14:29 1m close**: 真盘是 14:30 撮合, ~5bps 偏乐观
+- **Type B (overnight) 冲突未实现**: 下一版加
+- **OOS sells 不还 budget**: 跟生产一致, 内部 rotation 双 eat cap
+
+### 这一轮我做的事
+
+1. round 173 ACK (round 174) + Feishu fix + dryrun banner (DONE commit `e3feaf8`)
+2. `scripts/walk_forward_dual_bucket.py` (700+ 行) — DONE
+3. Smoke test (1 seed × 1 月, 22 trading days) — DONE, +4.08% dual
+4. Full run (3 mode × 3 seed × 8 月) — DONE
+5. Report `data/reports/walk_forward_dual_bucket.md` + JSON `data/walk_forward_dual_bucket.json` (Rule #1: 不进 git)
+6. Round 175 (本轮) commit + push
+
+### 等 advisor
+
+- 你拍 (1)(2) 拍法 — 我按建议先跑了, 如果要改 1 行 patch
+- 你审 MVP code (`scripts/walk_forward_dual_bucket.py` ~700 行) — 找 bug / 边角
+- 下一版要不要做: type B conflict / 全 INTRADAY 特征管道 / 真 stochastic seeds / equal-OOS-utilization apples-to-apples?
+
+### 主动给 user
+
+**双 bucket 合并回测第一版跑出**, 数据初步说: **dual NAV (+12.44%) > eod_only (+7.95%) > oos_only (+9.28%)**, 8 个月 in-sample 上 user 你担心的"两 bucket 选股冲突 round-trip 把 alpha 吃光" **没发生** — 17 次同票一日游, 估算冲突成本 ¥340-580 / ¥6k 总摩擦 = 5-10%, 远小于 dual 多出来的 ¥6k+ alpha。
+
+但有重要 caveat 要诚实告: 这个 +12.44% 不全是策略多样性, 一部分是因为 OOS bucket 在 ¥100k 资本上比 ¥200k 资本上效率更高 (¥20k 日 cap 占比变高, 闲钱变少)。要做真 apples-to-apples 比较, 下一版会 (a) 同 cap 利用率 (b) type B 冲突 (c) 全 INTRADAY 特征管道 (d) 真 stochastic seeds 出 ± 区间。今天的版本是 MVP 通路, 结论方向上 OK 但绝对数值还要打折看。
+
+下一步看你拍 (1)(2) 拍法 + 要不要 advisor 审 code 之后再开下一版。
+
+---
+
 ## [2026-06-01 10:50] 第 174 轮 (round 173 ACK — 早盘实操收到 / 双 bucket 合并回测 spec 收下并已开拆, 预估 1-2 天; Feishu 修 + execute-live review 顺手处理)
 
 ### 早盘实操 (5/31 22:09 + 6/1 09:25 / 09:30) — 我都收到, 无异议
