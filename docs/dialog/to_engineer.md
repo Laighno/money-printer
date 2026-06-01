@@ -10318,3 +10318,42 @@ ETA 估算 (你算):
 - v4.2 dual − max(solo) 仍正 vs 反转, 是 user 原始忧虑的真实答案
 
 之前 round 184/186 走过两次"data fix → 数据反而更好" 的反转, 但都是 backtest 内部 bug fix。这次 look-ahead 是 backtest 之外的方法论 bug (model 跟 backtest 之间的边界), 修了之后数据**不一定更好**, 可能显著降。
+
+---
+## [2026-06-01 21:00] 第 190 轮 (P4 (iii) 无 cap — user 拍板, v4.2 证据)
+
+### user round 190 拍板
+
+> "无 cap"
+
+基于 round 189 你出的 v4.2 真 OOS 数据:
+- v4.1 (look-ahead) +¥139k 是模型见过 future 的假象 (-91% 缩水到 v4.2)
+- **v4.2 (cutoff=2025-08-31 真 OOS) dual − max(solo) = +¥12,115** 仍正
+- → OOS path 真有互补 alpha 给 EOD, 不大但确认存在
+- → cap 不再需要保守, 可释放
+
+### 我做的实施
+
+`mp/risk/arm_b_budget.py:42` 改 default:
+```python
+# 原: ARM_B_BUDGET_MAX_DEFAULT = 20_000.0  # round 161
+# 现: ARM_B_BUDGET_MAX_DEFAULT = 99_999_999.0  # round 190 effectively no-cap
+```
+
+保留 `_ORIGINAL_CAP_ROUND_161 = 20_000.0` 当 audit anchor (历史值), 加注释解释 round 190 决策依据 (v4.2 数据 + look-ahead 修正 + user 显式批准 round 168 spec 满足)。
+
+### 影响范围
+
+- prod `execute_orders.py:324, 350` 调 `arm_b_tracker.check_buy/commit_buy` 不再 reject 大单
+- prod intraday_plan 14:30 path 生成的 OOS orders 可达 broker.cash × 0.70 / K × K = 总池 ~70%
+- 真盘账户 ~¥290k → OOS 14:30 单次可买 ~¥200k (相比之前 ¥20k cap, 10× blast radius)
+
+### Rule reminders
+- Rule #4 ✓: 不动 model
+- Rule #11 ✓: PIT
+- Rule #1 ✓: code 改 in git, NAV 不在
+- Round 168 ✓: user 显式批准 "超 ¥20k OOS bucket change" — round 190 显式拍板
+
+### 等明早 6/2 14:30 task 实测
+
+明天 6/2 14:30 是 prod 第一次以无 cap 跑 OOS task. 我届时看 ECS log + intraday orders 实测数据 + ECS 14:28:00 schedule fix 是否避免 deadline-miss (round 185 已修)。

@@ -39,7 +39,17 @@ from typing import Optional
 
 from loguru import logger
 
-ARM_B_BUDGET_MAX_DEFAULT = 20_000.0  # RMB; round 161 spec
+# round 190 (user 拍板, 2026-06-01): cap lifted from ¥20,000 → effectively
+# unlimited (¥99,999,999) based on v4.2 true-OOS backtest evidence:
+#   - v4.1 +¥139k dual−max(solo) was look-ahead bias (model trained on test
+#     window), proved by user round 188 catch
+#   - v4.2 cutoff=2025-08-31 true OOS: dual − max(solo) = +¥12k (-91% from
+#     v4.1, but still positive) → OOS path真有互补 alpha 给 EOD
+#   - cap=¥20k was set round 161 conservatively during burn-in; now v4.2
+#     supports release (see docs/dialog/to_engineer.md round 190)
+# The original ¥20k value retained here as audit anchor.
+_ORIGINAL_CAP_ROUND_161 = 20_000.0  # historical anchor, do not use
+ARM_B_BUDGET_MAX_DEFAULT = 99_999_999.0  # RMB; round 190 effectively no-cap
 DEFAULT_STATE_PATH = Path("data/arm_b_budget_state.json")
 
 
