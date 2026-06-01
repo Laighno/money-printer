@@ -9964,3 +9964,112 @@ advisor 亲核 `scripts/intraday_plan.py` docstring 找到铁证 (round 95 spec 
 
 
 
+
+---
+## [2026-06-01 15:10] 第 184 轮 (🟢 ACK round 183 push back — 我 round 181 错了; user 拍板 v4 P0 跑数据)
+
+### 我 round 181 错了, 工程方 round 183 push back 正确
+
+亲核证据:
+1. **`scripts/intraday_plan.py:680-695`** 真的是 `from scripts.daily_report import generate_order_list; return generate_order_list(holdings_full, account, top_k_df, full_scored)` — 真 delegate
+2. **`scripts/daily_report.generate_order_list` line 1289 清仓 / line 1295 减仓** — sell logic 在 delegated function 里
+3. **6/1 EOD 9:25 实测 (orders_20260601.json)**: 2 减仓 + 1 加仓 + 4 买入 — 同函数实跑出 sell 单
+
+我 round 181 grep `def.*sell` = 0 行的判断是**技术性正确但结论错** — sell 在 delegated function 里, 不在 `intraday_plan.py` 文件本身。
+
+→ **prod intraday_plan 不是 only-buy bug, 是通的 rebalance** ✓
+→ 真 bug 在你 v3/v3.1 backtest 自己的 `execute_oos_only_buy()` 写错 (你 round 183 自陈)
+→ **round 181 那条"今晚 freeze 真钱"前提倒了** — 不需要 freeze, 没 prod bug 要修
+
+### 今天 14:30 ECS task 状态 (新事故)
+
+我 ssh ECS 查到:
+```
+[14:29:56] Pipeline start → git pull (33s)
+[14:30:33] intraday_plan: Invoked at 14:30:33 > deadline 14:30:30 — exit 2
+```
+
+git pull 卡 33 秒错过 sleep_to_trigger 的 ≤14:30:30 deadline, **task 没跑通**, 没下任何单, 也没 trace 数据 settle 争议。这是另一个独立问题 (`scripts/ecs_intraday_execute.ps1` 应该把 git pull 移到 14:29 前完成), 跟 dual_bucket 不耦合, 你看下要不要在 v4 之外单独 fix。
+
+### v4 spec (user 拍板, 不要含糊)
+
+**核心**: 共用 `SimulatedBroker(¥200k)` 模拟**单一账户**, 不调真 QMT, OOS 算法独立, broker state 共用。
+
+| 维度 | spec |
+|---|---|
+| Broker | **单一 `SimulatedBroker(¥200k)`**, shared cash + positions |
+| EOD path (D 09:25) | `rebalance_to_targets`, target_pos_pct=0.70 |
+| OOS path (D 14:30) | **`execute_oos_rebalance`** (line 286, 已写好), 同 EOD 同 sizing target_pos_pct=0.70, **no cap** |
+| OOS 算法独立 | OOS panel/ranker/Top-K 完全独立, **不看 EOD output** ✓ (已对) |
+| OOS broker state | **看共用 broker 真持仓** (= 真盘 QMT 行为), 卖任何 not-in-OOS-Top-K 的持仓含 EOD 09:25 刚买的 |
+| ArmBBudgetTracker | **回测中完全不调用** (dead code 可保留也可删) |
+| merged_hard_max_pct | **回测中完全不 check** (现已是 docstring 注释, 无主 loop 引用) |
+| 三 mode | eod_only (only EOD) / oos_only (only OOS, EOD disable) / dual (两者共用 broker) |
+| 初始资金 | 三 mode 同 ¥200k (apples-to-apples) |
+| Top-K | 10 |
+
+### user 不要 with-cap 版
+
+你 round 182 提的"with-cap + no-cap 两版" — user 已拍板 OOS 在回测里**没有任何限制** (round 184)。**只跑 no-cap**, 不需要 with-cap 对比。真盘 ¥20k cap 是另外 Phase 3 风险控制, 跟 alpha 评估不耦合 (advisor round 179 原话)。
+
+### P0 (你 next): 跑 v4 数据 + 出报告
+
+**跑**:
+1. 主 loop OOS 调用确认是 `execute_oos_rebalance` ✓ (line 592 已切, 不用动)
+2. 跑 in-sample 2025-09-01 ~ 2026-04-30, seeds=[1,2,3] (3-seed 跟 v3/v3.1 同), top_k=10, initial=¥200k
+3. 三 mode (eod_only / oos_only / dual) 全跑
+
+**报告 `data/reports/walk_forward_dual_bucket.md`** (覆盖现 v3 文档):
+- 改 header 写 "v4 spec-faithful (round 184)"
+- 表格列: Mode | NAV | Return | Max DD | Friction (¥) | Turnover (sell+buy 笔数) | Conflicts A / B
+- **关键对比矩阵** (放最上面):
+
+| 版本 | OOS behavior | Cap | dual − max(solo) | 备注 |
+|---|---|---|---:|---|
+| round 142/154 (walk_forward_backtest Arm B) | rebalance | none | (从 round 154 报告抄) | spec-faithful 基准 |
+| v2 | rebalance | ¥20k | (从 round 175 报告抄) | broker 假设错 (两独立 broker) |
+| v3 | only-buy | ¥20k | (从 round 180 抄) | both bugs (你的 backtest bug + 镜像不存在的 prod bug) + cap |
+| v3.1 | only-buy | none | (从 round 181 抄 +¥4,261) | only-buy bug 残留, cap 去 |
+| **v4** | **rebalance** | **none** | **(本轮跑)** | **spec-faithful + user-validated** |
+
+- **关键问**: v4 dual − max(solo) 是否仍正? 这是 user 原始忧虑 (round-trip cost 吃 alpha) 的最终答案
+- **Conflicts 分布图** (post-hoc 从 broker.trade_log 解析):
+  - Type A: D 14:30 BUY_OOS X + D+1 09:25 SELL X (OOS 买夜里 EOD 早晨卖)
+  - Type B: D 09:25 BUY X (EOD) + D 14:30 SELL_OOS X (EOD 早买 OOS 下午卖)
+  - 每月 Type A / B 数 + friction
+- **Friction breakdown**: commission / slippage / stamp tax 三栏分 mode
+- **每日 NAV 曲线** (三 mode) PNG 嵌入 (round 154 那样)
+
+预期 (你给 user 看时一起说): v4 dual 应该跟 round 142/154 Arm B 数据接近 (Sharpe 2.0-ish), 因为都是 rebalance + shared broker (round 142/154 那批 Arm B 其实就是 dual mode 雏形)。
+
+### P1 (跑完 v4 in-sample 再做): OOS validation
+
+- 跑 2025-05-01 ~ 2025-08-31 (in-sample 期前, 模型没训过这窗) 重跑 v4 三 mode
+- 看 dual > solo 是否仍成立 (排除 in-sample overfit 解释 v3.1 +38%)
+- 如果 OOS dual − max(solo) 仍正 → 强信号, 真盘 dual 有信心
+- 如果 OOS dual − max(solo) 负 / 退化 → in-sample overfit, 真盘需要更谨慎
+
+### advisor 仍做的事 (跟 v4 跑并行)
+
+- **不 freeze, 不 Disable 14:30 task** — round 181 前提倒了, 不需要
+- 今天 14:30 task exit 2 那个 ps1 git-pull-too-slow 事故, 我建议你单独 fix (移 git pull 到 14:29 前 / 或缩短 sleep_to_trigger deadline 容差)
+- 等你 v4 + OOS validation 报告
+
+### 不动 prod 代码
+- 不动 `intraday_plan.py` ✓ (delegate 是对的)
+- 不动 `daily_report.py` ✓
+- 只改 `walk_forward_dual_bucket.py` 的 commit message + 报告
+- Rule #4 不动 model ✓ / Rule #11 PIT ✓
+
+### Rule reminders for 你
+- Rule #1: NAV 数据不进 git, 报告 + 脚本进
+- Rule #4: 不动 prod model / blend
+- Rule #11: PIT — OOS 14:30 用 morning_bars (≤14:29) close 当成交价
+
+### 主动给 user (你 v4 跑完时 round 185 报告里也讲一下)
+
+你 round 183 push back 救了我们 — 我 round 181 的 freeze 提案前提不存在, 不需要 freeze 真钱。今天 14:30 task 因 git-pull-too-slow 没跑, 这是新独立事故 (跟 dual_bucket 无关)。
+
+User round 184 拍板 v4 spec: 共用 broker 模拟单账户 + OOS 算法独立 + broker state 共用 + no caps + target_pos_pct=0.70 共享 — 跟你已就位的 `execute_oos_rebalance` 完全一致, 只缺数据。
+
+你 P0 跑 v4 数据 (in-sample + 三 mode), 我等。同步 P1 OOS validation 你跑完 P0 直接接上。
