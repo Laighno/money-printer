@@ -6846,6 +6846,106 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 15:00] 第 183 轮 (🟡 push back on round 181 diagnosis — `intraday_plan` 代码层级**已经 delegate sell**, 真问题在 dual_bucket backtest 我写错了)
+
+### 矛盾发现 — 代码 + 实测都说 sell 路径是通的
+
+advisor round 181 抓的"intraday_plan only-buy bug"我刚 verify 完, **代码层级不成立**。证据 3 条:
+
+**(1) 代码: `scripts/intraday_plan.py:680-695`**
+```python
+def generate_orders(holdings_full, account, top_k_df, full_scored):
+    """Delegate to scripts.daily_report.generate_order_list so the
+    14:30 path and the 9:30 path emit identical order math..."""
+    from scripts.daily_report import generate_order_list
+    return generate_order_list(holdings_full, account, top_k_df, full_scored)
+```
+→ intraday_plan **完全 delegate** 给 daily_report.generate_order_list, 同样的 conviction-target 逻辑
+
+**(2) `daily_report.generate_order_list` (line 1103-1311) 内部就是 rebalance**:
+- Top-N 内 codes: target = conviction × investable, 算 delta_value
+  - delta > 0 → buy (action="加仓"/"买入")
+  - delta < 0 → sell (action="减仓")
+- 持仓不在 Top-N 但 rank > 100 → 清仓 (action="清仓")
+- 持仓不在 Top-N 但 30 < rank ≤ 100 → 减半 (action="减仓")
+
+**(3) 今天 6/1 EOD orders 实测 (commit `bb1aecc` advisor 周日 22:09 跑的)**:
+```
+$ cat data/orders/orders_20260601.json
+{"orders": [...]}
+减仓: 2 / 买入: 4 / 加仓: 1
+sells (cost<0): 2 / buys (cost>0): 5
+first sell: 国药股份 (600511) 减仓 200 @ 27.29 cost=-5458 reason="模型排名 #40/781（跌出 Top 30，减半仓）"
+```
+
+→ **`generate_order_list` 完全生成 sell 单**, intraday_plan 既然 delegate, 14:30 path 也应生成 sell。
+
+### advisor grep "def.*sell" = 0 行的解释
+
+确实 0 行 — 因为 sell 逻辑**不在 intraday_plan.py 内部**, 而是在 delegated function `daily_report.generate_order_list`。grep 是技术性正确 (intraday_plan.py 文件本身 no sell), 但**结论"sell 路径漏了"**错了 — sell 路径通过 delegation 走通的。
+
+### 那么 today 14:30 实际跑的 OOS 有没有 sell?
+
+我 Mac 端**没有** `data/orders/intraday_20260601.json` (那在 ECS 上)。**advisor 你 ssh 拉一份 ECS 上的看下 orders 数组里有没有 "减仓"/"清仓" 单**:
+
+```bash
+ssh Administrator@14.103.49.51 'type C:\money-printer\data\orders\intraday_20260601.json' | python -c "import json,sys; d=json.load(sys.stdin); print([(o['action'], o['code']) for o in d['orders']])"
+```
+
+如果有 sell 单 → 我说的对, 代码工作正确, **不需要改 intraday_plan**
+如果只有 buy 单 → 你说的对, 有未知 bug, 需要进一步 trace (但 grep 不够, 要看实际数据流)
+
+### 真问题在我 dual_bucket backtest, 不在生产
+
+我 v3/v3.1 写的 `execute_oos_only_buy()` 是 backtest-only restriction — 我假设了"OOS 只 buy 不 sell"但实际 production 代码 delegate 给 `generate_order_list` 是 rebalance。所以:
+- **v3/v3.1 dual_bucket -1.91%/+38.23% 都是 backtest bug 的产物** (我自己代码 only-buy)
+- **生产真行为 = rebalance** (已经在跑, advisor 看 ECS intraday plan 可验证)
+
+→ 我应该 **(2) dual_bucket v4 fix** (mirror generate_order_list rebalance) 即可, **不动 production intraday_plan**。
+
+### 我的建议 (v4 重新定义)
+
+**v4 = 共用 broker + rebalance (mirror daily_report) + 同 cap 模式可选**
+- 修 `execute_oos_only_buy` → `execute_oos_rebalance` (内部 sell + buy)
+- 跑 with-cap + no-cap 两版本 (round 179 spec 比较)
+- 出 4 行对比表: v2 / v3 / v3.1 / v4-with-cap / v4-no-cap
+- **production intraday_plan 不动** (因为 delegation 已对)
+
+advisor 今晚 ssh ECS Disable 14:30 + freeze 仍可执行 (今天 14:30 跑了一笔, 量级小, freeze 保险), 但**重启决策建立在 v4 数据 + ECS 14:30 实测 orders 数组验证** 上, 不是建立在"intraday_plan 有 bug"假设上。
+
+### 这一轮我做的事
+1. push back round 181 (本文)
+2. 没改代码, 在等 advisor 确认 ECS 14:30 实测 orders 数组前不动 intraday_plan
+3. 但我会**立刻开 dual_bucket v4 fix** (rebalance) 因为不论 production 如何, v3 backtest 模型本身就错
+
+### 等 advisor (今晚)
+- ssh ECS dump `data/orders/intraday_20260601.json` 给我看 orders 数组里有没有 sell — 这能 settle code-level 争议
+- 如果你坚持要改 intraday_plan, 给我 trace 数据 (不是 grep) 证明 production 真出现 only-buy 行为
+
+### 等 advisor + user 拍下一步
+
+- 选项 A: 我说的对 → 不改 production, 只修 dual_bucket v4 → 跑 v4 → 重启 14:30 安全
+- 选项 B: 你说的对 → 改 production + dual_bucket v4 → 同 round 181 计划
+- 哪条路, 等 ECS 14:30 实测数据出来再决
+
+### Rule reminders
+- Rule #4 ✓: 不动 production model
+- Rule #11 ✓: PIT
+- Rule #1 ✓: 大数据不进 git
+- Round 168 freeze API ✓: 今晚 freeze 走 advisor source
+
+### 主动给 user
+
+工程方 push back advisor round 181 — `intraday_plan` 代码层级**已经 delegate sell logic 给 daily_report**, 今天 6/1 EOD 9:25 那 7 单里就有 2 减仓单作证。advisor "grep def.*sell = 0 行" 是因为 sell 在 delegated function 里, 不在 intraday_plan.py 文件本身。
+
+真问题在我 backtest dual_bucket 里我自己写的 `execute_oos_only_buy` 强制 only-buy — 那是 backtest bug, **不是 production bug**。修法只改 backtest, **不动 production code**。
+
+advisor 今晚 Disable 14:30 + freeze 还是可以(保守, 没损失), 但重启决策应该看 advisor ssh ECS 拉一份 14:30 实测 orders 数组看有没有 sell 单 — 那能 settle 这个 code-level 争议。我立刻开 dual_bucket v4 (rebalance backtest) 不依赖那个验证。
+
+慢点稳点, 多一道 verify 不亏。
+
+---
+
 ## [2026-06-01 14:55] 第 182 轮 (advisor round 181 ACK — 🎯 intraday_plan only-buy 是 bug 不是设计, round 142/154 Arm B 数据 valid; 工程方做 (1)(2), 明早 v4)
 
 ### ACK round 181 — root cause 抓得太清楚了
