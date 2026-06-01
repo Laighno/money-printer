@@ -6846,6 +6846,97 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 14:25] 第 180 轮 (v3 production-faithful 跑通 + 出关键反转 — **user worry 完全成立**, dual −1.85pp drag vs EOD)
+
+### v3 实施 + 重跑完成
+
+`scripts/walk_forward_dual_bucket.py` v3 已覆盖式重写, 单 commit 在本 round 即将 push:
+
+- 删: 双独立 `SimulatedBroker`, `merged_hard_max_pct` 合并 cap check, `execute_oos_with_budget(eod_broker=...)` 双向参数
+- 改: 单一共用 `broker = SimulatedBroker(initial_capital)` 三 mode 共用
+- 改: `execute_oos_only_buy()` 严格只 buy 不 sell, action="BUY_OOS" 标 (post-hoc 区分)
+- 加: post-hoc 冲突检测从 `broker.trade_log` action 标拆 (run_seed 末尾)
+
+### v3 8-month in-sample 结果 (颠覆性反转)
+
+| Mode | NAV | Ret | Max DD | Friction | Conflicts (A+B) | OOS skips |
+|---|---:|---:|---:|---:|---:|---:|
+| eod_only | ¥215,903 | +7.95% | 5.27% | ¥8,009 | 0 | 0 |
+| **oos_only** | **¥196,170** | **-1.91%** | **21.95%** | ¥120 | 0 | 1439 |
+| **dual** | **¥212,200** | **+6.10%** | 6.13% | ¥10,395 | **1432 (A=608/B=824)** | 646 |
+
+**Net alpha delta**:
+- `dual − max(EOD, OOS)` = **−¥3,703 (−185bps)** ← **user worry 在 v3 下成立!**
+- `dual − (EOD + OOS) / 2` = +¥6,163
+
+### v2 vs v3 对比 — v2 完全是 testing artifact
+
+| 维度 | v2 (testing-isolated) | v3 (production-faithful) |
+|---|---:|---:|
+| Broker | 2 × ¥100k 独立 | 1 × ¥200k 共用 |
+| OOS sells | rebalance | only buy |
+| Merged cap | 8% 拒 | 不存在 |
+| eod_only NAV | ¥215,903 | ¥215,903 (一致, EOD 不变) |
+| oos_only NAV | **¥218,563 (+9.28%)** | **¥196,170 (−1.91%)** |
+| dual NAV | **¥224,887 (+12.44%)** | **¥212,200 (+6.10%)** |
+| dual vs max(solo) | **+¥6,324 (positive)** | **−¥3,703 (negative!)** |
+| Conflicts | 40 | **1,432** (36× higher) |
+
+**v2 的"dual 比 best solo 多 +316bps"完全是双独立 broker 假象**。v3 真实生产模型下:
+- oos_only 实际**亏 1.91%** (8 个月共用账户 only-buy 累积坏票, 22% Max DD) — 单跑 OOS 是亏的
+- dual 比 eod_only **少赚 1.85pp** — OOS 拖 EOD 后腿
+- 1,432 次冲突 (~9/天) 不是冷数字, 是真 round-trip 友损
+
+### 解读 (3 个关键发现)
+
+1. **OOS 单跑 8 月亏钱** — `data/intraday_blend_*.lgb` 5/27 训 (未过 n2c upgrade) 的真实表现, only-buy 累积 + 22% DD; 单独跑 OOS **生产意义为负**, 不是"加上 OOS 也不亏"。
+2. **dual < eod_only 1.85pp** — OOS 在共用 broker 下抢 EOD 的 cash + EOD 又卖掉 OOS 昨买的; 协同效应**不存在**, 反而互相消耗。
+3. **1,432 次冲突** 是 broker.trade_log 后置算的, 不是预先 detect; 这正是 user 原始 worry 的真实量级 — 不是 40, 是 1,432。
+
+### 这一轮我做的事
+
+1. ACK round 178 (commit `e5572aa`)
+2. v3 重写 (单一 broker + OOS only-buy + 后置冲突)
+3. v3 in-sample 三 mode × 3-seed 跑完
+4. report v3 覆盖 `data/reports/walk_forward_dual_bucket.md` (含 v3 caveats)
+5. round 180 (本文)
+
+### 决策点抛给 advisor + user
+
+v3 数据明确说: **当前生产 14:30 OOS 路径在共用账户模型下是 drag, 不是 alpha source**。
+**3 个 path**:
+
+(P1) **关掉 OOS 路径** — 14:30 ScheduledTask 改回 Disabled (round 168 freeze API), 真钱回到 9:25 EOD only。最 conservative。
+
+(P2) **保留 OOS 但限制规模** — 比如 OOS 日 cap 从 ¥20k → ¥5k (1/4), 测 v3 是否变正; 或 OOS 只在 EOD 当日不卖该票时才 buy (跨策略 sanity), 减少 round-trip。
+
+(P3) **重训 intraday_blend (n2c upgrade)** — 当前 model 5/27 训未过 n2c, oos_only −1.91% 部分是 model 过时, 重训后再回测看是否变正。
+
+**建议优先 (P3)**: 在做规模限制 / 关闭决策之前, 先排除"model 过时"这条变量, 因为 6/1 真盘已经在跑 v3-equivalent 架构 (14:30 buy with ¥20k cap), 第一笔 OOS 今天 14:29:29 即将触发。**这是 user 拍板的事**。
+
+等你 + user 拍 P1/P2/P3。**14:30 task 此刻 (15:00 UTC ~ 13:00 GMT) 已开了一段时间, 应该已第一笔, 数据落地后我再独立审。**
+
+### Rule reminders
+- Rule #4: 纯研究, 不动 prod model ✓ (v3 跑回测不动 blend / intraday_blend)
+- Rule #11: PIT 守住 ✓
+- Rule #1: NAV 大结果不进 git, 脚本 + 结论 + commit msg 进 ✓
+- Round 168 freeze API ✓: P1 (关 OOS) 走 ECS `Disable-ScheduledTask` + 真钱可 freeze 也可不 freeze
+- Round 159: 任何 cap 调整须 user 显式批 ✓ (P2 改 cap 走这条)
+
+### 主动给 user
+
+工程方按你 + advisor 拍板把 dual_bucket 改成真生产架构 (单一 QMT 账户 + OOS 只 buy + 删合并 cap) 重跑, **结果跟 v2 完全反转**:
+
+- **dual NAV (+6.10%) 比纯 EOD (+7.95%) 少赚 1.85pp** — 加上 OOS 不仅没赚, 反而吃了 EOD 的 alpha。你原始担心**完全成立**。
+- **OOS 单跑 8 个月亏 1.91%** — only-buy 累积 + 模型 5/27 老版本未过 n2c upgrade。
+- **冲突 1,432 次** (~9/天) 是真 round-trip 频次, 不是 v2 的 40 次 (40 是 testing artifact)。
+
+3 个候选 path: (P1) 关 OOS 真钱回 EOD only / (P2) 缩 OOS cap / (P3) 重训 intraday_blend (n2c upgrade) 再回测。**我倾向 P3**, 因为今天 6/1 14:29:29 第一笔真盘 OOS 即将触发, 在做停 / 改前先排除"model 过时"这条变量。等你拍。
+
+注: 当前真盘 14:30 task 状态我没动 (round 171 user 解 freeze 重启那条不动), 4 道 sanity guard 仍在线, 真钱仍解冻, ArmBBudgetTracker ¥20k 仍强制 — 即使 dual 是 drag, 单笔 blast radius 已封顶 ¥20k/天。
+
+---
+
 ## [2026-06-01 14:10] 第 179 轮 (🔴 ACK round 178 — user 抓得对, v2 偏离生产; OOS 验证暂停, 立刻 v3 重写按真实架构)
 
 ### 收下 user 的核心建模错误指控 — 完全成立

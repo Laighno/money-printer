@@ -135,9 +135,11 @@ def load_intraday_morning_bars(window_start: pd.Timestamp,
         if start_month <= stem <= end_month:
             files.append(p)
     if not files:
-        logger.error("no intraday parquet in {} for [{}, {}]", INTRADAY_DIR,
-                     start_month, end_month)
-        sys.exit(2)
+        logger.warning("no intraday parquet in {} for [{}, {}] — OOS path "
+                       "will see no features and skip all scoring (returns "
+                       "empty dict, downstream OOS picks will be empty).",
+                       INTRADAY_DIR, start_month, end_month)
+        return {}
 
     morning_bars: Dict[Tuple[str, pd.Timestamp], dict] = {}
     for p in files:
@@ -281,97 +283,65 @@ def rebalance_to_targets(broker: SimulatedBroker, top_picks: pd.DataFrame,
     return pick_codes
 
 
-def execute_oos_with_budget(broker: SimulatedBroker, tracker: ArmBBudgetTracker,
-                             oos_picks: pd.DataFrame,
-                             prices: Dict[str, float],
-                             adv_lookup: Dict[str, float],
-                             sim_date: str,
-                             eod_broker: Optional[SimulatedBroker] = None,
-                             merged_hard_max_pct: Optional[float] = None,
-                             ) -> Tuple[List[str], List[dict]]:
-    """OOS bucket: equal-weight rebalance with daily budget cap.
+def execute_oos_only_buy(broker: SimulatedBroker, tracker: ArmBBudgetTracker,
+                          oos_picks: pd.DataFrame,
+                          prices: Dict[str, float],
+                          adv_lookup: Dict[str, float],
+                          sim_date: str) -> Tuple[List[str], List[dict]]:
+    """round 180 (advisor 178 spec, v3 production-faithful):
+    OOS bucket = strictly **only buy, never sell**. Production
+    ``intraday_plan`` has no sell logic (grep ``def.*sell`` = 0 lines).
 
-    round 176 (advisor 175 拍板 (1)): when ``eod_broker`` and
-    ``merged_hard_max_pct`` are passed, refuse OOS buys whose post-buy
-    MERGED position (EOD bucket value + OOS bucket value, expressed
-    as fraction of combined total) would exceed ``merged_hard_max_pct``.
-    Reject the WHOLE order (no partial fill).
+    Cash comes from the SHARED broker pool (single QMT account model).
+    Daily new-buy cap enforced by ``ArmBBudgetTracker`` (¥20k default).
+    When ``broker.cash`` is short — because EOD path already spent it
+    on its own picks at 09:25 — ``broker.buy`` returns None and the
+    pick is skipped. This is the production behavior the user worried
+    about: OOS competes for cash with EOD on the SAME account.
 
-    Returns (executed_picks, skipped_events).
+    No merged-cap check (production has none). No sells (production has none).
     """
     skipped: List[dict] = []
     if oos_picks.empty:
         return [], skipped
 
     pick_codes = [str(c).zfill(6) for c in oos_picks["code"].tolist()]
-    pick_set = set(pick_codes)
-
-    # First: sell exits (releases budget for the day too)
-    for code in list(broker.positions.keys()):
-        if code not in pick_set:
-            price = prices.get(code)
-            if price is None or price <= 0 or pd.isna(price):
-                continue
-            adv = adv_lookup.get(code)
-            trade = broker.sell(code, price, date=sim_date, adv=adv)
-            if trade is not None:
-                # OOS bucket released budget; tracker model is for NEW BUYS only.
-                # Don't credit the tracker for sells (the daily cap is buy-only).
-                pass
-
-    # Then: buy with budget + merged-cap gating
     per_name = OOS_DAILY_BUDGET / max(1, len(pick_codes))
-    # Combined total for merged-cap base (computed once at this 14:30 snapshot)
-    combined_total = broker.total_value
-    if eod_broker is not None:
-        combined_total += eod_broker.total_value
+
     for code in pick_codes:
         price = prices.get(code)
         if price is None or price <= 0 or pd.isna(price):
             skipped.append({"code": code, "reason": "no_price_or_nan"})
             continue
-        # Pre-compute lot shares from per_name budget
         from mp.account.broker import LOT_SIZE
         shares_target = int(per_name / price / LOT_SIZE) * LOT_SIZE
         if shares_target <= 0:
             skipped.append({"code": code, "reason": "below_lot_size"})
             continue
-        # round 176 (advisor 175 (1)): merged-cap check BEFORE tracker.check
-        if eod_broker is not None and merged_hard_max_pct is not None and combined_total > 0:
-            cur_eod_val = (eod_broker.positions[code].market_value
-                           if code in eod_broker.positions else 0.0)
-            cur_oos_val = (broker.positions[code].market_value
-                           if code in broker.positions else 0.0)
-            new_oos_val = cur_oos_val + shares_target * price
-            merged_val = cur_eod_val + new_oos_val
-            merged_pct = merged_val / combined_total
-            if merged_pct > merged_hard_max_pct:
-                skipped.append({
-                    "code": code,
-                    "reason": (f"merged_cap: EOD ¥{cur_eod_val:.0f} + new OOS ¥{new_oos_val:.0f} "
-                               f"= ¥{merged_val:.0f} ({merged_pct*100:.2f}%) > "
-                               f"{merged_hard_max_pct*100:.1f}% of combined total ¥{combined_total:.0f}"),
-                })
-                continue
         ok, msg = tracker.check_buy(code, shares_target, price)
         if not ok:
             skipped.append({"code": code, "reason": msg})
             continue
         adv = adv_lookup.get(code)
-        trade = broker.buy(code, price, shares=shares_target, date=sim_date, adv=adv)
+        # broker.buy enforces broker.cash availability — when EOD spent
+        # most cash at 09:25, OOS gets fewer shares or skipped entirely.
+        trade = broker.buy(code, price, shares=shares_target, date=sim_date, adv=adv, action="BUY_OOS")
         if trade is None:
-            skipped.append({"code": code, "reason": "broker_refused"})
+            skipped.append({"code": code, "reason": "insufficient_cash_or_broker_refused"})
             continue
-        # Commit to tracker only the actually-filled notional
+        # Commit only what actually filled
         filled_shares = trade["shares"]
         filled_price = trade["price"]
         try:
             tracker.commit_buy(code, filled_shares, filled_price, order_id=f"sim_{sim_date}_{code}")
         except Exception as e:
-            logger.warning("tracker.commit_buy failed (race?): {}", e)
+            logger.warning("tracker.commit_buy failed: {}", e)
             skipped.append({"code": code, "reason": f"commit_failed: {e}"})
 
-    return pick_codes, skipped
+    # Return only codes that successfully bought (filtered against skipped)
+    skipped_codes = {s["code"] for s in skipped}
+    executed = [c for c in pick_codes if c not in skipped_codes]
+    return executed, skipped
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -498,23 +468,26 @@ def run_seed(seed: int, mode: str,
              adv_lookup: Dict[Tuple[str, pd.Timestamp], float],
              merged_hard_max_pct: float = MERGED_HARD_MAX_PCT_DEFAULT,
              ) -> BacktestResult:
-    """Run a single seed in mode={eod_only | oos_only | dual}."""
+    """round 180 (v3 production-faithful, advisor 178 spec):
+
+    Single SHARED ``broker`` for all 3 modes. EOD path does full
+    rebalance (sell+buy) at 09:25; OOS path strictly only buys at 14:30
+    (production ``intraday_plan`` has 0 sell logic). Both compete for
+    the SAME cash pool — that's the real user-facing model.
+
+    No merged-cap check (production has none). Conflicts detected
+    post-hoc from ``broker.trade_log`` (OOS buy D → EOD sell D+1 = real
+    round-trip with cost).
+    """
     np.random.seed(seed)
     fees = FeeSchedule()
 
-    if mode == "eod_only":
-        eod_broker = SimulatedBroker(initial_capital=initial_capital, fees=fees, silent=True)
-        oos_broker = None
-        oos_tracker = None
-    elif mode == "oos_only":
-        eod_broker = None
-        oos_broker = SimulatedBroker(initial_capital=initial_capital, fees=fees, silent=True)
-        oos_tracker = make_in_memory_tracker(OOS_DAILY_BUDGET, "init")
-    else:  # dual
-        half = initial_capital / 2
-        eod_broker = SimulatedBroker(initial_capital=half, fees=fees, silent=True)
-        oos_broker = SimulatedBroker(initial_capital=half, fees=fees, silent=True)
-        oos_tracker = make_in_memory_tracker(OOS_DAILY_BUDGET, "init")
+    # v3: single shared broker for ALL modes (apples-to-apples capital)
+    broker = SimulatedBroker(initial_capital=initial_capital, fees=fees, silent=True)
+    oos_tracker = make_in_memory_tracker(OOS_DAILY_BUDGET, "init")
+
+    enable_eod = mode in ("eod_only", "dual")
+    enable_oos = mode in ("oos_only", "dual")
 
     result = BacktestResult(seed=seed, mode=mode)
     eod_plan_for_tomorrow: Optional[pd.DataFrame] = None
@@ -534,121 +507,130 @@ def run_seed(seed: int, mode: str,
                 close_prices[code] = float(row["close"])
         adv_today = {code: adv_lookup.get((code, D), 0.0) for code in close_prices}
 
-        # ─── 1. EOD execute yesterday's plan on today's open ───
+        # ─── 1. EOD execute yesterday's plan on today's open (shared broker) ───
         eod_picks_executed: List[str] = []
-        if eod_broker is not None and eod_plan_for_tomorrow is not None and not eod_plan_for_tomorrow.empty:
+        if enable_eod and eod_plan_for_tomorrow is not None and not eod_plan_for_tomorrow.empty:
             eod_picks_executed = rebalance_to_targets(
-                eod_broker, eod_plan_for_tomorrow, open_prices,
+                broker, eod_plan_for_tomorrow, open_prices,
                 adv_today, sim_date_str, target_pos_pct=0.70,
             )
 
-        # ─── 2. OOS score + execute at 14:30 ───
+        # ─── 2. OOS score + only-buy at 14:30 (shared broker, fights for cash) ───
         oos_picks_executed: List[str] = []
         oos_skipped: List[dict] = []
-        if oos_broker is not None:
+        if enable_oos:
             reset_tracker_for_day(oos_tracker, sim_date_str)
             oos_panel = make_oos_panel_for(factors, bars, morning_bars, D)
             oos_scores = score_panel(oos_ranker, oos_panel)
             if not oos_scores.empty:
-                # OOS uses 14:29 close ≈ close as proxy execution price
                 oos_prices = {}
                 for code in oos_scores["code"].values:
                     mb = morning_bars.get((code, D))
                     if mb is not None:
                         oos_prices[code] = mb["close"]
                     else:
-                        # Fall back to today's daily close
                         if code in close_prices:
                             oos_prices[code] = close_prices[code]
-                # Apply OOS filters (ADV >= 1亿, price <= 50)
                 top = top_k_picks(oos_scores, k=top_k,
                                   price_map=oos_prices, cap_price=50.0,
                                   adv_lookup={c: adv_today.get(c, 0.0) for c in oos_scores["code"]},
                                   adv_floor=100_000_000.0)
-                oos_picks_executed, oos_skipped = execute_oos_with_budget(
-                    oos_broker, oos_tracker, top, oos_prices, adv_today, sim_date_str,
-                    eod_broker=eod_broker if mode == "dual" else None,
-                    merged_hard_max_pct=merged_hard_max_pct if mode == "dual" else None,
+                # v3: only-buy, shared broker
+                oos_picks_executed, oos_skipped = execute_oos_only_buy(
+                    broker, oos_tracker, top, oos_prices, adv_today, sim_date_str,
                 )
 
         # ─── 3. Mark-to-market at D close ───
-        if eod_broker is not None:
-            eod_broker.update_prices(close_prices)
-        if oos_broker is not None:
-            oos_broker.update_prices(close_prices)
+        broker.update_prices(close_prices)
+        nav = broker.total_value
 
-        eod_nav = eod_broker.total_value if eod_broker is not None else 0.0
-        oos_nav = oos_broker.total_value if oos_broker is not None else 0.0
+        # v3: single broker, so eod_nav / oos_nav / dual_nav are all the same
+        # number per mode. We keep all three columns to maintain output schema
+        # backward compatibility (consumers indexed by mode).
         nav_row = {
             "date": sim_date_str,
-            "eod_nav": eod_nav,
-            "oos_nav": oos_nav,
-            "dual_nav": eod_nav + oos_nav,
+            "eod_nav": nav if mode == "eod_only" else 0.0,
+            "oos_nav": nav if mode == "oos_only" else 0.0,
+            "dual_nav": nav if mode == "dual" else 0.0,
+            "nav": nav,  # canonical (v3)
         }
         result.nav_records.append(nav_row)
 
         # ─── 4. Generate EOD plan for D+1 ───
-        if eod_broker is not None:
+        if enable_eod:
             eod_panel = make_eod_panel_for(factors, D)
             eod_scores = score_panel(eod_ranker, eod_panel)
             if not eod_scores.empty:
-                # EOD path: no price cap, no ADV floor
                 eod_plan_for_tomorrow = top_k_picks(eod_scores, k=top_k)
             else:
                 eod_plan_for_tomorrow = pd.DataFrame()
 
-        # ─── 5. Picks log + conflict detection ───
+        # ─── 5. Picks log (post-hoc conflict detection done in summarize) ───
         picks_row = {
             "date": sim_date_str,
             "eod_picks_executed_today_open": list(eod_picks_executed),
             "oos_picks_executed_today_1430": list(oos_picks_executed),
             "eod_plan_for_tomorrow": (list(eod_plan_for_tomorrow["code"].astype(str).str.zfill(6))
-                                       if eod_broker is not None and eod_plan_for_tomorrow is not None and not eod_plan_for_tomorrow.empty
+                                       if enable_eod and eod_plan_for_tomorrow is not None and not eod_plan_for_tomorrow.empty
                                        else []),
             "oos_skipped_count": len(oos_skipped),
         }
         result.picks_log.append(picks_row)
 
-        # round 176 (advisor 175 (2)): strict conflict count, single metric.
-        # Type A: EOD sells X on D 09:25 (open) AND OOS buys X on D 14:30
-        # Type B: OOS bought X on D-1 14:30 AND EOD sells X on D 09:25 (open)
-        # Both count toward `conflict_count` — economic cost is real (round-trip
-        # friction) regardless of model-level PIT awareness.
-        if mode == "dual" and eod_broker is not None and oos_broker is not None:
-            eod_sold_today = set()
-            for trade in eod_broker.trade_log:
-                if trade.get("date") == sim_date_str and trade.get("action") == "SELL":
-                    eod_sold_today.add(trade["code"])
-            # Type A
-            for code in oos_picks_executed:
-                if code in eod_sold_today:
-                    result.conflicts.append({
-                        "date": sim_date_str,
-                        "type": "A_eod_sell_then_oos_buy_same_day",
-                        "code": code,
-                    })
-            # Type B: was X bought by OOS on D-1, and EOD sells X today?
-            # picks_log entries are appended in order; the most-recent prior is len-2.
-            if len(result.picks_log) >= 2:
-                prev_oos_picks = set(result.picks_log[-2].get("oos_picks_executed_today_1430", []))
-                for code in eod_sold_today:
-                    if code in prev_oos_picks:
-                        result.conflicts.append({
-                            "date": sim_date_str,
-                            "type": "B_oos_bought_yesterday_eod_sells_today",
-                            "code": code,
-                        })
-
         if i % 20 == 0:
-            logger.info("[seed={} {}] D={} ({}/{}) NAV: eod={:.0f} oos={:.0f} dual={:.0f}",
-                       seed, mode, sim_date_str, i + 1, len(trading_dates),
-                       eod_nav, oos_nav, eod_nav + oos_nav)
+            logger.info("[seed={} {}] D={} ({}/{}) NAV: {:.0f}",
+                       seed, mode, sim_date_str, i + 1, len(trading_dates), nav)
 
-    # Capture trade logs
-    if eod_broker is not None:
-        result.eod_trades = list(eod_broker.trade_log)
-    if oos_broker is not None:
-        result.oos_trades = list(oos_broker.trade_log)
+    # v3: single trade log on shared broker
+    result.eod_trades = []   # legacy field unused
+    result.oos_trades = []   # legacy field unused
+    # Stash the shared trade log on the result for post-hoc conflict detection.
+    # We re-use eod_trades for it (it's the union of EOD + OOS trades from the
+    # shared broker; downstream conflict detection looks at action labels
+    # "BUY_OOS" vs others to split them post-hoc).
+    result.eod_trades = list(broker.trade_log)
+
+    # ─── Post-hoc conflict detection (v3, advisor 178 spec) ───
+    # Type A: OOS bought X on D 14:30, EOD sells X on D 09:25 same day
+    #   (i.e., 9:25 EOD sold X, then 14:30 OOS bought it back the same day —
+    #    this is the user's "EOD just sold → OOS re-buys" worry)
+    # Type B: OOS bought X on D-1 14:30, EOD sells X on D 09:25 next day
+    #   (OOS's purchase from yesterday gets dumped this morning by EOD)
+    # Strict count: A + B = total conflicts. Cost lives in NAV already.
+    log_by_date_code: Dict[Tuple[str, str], List[dict]] = {}
+    for t in result.eod_trades:
+        key = (t.get("date", ""), t["code"])
+        log_by_date_code.setdefault(key, []).append(t)
+
+    for picks_row in result.picks_log:
+        d = picks_row["date"]
+        oos_today = set(picks_row.get("oos_picks_executed_today_1430", []))
+        eod_today = set(picks_row.get("eod_picks_executed_today_open", []))
+        # Type A: same-day EOD-sell + OOS-buy. EOD action is "SELL" or
+        # action != "BUY_OOS"; OOS action is "BUY_OOS".
+        for code in oos_today:
+            trades_today = log_by_date_code.get((d, code), [])
+            had_sell_today = any(t.get("action") == "SELL" for t in trades_today)
+            if had_sell_today:
+                result.conflicts.append({
+                    "date": d, "type": "A_eod_sell_then_oos_buy_same_day", "code": code,
+                })
+
+    for idx, picks_row in enumerate(result.picks_log):
+        if idx == 0:
+            continue
+        d = picks_row["date"]
+        # OOS picks from yesterday
+        prev_oos = set(result.picks_log[idx - 1].get("oos_picks_executed_today_1430", []))
+        # EOD sells today (action=SELL on the shared trade_log)
+        for code in prev_oos:
+            trades_today = log_by_date_code.get((d, code), [])
+            had_sell_today = any(t.get("action") == "SELL" for t in trades_today)
+            if had_sell_today:
+                result.conflicts.append({
+                    "date": d, "type": "B_oos_bought_yesterday_eod_sells_today", "code": code,
+                })
+
     return result
 
 
@@ -670,23 +652,24 @@ def summarize_results(results: List[BacktestResult], initial_capital: float) -> 
         total_slippage = []
         total_stamp = []
         for r in mode_results:
-            if mode == "eod_only":
-                final_navs.append(r.nav_records[-1]["eod_nav"] if r.nav_records else initial_capital)
-                trades = r.eod_trades
-            elif mode == "oos_only":
-                final_navs.append(r.nav_records[-1]["oos_nav"] if r.nav_records else initial_capital)
-                trades = r.oos_trades
+            # v3: single shared broker → use canonical "nav" column. Fall
+            # back to legacy column for compat with v2 nav_records.
+            if r.nav_records:
+                last = r.nav_records[-1]
+                final_navs.append(float(last.get("nav") or last.get(f"{mode.split('_')[0]}_nav") or
+                                          last.get("dual_nav") or initial_capital))
             else:
-                final_navs.append(r.nav_records[-1]["dual_nav"] if r.nav_records else initial_capital)
-                trades = r.eod_trades + r.oos_trades
-            # max drawdown
-            navs = [n["dual_nav" if mode == "dual" else f"{mode.split('_')[0]}_nav"] for n in r.nav_records]
+                final_navs.append(initial_capital)
+            trades = r.eod_trades  # v3: union log on shared broker; oos_trades empty
+            # max drawdown (use canonical "nav")
+            navs = [float(n.get("nav") or n.get(f"{mode.split('_')[0]}_nav") or n.get("dual_nav") or 0.0)
+                    for n in r.nav_records]
             if navs:
                 peak = navs[0]
                 mdd = 0.0
                 for v in navs:
                     peak = max(peak, v)
-                    mdd = max(mdd, (peak - v) / peak)
+                    mdd = max(mdd, (peak - v) / peak) if peak > 0 else mdd
                 max_drawdowns.append(mdd)
             commission = sum(t.get("commission", 0) for t in trades)
             slippage = sum(t.get("slippage_cost", 0) for t in trades)
@@ -742,9 +725,15 @@ def write_report(summary: dict, out_path: Path, initial_capital: float,
                   start: str, end: str, n_seeds: int, top_k: int) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
-        f"# Walk-Forward Dual-Bucket Backtest Report",
+        f"# Walk-Forward Dual-Bucket Backtest Report (v3 production-faithful)",
         f"",
-        f"_Generated by `scripts/walk_forward_dual_bucket.py` (round 174)_",
+        f"_Generated by `scripts/walk_forward_dual_bucket.py` (round 180, v3)_",
+        f"",
+        f"**v3 changes vs v2** (advisor round 178 spec):",
+        f"- Single SHARED `SimulatedBroker` (matches real QMT account 8886933837)",
+        f"- OOS path strictly **only buys** (matches production `intraday_plan` 0-sell)",
+        f"- No merged-cap check (production has none)",
+        f"- Post-hoc conflict detection from `broker.trade_log` (not preemptive)",
         f"",
         f"## Inputs",
         f"- Window: {start} → {end}",
@@ -809,20 +798,19 @@ def write_report(summary: dict, out_path: Path, initial_capital: float,
             )
     lines += [
         f"",
-        f"## Reading the comparison fairly",
-        f"All three modes share the SAME total capital (¥{initial_capital:,.0f}). The split:",
-        f"- `eod_only`: ¥{initial_capital:,.0f} fully in EOD bucket (capital-efficient: target_pos_pct × total drives invested amount)",
-        f"- `oos_only`: ¥{initial_capital:,.0f} fully in OOS bucket — **most of this stays cash** because the daily cap is ¥20k and turnover is bounded",
-        f"- `dual`:    ¥{initial_capital/2:,.0f} EOD + ¥{initial_capital/2:,.0f} OOS — OOS bucket's daily cap is the same ¥20k, so a smaller pool is closer-to-fully utilized",
+        f"## Reading the comparison fairly (v3)",
+        f"All three modes share the SAME total capital (¥{initial_capital:,.0f}) in a SINGLE shared broker (matches production QMT single-account):",
+        f"- `eod_only`: only EOD rebalance runs (sell + buy). OOS path disabled.",
+        f"- `oos_only`: only OOS only-buy runs at 14:30, capped at ¥{OOS_DAILY_BUDGET:,.0f}/day. **No selling** (production `intraday_plan` has 0 sell logic). Cash drains as positions accumulate; nothing rebalances stale picks.",
+        f"- `dual`: EOD rebalance at 09:25 + OOS only-buy at 14:30 on the same broker. OOS competes with EOD for the same `broker.cash`. EOD's 09:25 sells may dump positions OOS just bought yesterday — the round-trip the user worried about.",
         f"",
-        f"Net implication: `dual` is *not* mechanically additive vs `eod_only` + `oos_only` because changing OOS capital from ¥{initial_capital:,.0f} → ¥{initial_capital/2:,.0f} barely changes OOS turnover (cap-bound), but doubles its return rate per ¥ invested. Treat the absolute `dual − solo` deltas with this in mind.",
+        f"`dual − max(solo)` answers: *does adding OOS to EOD net-add alpha, or does the round-trip eat it?* If negative, OOS is a drag on EOD; if positive, the two strategies complement.",
         f"",
-        f"## round 176 (advisor round 175 拍板)",
-        f"- **(1) Merged position cap** active in dual mode: an OOS buy on code X is REJECTED (whole order, no partial) if EOD position(X) + new OOS position(X) > `hard_max_pct` (default 8%) of combined total. This is more conservative than independent positions and protects against same-stock double exposure.",
-        f"- **(2) Single conflict metric** = Type A + Type B count:",
-        f"  - Type A: EOD sells X on D 09:25 open → OOS buys X on D 14:30 same day",
-        f"  - Type B: OOS bought X on D-1 14:30 → EOD sells X on D 09:25 open",
-        f"  Both count toward `Conflicts` total. Per advisor: no PIT excuse, economic round-trip cost is real.",
+        f"## Conflict definition (v3, post-hoc from `broker.trade_log`)",
+        f"- **Type A**: OOS buys X on D 14:30 + EOD sells X on D 09:25 (same day, EOD already sold this morning, OOS rebuys at 14:30 — user's headline worry)",
+        f"- **Type B**: OOS bought X on D-1 14:30 + EOD sells X on D 09:25 (overnight: OOS yesterday's pick, EOD dumps it next morning)",
+        f"",
+        f"Both count toward the strict `Conflicts (A+B)` total. v3 doesn't *prevent* conflicts — production architecture doesn't either — the cost is already baked into `dual NAV`.",
         f"",
         f"## Caveats",
         f"- 8-month in-sample window — sample size is small; treat as directional, not definitive",
@@ -830,7 +818,7 @@ def write_report(summary: dict, out_path: Path, initial_capital: float,
         f"- `data/intraday_blend_*.lgb` was trained 2026-05-27, BEFORE the n2c label upgrade (round 162). This is the *currently-shipped* OOS model so its drag is what user asked us to measure.",
         f"- OOS panel uses D-1 factor row + 4 INTRADAY_EXTRA_COLUMNS proxies (MVP). Production intraday_plan re-derives 64 TECHNICAL_COLUMNS from morning bars — this would tighten OOS scoring",
         f"- OOS execution price = 1m close at 14:29 from `data/intraday_1m_qfq/`; real fills are next-second auction (~5bps optimistic)",
-        f"- Sells in OOS bucket don't credit back the daily budget (production logic too); so a bucket-internal rotation eats budget twice",
+        f"- `oos_only` accumulates positions forever (no sell); over 8 months this drags down NAV when bad picks turn worse. Production wouldn't run OOS in isolation — this mode is reference only.",
         f"",
         f"## Rule reminders",
         f"- Rule #4: pure research, `--skip-update` style, no prod model touched",
