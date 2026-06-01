@@ -9650,6 +9650,50 @@ execution log: `data/orders/executions/exec_20260601_093021.json` (在 ECS, 你 
 **今天下午 14:30 OOS 跑出第一笔时**, 我会现场跟早上 9:25 那 7 单做 same-day overlap 分析作为第一份证据(轻量, 不需工程方)。先告你一个 picks 重叠率的初步感觉, 再等工程方正式回测给精确答案。
 
 
+## [2026-06-01 11:30] 第 175 轮 (round 174 ACK + user 拍 2 边角: 合并 cap + 只报严格冲突)
+
+### ACK round 174
+- 早盘实操 (5/31 22:09 + 6/1 09:25/09:30) 全收下, 同意 advisor 代跑是临时方案非新流程 ✓
+- Feishu PATH guard + execute-preview "DRYRUN tag" 已修 (commit `e3feaf8`) ✓
+- execute-live / AutoExecute 重启**待双 bucket 结果后再 review**, 不动 ✓
+- 双 bucket 合并回测 spec 跟我 round 173 一致, 开拆 1-2 天 ✓
+- 11:05/11:06 那两条 dryrun exec log = 你测 DRYRUN tag fix 的 — 收下, 不计入今日真单
+
+### user 拍板 2 边角 (你 round 174 问的)
+
+**(1) 同股仓位上限 → 合并查 `hard_max`** (不是独立)
+- 同股 EOD bucket + OOS bucket **总仓位 ≤ `hard_max`** (e.g. 8%)
+- 若 EOD 已占满某股 `hard_max`, OOS 14:30 进场对该股 **拒买** (走 budget tracker skip 路径, log "merged_cap: ...", 不抛错)
+- 若 EOD 占 5% + OOS 想加 2% (合计 7% < 8%) → 通过
+- 若 EOD 占 5% + OOS 想加 4% (合计 9% > 8%) → OOS 该单 buy 减半或拒, 看你怎么实现 (建议: 拒整笔 skip, 不做部分填充, 防止 sizing 复杂化)
+- 这是 user 的偏好: 比"完全独立"保守, 防同股双 bucket 暴露失控
+
+**(2) 冲突统计 → 只报严格冲突** (不给"PIT 不算"口径)
+- "EOD D 卖 X + OOS D 14:30 buy X" + "OOS D-1 buy X + EOD D 卖 X" — 全算 conflict
+- 严格 PIT 上 OOS 模型不知 EOD 已卖, 但**经济成本是真的**(round-trip), 应该计入
+- 不要"两套口径让 user 自己选"; user 想看的就是这个数, 给严格一套即可
+
+### 这一轮你 (按 round 174 spec + 上面 2 拍板继续)
+1. ACK round 175
+2. 实施 `scripts/walk_forward_dual_bucket.py` (1-2 天)
+   - 同股 cap = 合并 ≤ hard_max, OOS 超出拒整笔
+   - 冲突统计 = 严格定义, 单一口径
+3. 出三线 NAV + overlap + 冲突 + 成本 + 净 alpha
+4. 监控接力照旧
+
+### Rule reminders
+- Rule #4: 纯研究态 --skip-update, 不动 prod model
+- Rule #11: PIT 不变
+- Rule #1: NAV 大结果不进 git, spec + 脚本 + 结论文档进
+
+### 主动给 user
+2 个边角你拍了, 工程方按这个跑:
+1. **同股仓位上限 = 合并查 hard_max** — 比独立保守, 防 EOD + OOS 在同一只票上叠仓失控 (例如 EOD 已占满 8% 的票, OOS 14:30 再买就拒)
+2. **冲突 = 只报严格定义** — 不给"严格 PIT 上 OOS 模型不知 EOD 已卖所以不算"的口径; 经济成本是真的, 一套数说话
+
+工程方 1-2 天写完 + 跑 in-sample 3-seed + 给三线对比 (单 EOD / 单 OOS / 双 bucket), 完了你看合并是不是净有优势。期间今天 14:30 OOS 跑出来后, 我现场做 same-day overlap 轻量分析给你初步感觉。
+
+
 
 
 
