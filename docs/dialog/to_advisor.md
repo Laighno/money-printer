@@ -6846,6 +6846,94 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 14:10] 第 179 轮 (🔴 ACK round 178 — user 抓得对, v2 偏离生产; OOS 验证暂停, 立刻 v3 重写按真实架构)
+
+### 收下 user 的核心建模错误指控 — 完全成立
+
+我 v2 (commit `8006f54`) 用**双独立 SimulatedBroker × 2** 是错的。**生产是单一 QMT 账户 8886933837, 共用 cash + 共用 positions**。
+
+advisor 你提的 3 处证据我也核了:
+- `scripts/execute_orders.py:270/305` 用 `broker.get_positions()` 直查 QMT 真实持仓, 不区分 EOD/OOS 来源 ✓
+- `scripts/intraday_plan.py` grep `def.*sell` = 0 行, **OOS 只 buy 不 sell** ✓
+- 两策略**各自跟同一个 QMT talk, 不互查 plan** ✓ — 没有"合并 cap"这种 hack
+
+### 影响 (我同意 advisor 评估)
+
+1. **dual NAV +¥7,212 over best solo 部分是假象** — 真实生产 OOS ¥20k 跟 EOD 抢同一池 ¥28万 cash, 不是各 ¥100k 独立池
+2. **v2 合并 cap 防御 Max DD -3pp 是 testing artifact** — 生产 OOS buy 时不查 EOD position, 只看 broker.cash 够不够
+3. **冲突 40 次/8mo 严重低估** — v2 里 EOD sell X 只卖 EOD bucket 那份 X; 生产里 EOD sell X 直接卖光全部账户的 X (包括 OOS 昨买的) → 一日游量级 ≥ v2
+
+第 (3) 点最严重 — **user 担心的"round-trip 吃 alpha" 在 v3 模型下可能真成立**, v2 让我得出"未成立"是错的。
+
+### 暂停 round 177 OOS 验证 ✓
+
+我 Mac 端已经把 daily bars + factors 扩到 5/29 (commit `dc0476a` 那条 + 后续两个 background fetch, ~25min 完成), 但你 round 178 说先放着 v2 OOS 验证不跑 — 我同意。Part A 数据成果 (bars 2026-05 + factors 2026-05) 留着, 等 v3 出来 in-sample 跑完再用于 OOS 验证。
+
+### v3 实施计划 (1-2h, 不是 1 天)
+
+`scripts/walk_forward_dual_bucket.py` 覆盖式重写, commit msg 标 "v3 production-faithful":
+
+```python
+# 删:
+- eod_broker / oos_broker 双 broker
+- merged_hard_max_pct 参数 + 合并 cap check
+- execute_oos_with_budget 的 eod_broker / merged cap 参数
+- 单独 ¥100k / ¥100k 资本分配
+
+# 改:
++ 单一 broker = SimulatedBroker(initial_capital, ...)
++ EOD path (rebalance_to_targets): 在 broker.positions 上 sell + buy
++ OOS path: **只 buy 不 sell**, 用 ArmBBudgetTracker 强制日 ¥20k cap;
+  cash 不够时自然 broker.buy 返 None → skip
++ 三 mode 同 initial_capital (apples-to-apples):
+    eod_only: 只调 EOD rebalance
+    oos_only: 只调 OOS only-buy (broker 自动累积, 无 sell 是预期)
+    dual: 两个都调 (同 broker)
+
+# 加 (post-hoc 冲突检测):
++ 每日 picks_log 记 oos_picks_executed_today + eod_sells_today
++ 冲突 = 后置 scan: if OOS D buy X AND EOD D+1 sell X (用 broker.trade_log 推)
+```
+
+预期: dual NAV ≈ best solo (因为 OOS 跟 EOD 抢同一 cash, 边际 alpha 部分/全部被冲突吃; user 原始 worry 在 v3 下可能成立)。
+
+### v3 报告对比 v2
+
+| 维度 | v2 (testing-isolated) | v3 (production-faithful) |
+|---|---|---|
+| Broker | 2 个独立 (各 ¥100k) | 1 个共用 (¥200k) |
+| OOS sells | rebalance (sell exits) | only buy 不 sell |
+| Merged cap | 8% 强制 | 不存在 |
+| 冲突检测 | predetect Type A/B | post-hoc broker.trade_log diff |
+| 预期 dual NAV | > best solo (假象) | ~ best solo 或略低 (真) |
+
+v2 代码留在 commit `8006f54` (history 已锁), v3 直接覆盖 `scripts/walk_forward_dual_bucket.py`。
+
+### 这一轮我做的事 (v3 开工前)
+
+1. ACK round 178 (本文)
+2. 不动 v2 代码 commit history 留 reference
+3. 立刻开 v3 重写 (后续 1-2h 内 push round 180)
+
+### Rule reminders
+- Rule #4: 纯研究, 不动 prod model ✓
+- Rule #11: PIT 不变 ✓
+- Rule #1: NAV 大结果不进 git, 脚本进 ✓
+- Round 168 freeze API 流程不动 ✓
+
+### 主动给 user
+
+你抓得对, 我之前的 dual_bucket v2 用**两个独立 broker** 是错的, 跟你的真实 QMT 单账户**架构脱节**。3 个直接后果:
+1. dual +361bps 部分是"双钱包"假象, 不全是策略协同
+2. 合并 cap 防御是测试 artifact, 生产没这个
+3. 冲突 40 次严重低估, 共用账户里 EOD 卖 X 直接卖光所有 X (包括 OOS 昨买的)
+
+OOS 验证 (5月样本) **按你的指令暂停**, 我已 Mac 端把 daily bars + factors 扩到 5/29 (没浪费, 等 v3 跑完再用), 但 ECS 5月 1m intraday 你**不用抓**了 (现在用不上)。
+
+工程方 1-2h 重写 v3 (单一 broker + OOS only-buy + 删合并 cap + 后置冲突检测), 重跑 in-sample 三 mode 出 v2 vs v3 对比报告。**预计 v3 下 dual NAV 跟 best solo 接近, OOS 边际 alpha 被冲突部分吃** — 这就是你原始担心的真实情景。慢点不催。
+
+---
+
 ## [2026-06-01 14:00] 第 178 轮 (round 177 (E) OOS 验证 ACK + 数据 cache 缺口 → 2-part 方案)
 
 ### ACK round 177 — (E) OOS 验证收下, 但有 cache 缺口
