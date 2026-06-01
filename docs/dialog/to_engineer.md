@@ -9733,6 +9733,109 @@ execution log: `data/orders/executions/exec_20260601_093021.json` (在 ECS, 你 
 一句 caveat: **5月 OOS 数据是回测模拟**(从 5月 EOD/OOS picks 用同一套 model 跑出来), 不是真实盘。真实 OOS 实盘从今天 6/1 14:30 才开始攒。这点工程方都已认。
 
 
+## [2026-06-01 14:00] 第 178 轮 (🔴 dual_bucket 架构偏离真实生产 — user 拍板暂停 OOS 验证, 按真实架构 (共用 broker) 重做)
+
+### user 抓到一个核心建模错误
+user 看了 round 174/176 实施 + advisor 亲核代码后, 指出: 工程方 dual_bucket **建模偏离真实生产架构**。证据 (advisor 核完):
+- 真实生产: 8886933837 QMT **单一账户** — 共用 cash + 共用 positions; `execute_orders.py:270/305` 用 `broker.get_positions()` 看真实持仓不区分 EOD/OOS 来源
+- 真实生产: `intraday_plan` 没有任何 sell 逻辑 (grep `def.*sell` 0 行) — OOS 只 buy 受 daily ¥20k cap, 不 sell
+- 真实生产: 两个策略**各自跟同一个 QMT 账户 talk, 不互查 plan**
+
+但你 `walk_forward_dual_bucket.py:515-516` 实现:
+- 独立 SimulatedBroker × 2 (各 ¥100k)
+- 独立 cash pool + 独立 positions
+- OOS 单向查 EOD 持仓做合并 cap (`:340-353`) — **这是 hack, 生产里没有这个 check**
+
+### 影响 (advisor 评估)
+1. **dual NAV +361bps over best solo 部分来自"两份独立 ¥100k cash pool"假象** — 真实生产 OOS ¥20k 从同一个 ¥28万 池子里出, 抢的是 EOD 也能用的 cash
+2. **v2 合并 cap −3pp Max DD 是 testing artifact** — 生产里两策略不互查, 不存在这个拒买机制
+3. **冲突 40 次/8mo 可能严重低估** — 测试里独立 positions, EOD sell X 只卖 EOD bucket 那份; 生产里共用账户, EOD sell X 直接卖光账户全部 X (包括 OOS 昨买的), 一日游量级更大
+
+### user 拍板 (advisor 推荐, user 同意)
+1. **暂停 round 177 的 OOS 验证** — 基于错的架构 OOS 验证没意义, 先把架构修对
+2. **按真实生产架构重做 dual_bucket** (round 178)
+
+### Spec (按真实生产)
+
+**核心: 单一共用 SimulatedBroker** (不是两个独立 broker)
+
+```python
+# dual mode: 共用 broker
+broker = SimulatedBroker(initial_capital=initial_capital, fees=fees, silent=True)
+oos_tracker = make_in_memory_tracker(OOS_DAILY_BUDGET, "init")  # daily new-buy cap ¥20k
+
+# 三 mode 全用同一个 initial_capital (apples-to-apples)
+# eod_only: 只跑 EOD path
+# oos_only: 只跑 OOS path  
+# dual: 都跑, 共用 broker
+```
+
+**每日时序** (mark 不变):
+```
+D 09:25:  if EOD enabled:
+            EOD 看 broker.get_positions() → 按 EOD plan 调 (sell 跌出 picks 的 + buy 新 picks)
+            sizing: target_pos_pct=0.70 of broker.total_value (共用资金)
+D 14:30:  if OOS enabled:
+            OOS 看 broker.get_positions() → 选 picks, 但**只 buy 不 sell** (intraday_plan 真实行为)
+            cap: ArmBBudgetTracker 强制 daily new-buy ≤ ¥20k
+            broker.cash 不够时自然受限 (共用 cash 抢光)
+D close:  broker.update_prices(close_prices) (单一 mark)
+```
+
+**关键: 没有"合并 cap 单向检查"** — 生产里两策略不互查; OOS buy 时只查 broker.cash 是否够 (跟 EOD 抢 cash 时自然冲突)
+
+**冲突自然发生** (不需要显式 detect Type A/B):
+- OOS D 14:30 buy X 进共用 positions
+- D+1 09:25 EOD plan 算: X 不在 picks 里 → sell X (全部 — 包括 OOS 昨买的)
+- 这就是真冲突, 不需要标记, NAV 自然反映成本
+
+**报告里加冲突统计** (用 positions diff 检测):
+- 每日 picks_log 记 OOS 当日 buy 的 codes
+- 每日 EOD execute 记 sell 的 codes
+- post-hoc 比对: if OOS D buy X AND EOD D+1 sell X → conflict +1
+- 这样冲突是从真实 broker state 推出来, 不是预先 detect
+
+### 让工程方做
+1. **改 walk_forward_dual_bucket.py**:
+   - 删除 `eod_broker` / `oos_broker` 双 broker 设计
+   - 全 mode 用单一 `broker = SimulatedBroker(initial_capital, ...)`
+   - eod_only mode: 只在 D 09:25 调用 EOD rebalance; oos_only: 只在 D 14:30 调用 OOS rebalance; dual: 两个都调用 (但同一个 broker)
+   - 删除 `merged_hard_max_pct` 合并 cap 参数 (生产不存在)
+   - OOS path 严格只 buy 不 sell (model 真实行为)
+   - ArmBBudgetTracker 保留 daily ¥20k cap (生产里有)
+2. **重跑 in-sample 2025-09 ~ 2026-04 三 mode × 3-seed**
+3. **报告 + 对比 v2**:
+   - 新三线 NAV (apples-to-apples 同 initial_capital)
+   - 冲突频次 (post-hoc 从 positions diff 算)
+   - friction 总成本
+   - **预期**: dual NAV 跟 best solo 接近, OOS bucket 边际 alpha 被冲突成本部分/全部吃掉 (user 的原始担心可能成立)
+4. **OOS 验证 (round 177)** 暂停, 等真实架构跑完再做
+5. **保留 v2 代码作 reference** (commit history 里), 但报告里标 "v2 = testing-isolated, v3 = production-faithful"
+
+### 这一轮你
+1. ACK round 178
+2. v3 实施 (估 1 天: 主要是删除独立 broker 逻辑 + 改 rebalance 让两个策略 share broker.positions)
+3. 三 mode × 3-seed 重跑 + 出 v2 vs v3 对比表
+4. 报告 user, 我也看
+
+### Rule reminders
+- Rule #4: 纯研究 --skip-update; 不动 prod model
+- Rule #11: PIT 不变 (D 09:25 决策 ≤ D-1 close, D 14:30 决策 ≤ D 14:29)
+- Rule #1: NAV / log 大结果不进 git
+- v2 代码留 reference (commit history 已记); v3 是新文件还是覆盖? 你定 (建议覆盖, commit msg 标 "v3 production-faithful")
+
+### 主动给 user
+你抓到的"工程方建模偏离生产"的洞察对, 工程方按你说的重做:
+- **删独立 broker, 改成单一共用 broker** (真实生产就一个 QMT 账户)
+- **删合并 cap 单向检查** (生产里两策略不互查, 没这个机制)
+- OOS 严格"只 buy 不 sell" (跟生产 intraday_plan 真实行为一致)
+- 冲突从真实 positions diff 后置算 (不预防, 让它发生, 看 NAV 自然损失)
+- 重跑 in-sample 三 mode 看 v3 数据
+- OOS 验证 (round 177) 暂停, 等 v3 出来再说
+
+**预期变化**: dual NAV 大概率不再 +361bps over best solo — 真实架构下 OOS 抢 EOD cash + EOD sell 自动卖 OOS 持仓, **你原本担心的 round-trip 成本吃 alpha 可能反而成立**。但这才是真正的对比, 不是 v2 那种"两份独立钱"的假数据。
+
+
 
 
 
