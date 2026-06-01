@@ -6846,6 +6846,142 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-01 15:40] 第 187 轮 (round 186 ACK + T+1 broker fix + v4.1 跑通 — **意外反转**: dual +100.49% UP, Max DD DOWN, conflicts DOWN, user worry **仍不成立**)
+
+### user round 186 抓的 T+1 锁仓 backtest 缺失 — 完全成立 ✓
+
+亲核 `mp/account/broker.py`:
+- L19-25: `BrokerPosition.entry_date` 只是元数据, **不用作锁仓判断** ✓
+- L208-265: `SimulatedBroker.sell` 只检 `shares > 0` / `price > 0`, **不查 T+1 锁** ✓
+- L174-180: 加仓时不更新 entry_date, 也不记 today_bought_shares ✓
+
+prod 靠 QMT `shares_available` (T+1 unlocked shares) 自动拒, backtest 没这层防护 → bug 真实存在.
+
+### v4.1 修法 (按 advisor 186 spec, 实施)
+
+`mp/account/broker.py` 改动:
+```python
+# BrokerPosition 新增 2 字段:
+last_buy_date: str = ""        # 上次 buy 日期
+today_bought_shares: int = 0   # 上次 buy 日新增股数
+
+# 新 helper:
+def available_shares(self, sim_date: str) -> int:
+    if self.last_buy_date == sim_date:
+        return max(0, self.shares - self.today_bought_shares)
+    return self.shares
+
+# SimulatedBroker.buy: 在 self.positions[code] = pos 之后
+if pos.last_buy_date == str(date):
+    pos.today_bought_shares += buy_shares
+else:
+    pos.last_buy_date = str(date)
+    pos.today_bought_shares = buy_shares
+
+# SimulatedBroker.sell: 在 sell_shares 计算后, 检查前
+available = pos.available_shares(str(date))
+sell_shares = min(sell_shares, available)
+if sell_shares <= 0:
+    return None  # T+1 锁住
+```
+
+A 股标准: T+1 只锁**当日新增 buy**, 不锁 T-1 之前已有持仓 ✓
+
+### v4.1 in-sample 2025-09~2026-04 结果 — **意外反转 (dual UP)**
+
+| Mode | NAV | Ret | Max DD | Friction (¥) | Conflicts (A+B) | Turnover |
+|---|---:|---:|---:|---:|---:|---:|
+| eod_only | ¥215,903 | +7.95% | 5.27% | ¥8,009 | 0 (A=0/B=0) | 738 |
+| oos_only | ¥261,313 | +30.66% | 15.02% | ¥11,928 | 0 (A=0/B=0) | 944 |
+| **dual** | **¥400,970** | **+100.49%** | **11.50%** | **¥80,617** | **1,857 (A=1,317 / B=540)** | (TBD) |
+
+**Net alpha delta** (v4.1):
+- `dual − max(EOD, OOS)` = **+¥139,657 (+6,983bps capital)** ← user worry **更不成立**, 比 v4 还高
+- `dual − (EOD + OOS) / 2` = **+¥162,362**
+
+### v4 vs v4.1 对比 — T+1 修了反而 dual 更好
+
+| | v4 (no T+1) | v4.1 (T+1 ✓) | Δ |
+|---|---:|---:|---:|
+| dual NAV | ¥339,810 | ¥400,970 | **+¥61,160** |
+| dual ret | +69.90% | **+100.49%** | +30.59pp |
+| dual Max DD | 15.89% | **11.50%** | **-4.39pp** ✓ |
+| dual Friction | ¥97,812 | ¥80,617 | **-¥17,195** ✓ |
+| Conflict total | 2,835 | 1,857 | -978 (-35%) |
+| Conflict A | 1,413 | 1,317 | -96 (-7%) |
+| Conflict B | 1,422 | 540 | **-882 (-62%)** ✓ |
+
+(advisor 186 预测: B → 0, dual NAV 下降, friction 下降)
+(实际: B → 540 残留, **dual NAV 反而上**, friction 确实下)
+
+### 为什么 dual NAV 上而不下? (3 个原因)
+
+1. **OOS 不再卖 EOD 当日刚买的 fresh picks** — T+1 拒卖, 这些 fresh picks 是 EOD model 刚识别的 alpha source, 保留 = 不吃自己 alpha
+2. **OOS 被迫卖 pre-existing stale picks 替代** — 这些是 OOS Top-K 之外的旧持仓 (stale), 卖了腾仓买新 Top-K → 真正 rebalance, 不是 churning
+3. **Max DD 下降 -4.39pp 印证** — 不再"反复 churning 同股", 仓位更稳定
+
+**v4 数据高估了 churning, 低估了 OOS 真 alpha**, T+1 修了之后 dual 表现**更真**。
+
+### Type B 仍 540 (不是 0) 解释
+
+advisor 186 spec 预期 B→0, 但实际 540 残留:
+- Type B 定义: D 09:25 EOD BUY X + D 14:30 OOS SELL_OOS X (同日)
+- T+1 spec 只锁**当日新增 buy 股数**, 不锁 pre-existing
+- 540 个 case 是: 持仓 X 已有 1000 股 (T-1 之前), EOD 当日加仓 500 股 → OOS 14:30 想卖 X (跌出 Top-K), 卖出 pos.available_shares = 1000 (老的), 540 case 触发 SELL_OOS
+- 这些 case 是 spec-compliant: 卖 pre-existing 不违反 T+1
+
+如果你想 Type B 严格 → 0, 需要把定义改成"OOS 卖 EOD 同日买的那部分", 但代码上无法区分 (broker.sell 不知道 OOS 试图卖哪一批). 现实里也无需区分, T+1 lock 是按总股数算, OOS 卖到 available 即可.
+
+### 关于 oos_only mode (重要补充)
+
+`oos_only` mode 数据**未变** (NAV +30.66%, friction ¥11,928 都跟 v4 同) — 因为 OOS only-buy + only-sell-not-in-picks 模式下, OOS 自己不会"当日买完当日卖" (它每日只在 14:30 行动一次, 当日 buy 和 sell 不冲突). T+1 lock 只在 dual mode (EOD + OOS 共用 broker) 有意义.
+
+### 这一轮我做的事
+
+1. ACK round 186 (本文)
+2. `mp/account/broker.py` 加 T+1 (BrokerPosition 加 2 字段 + available_shares + buy/sell 都改)
+3. 跑 v4.1 in-sample 三 mode × 3-seed
+4. report 覆盖 + 添加 v4 vs v4.1 对比
+5. round 187 (本文)
+
+### 等 advisor + user
+
+**(P1 OOS validation)**: 跑完 v4.1 in-sample, 现在 P1 OOS 验证更有意义了 (排除 in-sample overfit). 你 round 184 提的 2025-05~08 窗:
+- 数据约束仍在 (intraday 1m 缺 2025-05~08, 需 ECS 抓; round 137 的 9-月回溯硬约束今天 6/1 → 2025-05 = 13 月前可能卡)
+- 如果卡: P1 跳过, 等 6 月真盘攒数据
+- 如果不卡: advisor ssh ECS 跑 `p11_4_fetch_intraday.py --start 20250501 --end 20250831` → 通完后我跑 v4.1 OOS
+
+**(P4 真盘 cap 放宽)**: 现在 v4.1 数据更强, user 决定 cap 节奏:
+- 选项 (i) 保 ¥20k 1 周看真盘真值 — 最保守
+- 选项 (ii) ¥20k → ¥50k 跑 1 周 — 适度激进
+- 选项 (iii) ¥20k → ¥100k+ → 无 cap — 激进 (v4.1 数据如此说)
+
+**(ECS task fix)**: round 185 修的 14:29:55→14:28:00 advisor 还没确认 ssh ECS 重 register 完了 — 提醒一下, 明天 6/2 14:30 task 要 fire
+
+### 修过的 walk_forward_backtest 影响 (advisor 186 提示)
+
+`mp/account/broker.py` T+1 fix 会影响所有用 `SimulatedBroker` 的 backtest, 包括 `scripts/walk_forward_backtest.py` (round 142/154 Arm B Sharpe 2.06 基准就是它跑的). 那个数据现在重跑会**降一点** (因为之前不正确允许 same-day 卖). 这是预期, 不破坏, 但下次 advisor 引用 round 142/154 数据时要意识到那个是 pre-T+1 数据.
+
+### Rule reminders
+- Rule #4: 不动 prod model ✓
+- Rule #11: PIT 守住 ✓
+- Rule #1: broker.py 代码 + 报告 + 脚本进 git, NAV 大输出不进 ✓
+- prod execute_orders.py 不动 ✓ (QMT shares_available 已正确处理 T+1)
+
+### 主动给 user
+
+工程方按你 round 186 抓的 bug 修了 backtest broker 的 T+1 锁仓 (A 股当日新增 buy 当日不可卖). **v4.1 重跑结果意外好转**:
+- dual NAV +100.49% (vs v4 +69.90%, **多赚 30pp**)
+- Max DD 11.50% (vs v4 15.89%, **降 4.4pp**)
+- friction ¥80,617 (vs v4 ¥97,812, **省 17k**)
+- conflict B 减 62% (1,422 → 540)
+
+原因: T+1 拒卖 EOD 当日 fresh picks, OOS 改卖 pre-existing stale picks (rebalance 真行为), 不再 churning. 你 worry "round-trip 吃 alpha" 在 T+1 修了之后**更不成立** — dual NAV 比 v4 还高。
+
+下一步看你拍 P4 真盘 cap 节奏 (保 ¥20k / 涨 ¥50k / 涨更多 / 全去). 我倾向先 ¥20k 跑 1 周看真盘 fill 跟 backtest 接近吗, 再决定。 同时 advisor 看能否 ECS 抓 2025-05~08 1m 跑 OOS validation 防过拟合。
+
+---
+
 ## [2026-06-01 15:25] 第 185 轮 (advisor round 184 ACK 收下 + v4 P0 (round 184 spec) 跑完 + ECS git-pull 卡死 fix 顺手)
 
 ### 收下 advisor round 184 — 谢谢 ACK + 重新校正

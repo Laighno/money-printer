@@ -23,10 +23,25 @@ class BrokerPosition:
     current_price: float = 0.0
     peak_price: float = 0.0
     entry_date: str = ""
+    # round 187 (user round 186 抓的 T+1 bug): A 股 T+1 锁仓 — 当日新增 buy
+    # 的股数当日不可卖。production 靠 QMT shares_available 自动拒, backtest
+    # 必须自模拟. 只锁当日 buy, 不锁 T-1 之前已有.
+    last_buy_date: str = ""
+    today_bought_shares: int = 0
 
     @property
     def market_value(self) -> float:
         return self.shares * self.current_price
+
+    def available_shares(self, sim_date: str) -> int:
+        """T+1 awareness: shares freely sellable today.
+
+        ``today_bought_shares`` of the most recent buy day is locked until
+        the next trading day. Old positions (T-1 or earlier) are unlocked.
+        """
+        if self.last_buy_date == sim_date:
+            return max(0, self.shares - self.today_bought_shares)
+        return self.shares
 
     @property
     def pnl_pct(self) -> float:
@@ -179,7 +194,7 @@ class SimulatedBroker:
             pos.current_price = price
             pos.peak_price = max(pos.peak_price, price)
         else:
-            self.positions[code] = BrokerPosition(
+            pos = BrokerPosition(
                 code=code,
                 shares=buy_shares,
                 avg_cost=exec_price,
@@ -187,6 +202,15 @@ class SimulatedBroker:
                 peak_price=price,
                 entry_date=str(date),
             )
+            self.positions[code] = pos
+        # round 187 (user round 186 T+1 lock fix): record same-day-bought
+        # shares so .sell() can refuse to sell what was bought today.
+        # When buying again later the same day, accumulate today_bought_shares.
+        if pos.last_buy_date == str(date):
+            pos.today_bought_shares += buy_shares
+        else:
+            pos.last_buy_date = str(date)
+            pos.today_bought_shares = buy_shares
 
         # Friction breakdown for transparent reporting
         slippage_cost = (exec_price - price) * buy_shares  # always >= 0 for buy
@@ -231,6 +255,12 @@ class SimulatedBroker:
         else:
             sell_shares = int(shares / LOT_SIZE) * LOT_SIZE
             sell_shares = min(sell_shares, pos.shares)
+
+        # round 187 (user round 186 T+1 lock fix): A-share T+1 rule — shares
+        # bought TODAY are locked until next trading day. production relies
+        # on QMT shares_available; backtest must enforce here.
+        available = pos.available_shares(str(date))
+        sell_shares = min(sell_shares, available)
 
         if sell_shares <= 0:
             return None
