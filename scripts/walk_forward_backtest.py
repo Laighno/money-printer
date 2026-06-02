@@ -35,6 +35,21 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 os.chdir(_PROJECT_ROOT)
 
+# P7-γ (docs/dialog/ rounds 50-51, rule #7): PYTHONHASHSEED must be 0 for
+# deterministic universe iteration / set ordering across processes. It is
+# environment-only (cannot be set after Python starts), so we warn loudly
+# instead of failing — the run will still produce reasonable numbers but
+# may not be byte-perfect reproducible across processes if hashseed varies.
+if os.environ.get("PYTHONHASHSEED") != "0":
+    sys.stderr.write(
+        "WARNING: PYTHONHASHSEED != 0 → universe iteration / set ordering "
+        "may be nondeterministic across processes. For byte-perfect "
+        "reproducible backtest, run as:\n"
+        "  PYTHONHASHSEED=0 LGBM_SEED=42 WF_FEATURE_PRESET=W_BASELINE "
+        "python scripts/walk_forward_backtest.py [...]\n"
+        "See P7-3 docs/dialog/ rounds 50-51 + rule #7 in docs/TODO.md.\n"
+    )
+
 from mp.account.broker import FeeSchedule, SimulatedBroker
 from mp.backtest.engine import calc_performance
 from mp.backtest.ml_backtest import _build_factor_panel, _prefetch_bars
@@ -57,7 +72,9 @@ from mp.ml.regime_features import REGIME_COLUMNS, add_regime_features
 # Parameters
 # ──────────────────────────────────────────────────────────────────────
 
-INITIAL_CAPITAL = 100_000       # 10万元
+# env-overridable for the round-133 AUM-scaling sweep (sqrt-impact scales with
+# notional = INITIAL_CAPITAL/TOP_K, so larger AUM → larger per-stock impact).
+INITIAL_CAPITAL = int(os.environ.get("INITIAL_CAPITAL", "100000"))   # default 10万元
 # Universe widened 2026-05-14 from ZZ500-only to HS300+ZZ500 (~800 unique).
 # Both indices have ≥120 PIT snapshots in DB so training preserves
 # point-in-time integrity (no survivorship bias from today's HS300 list).
@@ -98,10 +115,25 @@ def _merged_current() -> list[str]:
     """Merged current constituents across UNIVERSES (today's list)."""
     from mp.data.fetcher import get_recommendation_universe
     return get_recommendation_universe(UNIVERSES)
-BT_START = "20200101"           # first trading month
-BT_END = "20260401"             # last month (exclusive)
+BT_START = os.environ.get("BT_START", "20200101")   # first trading month (env-overridable for windowed A/B, P11 round 117)
+BT_END = os.environ.get("BT_END", "20260401")       # last month (exclusive)
 TOP_K = int(os.environ.get("TOP_K", "10"))
 HORIZON = 20                    # forward return horizon in trading days
+
+# Round 155 (label-alignment research): which label to train on.
+#   "close_to_close" (default, current production): fwd_ret[i] = close[i+H]/close[i]−1
+#       → assumes entry at close[i]; rewards stocks that gap UP overnight before
+#       T+1 open since the gap is captured in the label but NOT capturable when
+#       you actually execute at open[i+1] (train/serve mismatch).
+#   "next_open_to_close" (round 155 fix): fwd_ret[i] = close[i+H]/open[i+1]−1
+#       → label entry = open[i+1] = real T+1 open execution price; eliminates
+#       the overnight-gap windfall and the model no longer prefers gap-up names
+#       whose alpha you can't capture.
+# Cache key (factors.parquet path) is branched by LABEL_KIND so the legacy
+# close_to_close cache stays untouched.
+LABEL_KIND = os.environ.get("LABEL_KIND", "close_to_close")
+assert LABEL_KIND in ("close_to_close", "next_open_to_close"), \
+    f"Unknown LABEL_KIND={LABEL_KIND}"
 SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", "5"))
 COMMISSION_BPS = int(os.environ.get("COMMISSION_BPS", "3"))
 COST_AWARE_REBALANCE = True      # skip swaps where score gap < round-trip cost
@@ -130,8 +162,48 @@ assert REBALANCE_POLICY in ("on_change", "drift_threshold"), \
 # 0.2 extreme), which is what daily_report.py and paper_trade.py actually use.
 # Validating "blend" here is the missing piece — until this completes we
 # don't know if BlendRanker matches/beats StockRanker on the same backtest.
-RANKER_KIND = os.environ.get("RANKER_KIND", "stock")
-assert RANKER_KIND in ("stock", "blend"), f"Unknown RANKER_KIND={RANKER_KIND}"
+RANKER_KIND = os.environ.get("RANKER_KIND", "blend")  # P10-2: default to production path (BlendRanker) — see Rule #11
+# "intraday_blend" added P11-3 (round 79 spec): BlendRanker trained on
+# INTRADAY_FEATURE_COLS (FACTOR_COLUMNS + 4 morning extras = 68 cols),
+# panel augmented per-row via EOD-proxy. Option C entry: walk_forward
+# execution timing UNCHANGED (T+1 open), only the model variable
+# differs — clean A/B vs `blend` per Rule #10.
+assert RANKER_KIND in ("stock", "blend", "intraday_blend"), \
+    f"Unknown RANKER_KIND={RANKER_KIND}"
+
+# P11-4 Phase C (round 91): ENTRY_TIME selects execution price source.
+#   "t_plus_1_open" (default): use next-day open (matches production EOD blend
+#                              path; what P10-CLOSE baseline + P11-3 used)
+#   "14_30":                   use T 14:30 close from data/intraday_1m parquet
+#                              for dates ≥ 2025-09-01 where available, else T
+#                              close fallback. Models the 14:30 production
+#                              entry path; pair with RANKER_KIND=intraday_blend
+#                              for Rule #11 alignment.
+ENTRY_TIME = os.environ.get("ENTRY_TIME", "t_plus_1_open")
+assert ENTRY_TIME in ("t_plus_1_open", "14_30"), \
+    f"Unknown ENTRY_TIME={ENTRY_TIME}"
+
+# Round 147 (Design 2 fix-and-rerun): which intraday-1m dir to read for the
+# 14:30 entry price + Arm B injection. Default = the legacy NON-adjusted
+# `data/intraday_1m`; the round-147 clean rerun points this at the
+# front-adjusted (qfq) re-fetch so the 14:30 bar shares the qfq scale of the
+# EOD history + model training (fixes defect ① 复权尺度混用).
+INTRADAY_DIR = os.environ.get("INTRADAY_DIR", "data/intraday_1m")
+
+# Round 147 (fix ② 时序错位): ENTRY_TIME=14_30 now means TRUE SAME-DAY —
+# decide on D's ≤14:29 injected factors and EXECUTE the same day D at the
+# 14:29 close (≈14:30 fill), instead of the legacy pending-mechanism lag that
+# scored D and filled D+1 14:30 (隔日). Set INTRADAY_NEXT_DAY=1 to restore the
+# legacy next-day fill (for the A/B that isolates the timing effect from ①).
+# Only affects ENTRY_TIME=14_30; baseline + ③(t_plus_1_open) are untouched.
+INTRADAY_NEXT_DAY = os.environ.get("INTRADAY_NEXT_DAY", "0") == "1"
+SAME_DAY_14_30 = (ENTRY_TIME == "14_30") and not INTRADAY_NEXT_DAY
+
+# P11-4 Phase C (round 91): INTRADAY_HYBRID enables hybrid feature compute
+# when RANKER_KIND=intraday_blend. 1 → 2025-09+ dates use real intraday
+# from data/intraday_1m/*.parquet, else EOD-proxy (matches Phase B
+# training-time hybrid panel). 0 → 100% EOD-proxy (matches P11-3 / P11-2).
+INTRADAY_HYBRID = os.environ.get("INTRADAY_HYBRID", "0") == "1"
 
 # Position-sizing scheme for the Top-K selection.
 #   "equal"      : 1/N each (BASELINE-validated, default).
@@ -204,7 +276,12 @@ def _load_or_build_factors(
     codes: List[str],
 ) -> pd.DataFrame:
     """Build full factor panel with forward returns, with parquet cache."""
-    cache_path = CACHE_DIR / "factors.parquet"
+    # Round 155: cache key branches on LABEL_KIND so the new next_open_to_close
+    # label gets its own file and never collides with the legacy close_to_close
+    # cache. Default (close_to_close) keeps the original `factors.parquet` path
+    # — no rebuild needed for existing runs.
+    cache_path = CACHE_DIR / ("factors.parquet" if LABEL_KIND == "close_to_close"
+                              else f"factors_label_{LABEL_KIND}.parquet")
     if cache_path.exists():
         logger.info("Loading cached factor panel from {}", cache_path)
         panel = pd.read_parquet(cache_path)
@@ -285,9 +362,24 @@ def _load_or_build_factors(
             close_arr = close_vals["close"].values.astype(float)
             n = len(close_arr)
             fwd = np.full(n, np.nan)
-            for i in range(n - HORIZON):
-                if close_arr[i] > 0:
-                    fwd[i] = close_arr[i + HORIZON] / close_arr[i] - 1.0
+            if LABEL_KIND == "next_open_to_close":
+                # Round 155: entry = open[i+1] (real T+1 fill); exit unchanged
+                # at close[i+HORIZON]. Both indexes are bounded by the loop's
+                # range(n - HORIZON) since HORIZON ≥ 1 ⇒ i+1 ≤ n-HORIZON ≤ n-1.
+                open_arr = (close_vals["open"].values.astype(float)
+                            if "open" in close_vals.columns else None)
+                if open_arr is None:
+                    grp["fwd_ret"] = np.nan
+                    fwd_parts.append(grp)
+                    continue
+                for i in range(n - HORIZON):
+                    entry = open_arr[i + 1] if i + 1 < n else np.nan
+                    if entry > 0 and not np.isnan(entry) and close_arr[i + HORIZON] > 0:
+                        fwd[i] = close_arr[i + HORIZON] / entry - 1.0
+            else:
+                for i in range(n - HORIZON):
+                    if close_arr[i] > 0:
+                        fwd[i] = close_arr[i + HORIZON] / close_arr[i] - 1.0
             grp["fwd_ret"] = fwd
         else:
             grp["fwd_ret"] = np.nan
@@ -466,6 +558,241 @@ def _build_price_adv_lookup(
     return close_lk, open_lk, adv_lk
 
 
+def _build_entry_lk_14_30(close_lk: Dict[tuple, float]) -> Dict[tuple, float]:
+    """P11-4 Phase C: per (code, date) lookup for T 14:30 entry price.
+
+    Strategy:
+      - For dates in data/intraday_1m/*.parquet (2025-09 ~ 2026-04 by
+        round-89 fetch scope): close of the 14:29:00 bar (last bar
+        before 14:30, per PIT exclude-14:30 rule).
+      - Otherwise: T close (close_lk fallback). This models "if we had
+        intraday data we'd use 14:29 price; absent it, use the EOD close
+        as best proxy for the price the model would see at decision time".
+
+    Returns a dict that overlays close_lk where intraday available, else
+    deferring to close_lk via .get fallback at call sites.
+
+    NOTE Rule #11: production 14:30 entry would use the LIVE 14:30 price
+    at decision time; this backtest approximates with the 14:29 bar's
+    close (1m precision; live snapshot precision is ~1s). This is the
+    same approximation P11-4 Step 1 fetch made.
+    """
+    out: Dict[tuple, float] = {}
+    intra_dir = Path(INTRADAY_DIR)
+    if not intra_dir.exists():
+        logger.warning("ENTRY_TIME=14_30 but {} missing — full fallback to T close", INTRADAY_DIR)
+        return out
+    parts = sorted(intra_dir.glob("*.parquet"))
+    if not parts:
+        logger.warning("ENTRY_TIME=14_30 but {} empty — full fallback to T close", INTRADAY_DIR)
+        return out
+    frames = [pd.read_parquet(p) for p in parts]
+    intra = pd.concat(frames, ignore_index=True)
+    intra["datetime"] = pd.to_datetime(intra["datetime"])
+    # The fetcher excluded 14:30 bar (PIT); the last bar each day is 14:29.
+    # Take last bar per (code, date) — its close is the 14:29 close.
+    intra["date"] = intra["datetime"].dt.normalize()
+    intra = intra.sort_values(["code", "datetime"])
+    last_bars = intra.groupby(["code", "date"]).tail(1)
+    skipped_nan = 0
+    for _, row in last_bars.iterrows():
+        v = row["close"]
+        if pd.isna(v):
+            skipped_nan += 1
+            continue
+        out[(str(row["code"]), pd.Timestamp(row["date"]))] = float(v)
+    logger.info("ENTRY_TIME=14_30: built entry_lk for {} (code, date) pairs from intraday_1m "
+                "({} bars skipped due to NaN close)", len(out), skipped_nan)
+    return out
+
+
+# ── P11 Design 2 (round 117): Arm B real-14:30 factor injection ──────────
+# INTRADAY_INJECT=1 overlays, onto panel_by_date for window dates only, the
+# 64 factors recomputed with the REAL 14:30(T) morning bar injected as the
+# latest bar — i.e. the historical replay of production's
+# build_latest_features(intraday_bars=...). This is SCORING-only: training
+# reads `panel` (untouched), so the model stays the standard non-injected
+# EOD blend; at inference it sees 14:30-as-today's-close (Design 2's clean
+# reframe). Rule #11: intraday_1m already ends 14:29 (no 14:30 leak).
+INTRADAY_INJECT = os.environ.get("INTRADAY_INJECT", "0") == "1"
+# Round 121 negative control: when > 0, inject the WRONG day's morning bar
+# (shifted N positions in the sorted morning-date list, same code) instead of
+# day T's own. If Arm B's alpha genuinely comes from T's 14:30 bar it MUST
+# collapse to ~baseline here (garbage input → no signal); if it survives, the
+# excess is structural leakage, not the injected signal. Decisive test.
+INJECT_PLACEBO_SHIFT = int(os.environ.get("INJECT_PLACEBO_SHIFT", "0"))
+
+
+def _load_morning_bars(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> Dict[tuple, dict]:
+    """Aggregate data/intraday_1m/*.parquet into a per-(code, date) morning
+    bar (09:30–14:29). amount is synthesized as Σ(close_i × volume_i) since
+    the 1m parquet has no amount column — that IS the morning turnover."""
+    intra_dir = Path(INTRADAY_DIR)
+    parts = sorted(intra_dir.glob("*.parquet"))
+    if not parts:
+        logger.warning("INTRADAY_INJECT=1 but {} empty — no Arm B injection", INTRADAY_DIR)
+        return {}
+    intra = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+    intra["datetime"] = pd.to_datetime(intra["datetime"])
+    intra["date"] = intra["datetime"].dt.normalize()
+    intra = intra[(intra["date"] >= start_ts) & (intra["date"] <= end_ts)].copy()
+    if intra.empty:
+        return {}
+    intra["code"] = intra["code"].astype(str).str.zfill(6)
+    intra["_amt"] = intra["close"].astype(float) * intra["volume"].astype(float)
+    intra = intra.sort_values(["code", "datetime"])
+    agg = intra.groupby(["code", "date"]).agg(
+        open=("open", "first"), high=("high", "max"), low=("low", "min"),
+        close=("close", "last"), volume=("volume", "sum"), amount=("_amt", "sum"),
+    )
+    morning: Dict[tuple, dict] = {}
+    for (code, date), r in agg.iterrows():
+        if pd.isna(r["close"]) or pd.isna(r["open"]):
+            continue
+        morning[(code, pd.Timestamp(date))] = {
+            "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]),
+            "close": float(r["close"]), "volume": float(r["volume"]), "amount": float(r["amount"]),
+        }
+    logger.info("Arm B: loaded {} (code, date) morning bars from intraday_1m", len(morning))
+    return morning
+
+
+def _overlay_injected_factors(
+    panel_by_date: Dict[pd.Timestamp, pd.DataFrame],
+    bars_map: Dict[str, pd.DataFrame],
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+) -> Dict[pd.Timestamp, pd.DataFrame]:
+    """Return a NEW panel_by_date where, for dates in [window_start, window_end]
+    that have intraday_1m data, each (code, T) row's 51 TECHNICAL_COLUMNS are
+    recomputed on [EOD bars < T] + [real 14:30(T) morning bar]. The 13
+    fundamental/trend/industry columns are kept from the baseline row
+    (injection-invariant: publish-date aligned + cross-sectional). Dates
+    outside the window, and codes without a morning bar, are passed through
+    unchanged so the backtest degrades gracefully."""
+    from mp.ml.dataset import _compute_technical_factors, TECHNICAL_COLUMNS
+
+    morning = _load_morning_bars(window_start, window_end)
+    if not morning:
+        logger.warning("Arm B: no morning bars in window — returning panel unchanged")
+        return panel_by_date
+
+    # Negative-control remap (round 121): decision day dt → a WRONG morning
+    # date (shifted in the sorted morning-date list). Same code, wrong day.
+    morning_dates = sorted({d for (_c, d) in morning})
+    wrong_day: Dict[pd.Timestamp, pd.Timestamp] = {}
+    if INJECT_PLACEBO_SHIFT and morning_dates:
+        n_md = len(morning_dates)
+        wrong_day = {d: morning_dates[(i + INJECT_PLACEBO_SHIFT) % n_md]
+                     for i, d in enumerate(morning_dates)}
+        logger.warning("Arm B NEGATIVE CONTROL: INJECT_PLACEBO_SHIFT={} — injecting "
+                       "WRONG-day morning bars; alpha MUST collapse to ~baseline if "
+                       "the signal is real", INJECT_PLACEBO_SHIFT)
+    _audit_done = False
+
+    # Pre-index bars_map by code → sorted (date, ohlcv arrays) for fast slicing.
+    out: Dict[pd.Timestamp, pd.DataFrame] = dict(panel_by_date)
+    window_dates = [d for d in panel_by_date if window_start <= d <= window_end]
+    n_rows_injected = 0
+    n_codes_injected = 0
+    proof_samples: List[dict] = []  # injection-proof: baseline vs injected factor values
+
+    _sorted_window = sorted(window_dates)
+    for _di, dt in enumerate(_sorted_window):
+        if _di % 20 == 0:
+            logger.info("Arm B inject progress: {}/{} window dates ({} rows so far)",
+                        _di, len(_sorted_window), n_rows_injected)
+        base = panel_by_date[dt]
+        if base is None or base.empty:
+            continue
+        base = base.copy()
+        base["code"] = base["code"].astype(str).str.zfill(6)
+        tech_updates: Dict[int, Dict[str, float]] = {}  # row_idx → {tech_col: val}
+        for idx, code in zip(base.index, base["code"]):
+            src_dt = (wrong_day.get(pd.Timestamp(dt), pd.Timestamp(dt))
+                      if INJECT_PLACEBO_SHIFT else pd.Timestamp(dt))
+            mb = morning.get((code, src_dt))
+            if mb is None:
+                continue
+            bdf = bars_map.get(code)
+            if bdf is None or bdf.empty:
+                continue
+            hist = bdf[bdf["date"] < dt]
+            if len(hist) < 80:   # _process_single_stock minimum
+                continue
+            # Cap to the last 300 bars before computing factors. Every
+            # TECHNICAL_COLUMNS factor uses a rolling window <= 60, and MACD's
+            # EMA26 fully converges in < 300 bars, so the LAST row's factor
+            # values are identical (to ~1e-8) to the full-history computation
+            # — but ~9x cheaper: hist otherwise grows to ~2700 bars by 2025,
+            # which was the real Arm B bottleneck (~2h). Correctness-preserving.
+            if len(hist) > 300:
+                hist = hist.tail(300)
+            # Build injected series arrays: [EOD bars < T] + [morning(T)].
+            close = np.append(hist["close"].to_numpy(float), mb["close"])
+            high = np.append(hist["high"].to_numpy(float), mb["high"])
+            low = np.append(hist["low"].to_numpy(float), mb["low"])
+            volume = np.append(hist["volume"].to_numpy(float), mb["volume"])
+            amount = np.append(
+                (hist["amount"].to_numpy(float) if "amount" in hist.columns
+                 else hist["close"].to_numpy(float) * hist["volume"].to_numpy(float)),
+                mb["amount"])
+            open_arr = np.append(hist["open"].to_numpy(float), mb["open"])
+            turnover = np.append(
+                (hist["turnover"].to_numpy(float) if "turnover" in hist.columns
+                 else np.full(len(hist), np.nan)), np.nan)
+            try:
+                fac = _compute_technical_factors(close, high, low, volume, amount, turnover, open_arr)
+            except Exception as e:
+                logger.debug("Arm B inject factor calc failed {} {}: {}", code, dt, e)
+                continue
+            row_vals = {c: float(fac[c][-1]) for c in TECHNICAL_COLUMNS if c in fac}
+            tech_updates[idx] = row_vals
+            n_rows_injected += 1
+            if not _audit_done:
+                # Round 121 ② panel audit: prove the injected series ends
+                # [..., T-1 real, T synthetic-14:30] with NO T real EOD bar, the
+                # synth close == 14:29 (≠ full-day close), and that ALL 51
+                # technical cols are replaced (missing → kept-baseline = leak).
+                real_t = bdf.loc[bdf["date"] == dt, "close"]
+                missing = [c for c in TECHNICAL_COLUMNS if c not in fac]
+                logger.info(
+                    "Arm B PANEL AUDIT {} T={} (src={}): hist last2={} | T-real-bar "
+                    "in hist? {} | synth(14:29) close={:.4f} vs real-T close={} | "
+                    "tech cols updated {}/{}, missing(kept-baseline)={}",
+                    code, str(pd.Timestamp(dt).date()), str(src_dt.date()),
+                    [str(x.date()) for x in hist['date'].iloc[-2:]],
+                    bool((hist['date'] == dt).any()), mb['close'],
+                    (f"{float(real_t.iloc[0]):.4f}" if len(real_t) else "NA(T not in DB)"),
+                    len(row_vals), len(TECHNICAL_COLUMNS), missing)
+                _audit_done = True
+            if len(proof_samples) < 6:
+                proof_samples.append({
+                    "code": code, "date": str(pd.Timestamp(dt).date()),
+                    "rsi_14_base": float(base.at[idx, "rsi_14"]) if "rsi_14" in base.columns else None,
+                    "rsi_14_inj": row_vals.get("rsi_14"),
+                    "close_ma5_dev_base": float(base.at[idx, "close_ma5_dev"]) if "close_ma5_dev" in base.columns else None,
+                    "close_ma5_dev_inj": row_vals.get("close_ma5_dev"),
+                })
+        if tech_updates:
+            for col in TECHNICAL_COLUMNS:
+                if col not in base.columns:
+                    continue
+                col_map = {idx: vals[col] for idx, vals in tech_updates.items() if col in vals}
+                if col_map:
+                    base.loc[list(col_map.keys()), col] = list(col_map.values())
+            out[pd.Timestamp(dt)] = base
+            n_codes_injected = max(n_codes_injected, len(tech_updates))
+
+    logger.info("Arm B: injected 14:30 factors into {} (code,date) rows across {} window dates",
+                n_rows_injected, len(window_dates))
+    for s in proof_samples:
+        logger.info("  Arm B inject-proof {} {}: rsi_14 {:.3f}→{:.3f} | close_ma5_dev {:.5f}→{:.5f}",
+                    s["code"], s["date"], s["rsi_14_base"] or float("nan"), s["rsi_14_inj"] or float("nan"),
+                    s["close_ma5_dev_base"] or float("nan"), s["close_ma5_dev_inj"] or float("nan"))
+    return out
+
+
 def run_walk_forward():
     """Main walk-forward backtest."""
     t0 = time.time()
@@ -516,8 +843,12 @@ def run_walk_forward():
     # Optional: augment panel with per-date regime features (PIT-safe,
     # computed from ZZ500 + cross-sectional breadth).  LGBM can learn
     # regime↔factor interactions via tree splits.
+    # 2026-05-23: switched from FACTOR_COLUMNS (47) to CURATED_COLUMNS (28)
+    # — IC analysis showed the dropped 19 features had |IR| < 0.15 (noise);
+    # the kept set adds 3 strong industry-rank signals that were previously
+    # masked by data issues (now fixed).
     # 2026-05-24: env override for W0/W1/W2 walk-forward comparison after
-    # P0 ICIR fix (commit b023ba4). See mp/ml/feature_presets.py.
+    # P0 ICIR fix. See mp/ml/feature_presets.py for frozen preset lists.
     _wf_preset = os.environ.get("WF_FEATURE_PRESET")
     if _wf_preset:
         from mp.ml.feature_presets import PRESETS, preset_signature
@@ -532,7 +863,7 @@ def run_walk_forward():
             _wf_preset, len(feature_cols), preset_signature(_wf_preset),
         )
     else:
-        feature_cols = list(FACTOR_COLUMNS)
+        feature_cols = list(CURATED_COLUMNS)
     if USE_REGIME_FEATURES:
         logger.info("Regime features: ENABLED ({} cols added)", len(REGIME_COLUMNS))
         panel = add_regime_features(panel)
@@ -540,7 +871,88 @@ def run_walk_forward():
     else:
         logger.info("Regime features: disabled (set USE_REGIME_FEATURES=1 to enable)")
 
+    # ── P11-3 (round 79): RANKER_KIND=intraday_blend augments panel ────────
+    # with 4 EOD-proxy intraday extras + switches feature_cols to
+    # INTRADAY_FEATURE_COLS (68). Same EOD-proxy formula as
+    # scripts/train_intraday.py — keeps training and walk-forward in the
+    # same distribution. Execution timing UNCHANGED (T+1 open simulator
+    # path), per Option C — only the model variable differs vs RANKER_KIND=blend.
+    if RANKER_KIND == "intraday_blend":
+        from mp.ml.intraday_features import INTRADAY_FEATURE_COLS, INTRADAY_EXTRA_COLUMNS
+        from scripts.train_intraday import (
+            compute_extras_for_panel,
+            compute_extras_for_panel_hybrid,
+            load_intraday_1m,
+            _real_morning_extras_per_code,
+        )
+
+        # P11-4 Phase C: INTRADAY_HYBRID=1 overlays real intraday extras where available.
+        real_extras_by_code: Dict[str, pd.DataFrame] = {}
+        if INTRADAY_HYBRID:
+            intra_long = load_intraday_1m()
+            if not intra_long.empty:
+                for code_xt, code_df in intra_long.groupby("code"):
+                    code = str(code_xt)
+                    bars = bars_map.get(code)
+                    if bars is None or bars.empty:
+                        continue
+                    eod = bars.sort_values("date").reset_index(drop=True)
+                    eod["date"] = pd.to_datetime(eod["date"]).dt.normalize()
+                    eod_vol_ma20 = eod.set_index("date")["volume"].rolling(window=20, min_periods=20).mean().shift(1)
+                    real_extras_by_code[code] = _real_morning_extras_per_code(code_df.assign(code=code), eod_vol_ma20)
+            logger.info("INTRADAY_HYBRID=1 — real intraday extras prepared for {} codes",
+                        len(real_extras_by_code))
+            logger.info("RANKER_KIND=intraday_blend — augmenting panel (hybrid: real where available, else EOD-proxy)")
+        else:
+            logger.info("RANKER_KIND=intraday_blend — augmenting panel with EOD-proxy extras")
+
+        extras_frames: List[pd.DataFrame] = []
+        for code, bars in bars_map.items():
+            if INTRADAY_HYBRID and code in real_extras_by_code:
+                extras = compute_extras_for_panel_hybrid(bars, real_extras_by_code[code])
+            else:
+                extras = compute_extras_for_panel(bars)
+            extras["code"] = code
+            extras_frames.append(extras[["code", "date"] + list(INTRADAY_EXTRA_COLUMNS)])
+        extras_all = pd.concat(extras_frames, ignore_index=True)
+        extras_all["date"] = pd.to_datetime(extras_all["date"])
+        panel = panel.merge(extras_all, on=["code", "date"], how="left")
+        # Sanity: every panel row should now have all 4 extras (some NaN
+        # at warm-up boundaries is acceptable; LightGBM handles them).
+        for col in INTRADAY_EXTRA_COLUMNS:
+            n_nan = int(panel[col].isna().sum())
+            logger.info("  {}: {:.1f}% non-null ({} NaN of {})",
+                        col, 100.0 * (1 - n_nan / max(len(panel), 1)),
+                        n_nan, len(panel))
+        feature_cols = list(INTRADAY_FEATURE_COLS)
+        logger.info("intraday_blend feature_cols: {} cols (FACTOR_COLUMNS + 4 extras)",
+                    len(feature_cols))
+
     close_lk, open_lk, adv_lk = _build_price_adv_lookup(bars_map)
+
+    # P11-4 Phase C (round 91): ENTRY_TIME=14_30 swaps the execution price
+    # source. Build entry_lk once: T 14:30 close (from intraday_1m for
+    # 2025-09+, T close fallback otherwise). When ENTRY_TIME=t_plus_1_open
+    # (default), entry_lk is empty and code paths read open_lk as before.
+    if ENTRY_TIME == "14_30":
+        entry_lk_14_30 = _build_entry_lk_14_30(close_lk)
+        # Build the effective entry lookup: 14:29 close where available,
+        # else T close (NOT T+1 open — this is the semantic shift for 14:30
+        # entry: decision & execution same day at 14:30 = ~ T close).
+        # Bind to a name so later code can use the same `entry_lk` variable.
+        def _entry_price(code, dt):
+            return entry_lk_14_30.get((code, dt), close_lk.get((code, dt)))
+    else:
+        def _entry_price(code, dt):
+            return open_lk.get((code, dt))
+    logger.info("ENTRY_TIME={} — entry price source: {}",
+                ENTRY_TIME,
+                "{} 14:29 close + T close fallback".format(INTRADAY_DIR)
+                if ENTRY_TIME == "14_30" else "T+1 open")
+    if ENTRY_TIME == "14_30":
+        logger.info("14_30 execution timing: {} (round 147 fix ②)",
+                    "SAME-DAY D 14:30 (decision ≤14:29 → fill D 14:29-close)"
+                    if SAME_DAY_14_30 else "legacy NEXT-DAY D+1 14:30 (INTRADAY_NEXT_DAY=1)")
 
     # All trading dates in the BT window
     bt_start_ts = pd.Timestamp(BT_START)
@@ -560,6 +972,38 @@ def run_walk_forward():
     panel_by_date: Dict[pd.Timestamp, pd.DataFrame] = {}
     for dt_key, grp in panel.groupby("date"):
         panel_by_date[pd.Timestamp(dt_key)] = grp
+
+    # Arm B (Design 2): overlay real-14:30-injected factors onto the SCORING
+    # panel for window dates with intraday_1m data. Training (`panel`) is
+    # untouched. The window is the full BT span; injection only lands where
+    # morning bars exist (2025-09+), so older dates pass through unchanged.
+    if INTRADAY_INJECT:
+        logger.info("INTRADAY_INJECT=1 (Arm B / Design 2) — overlaying real-14:30 "
+                    "injected factors onto scoring panel (training untouched)")
+        _all_pbd_dates = sorted(panel_by_date.keys())
+        if _all_pbd_dates:
+            # Round 127 sweep: the injected panel is SEED- and COST-independent
+            # (factors only; LGBM_SEED/cost act downstream). INJECT_CACHE lets the
+            # cost sweep reuse one overlay instead of re-running the ~33min build
+            # per (seed,cost). Cache only the traded window [BT_START,BT_END] rows
+            # (scoring uses panel_by_date only there; retrain uses `panel`).
+            _cache = os.environ.get("INJECT_CACHE", "")
+            if _cache and Path(_cache).exists():
+                cdf = pd.read_parquet(_cache)
+                cdf["date"] = pd.to_datetime(cdf["date"])
+                for dkey, grp in cdf.groupby("date"):
+                    panel_by_date[pd.Timestamp(dkey)] = grp.reset_index(drop=True)
+                logger.info("INJECT_CACHE hit: loaded {} overlaid rows / {} dates from {} "
+                            "— skipped ~33min overlay", len(cdf), cdf["date"].nunique(), _cache)
+            else:
+                panel_by_date = _overlay_injected_factors(
+                    panel_by_date, bars_map, _all_pbd_dates[0], _all_pbd_dates[-1])
+                if _cache:
+                    win = [d for d in panel_by_date if bt_start_ts <= d <= bt_end_ts]
+                    cat = pd.concat([panel_by_date[d] for d in win], ignore_index=True)
+                    cat.to_parquet(_cache)
+                    logger.info("INJECT_CACHE saved: {} rows / {} dates → {}",
+                                len(cat), len(win), _cache)
 
     # Trading calendar from panel for label_cutoff (Fix #3: avoid calendar-day approximation)
     _all_trade_dates = sorted(panel["date"].unique())
@@ -622,8 +1066,26 @@ def run_walk_forward():
     # ────────────────────────────────────────────────────────────────────────
 
     # 3. Simulation state
-    fees = FeeSchedule(slippage_bps=SLIPPAGE_BPS, commission_bps=COMMISSION_BPS,
-                       use_sqrt_impact=True, impact_alpha_bps=150.0, min_slippage_bps=3.0)
+    # Round 127 cost sweep: cost model is env-driven so Arm B can be re-costed
+    # cheaply (with INJECT_CACHE) without rebuilding the injected panel.
+    #   USE_SQRT_IMPACT=0 → flat per-trade slippage = SLIPPAGE_BPS (clean "bps"
+    #     sweep); =1 (default) keeps the realistic sqrt-impact (Phase-1 config).
+    #   IMPACT_ALPHA_BPS overrides the sqrt α (default 150).
+    #   STAMP_TAX_BPS overrides sell-side stamp (default FeeSchedule new=5);
+    #     set 0 (with slippage/commission 0) for a true zero-cost gross run.
+    _use_sqrt = os.environ.get("USE_SQRT_IMPACT", "1") == "1"
+    _impact_alpha = float(os.environ.get("IMPACT_ALPHA_BPS", "150.0"))
+    _fee_kw = dict(slippage_bps=SLIPPAGE_BPS, commission_bps=COMMISSION_BPS,
+                   use_sqrt_impact=_use_sqrt, impact_alpha_bps=_impact_alpha,
+                   min_slippage_bps=3.0)
+    _stamp = os.environ.get("STAMP_TAX_BPS")
+    if _stamp is not None:
+        _fee_kw["stamp_tax_bps_old"] = float(_stamp)
+        _fee_kw["stamp_tax_bps_new"] = float(_stamp)
+    fees = FeeSchedule(**_fee_kw)
+    logger.info("FeeSchedule: slippage={} commission={} sqrt_impact={} alpha={} stamp={}",
+                SLIPPAGE_BPS, COMMISSION_BPS, _use_sqrt, _impact_alpha,
+                _stamp if _stamp is not None else "default(5)")
     logger.info("Slippage model: sqrt-impact α={} bps, floor={} bps (fallback linear={} bps)",
                 fees.impact_alpha_bps, fees.min_slippage_bps, fees.slippage_bps)
     broker = SimulatedBroker(INITIAL_CAPITAL, fees, silent=True)
@@ -636,6 +1098,71 @@ def run_walk_forward():
     pending_selection: Optional[List[tuple]] = None  # signal from previous close
     pending_raw_scores: Dict[str, float] = {}        # raw excess pred by code, populated in Step B
     current_universe: frozenset = _current_codes_set  # updated at each retrain
+
+    # Tail-quality records — for each scoring day, capture:
+    #   predicted top-K codes, actual fwd_ret of all valid codes
+    # Used after backtest to compute Hit Rate@K and NDCG@K, which measure
+    # how well the model identifies the extreme tail (top performers).
+    # IC measures mean predictive power; these measure top-K precision —
+    # what actually matters for a Top-K strategy.
+    tail_quality_records: List[dict] = []
+
+    # Round 147 (fix ②): extract Step B's scoring so SAME_DAY_14_30 can run it
+    # BEFORE Step A (same-day fill), while the default path keeps running it
+    # after (next-day fill). Returns (selection, raw_scores) or (None, {})
+    # when the ranker isn't ready / today's panel is empty — callers leave
+    # the prior `pending_selection` untouched in that case.
+    def _score_today(dt):
+        ranker_ready = current_ranker is not None and (
+            getattr(current_ranker, "model", None) is not None
+            or (
+                hasattr(current_ranker, "primary")
+                and getattr(current_ranker.primary, "model", None) is not None
+            )
+        )
+        if not ranker_ready:
+            return None, {}
+        today_df = panel_by_date.get(dt)
+        if today_df is None:
+            return None, {}
+        today_df = today_df[today_df["code"].isin(current_universe)]
+        today_valid = today_df.dropna(subset=core)
+        if today_valid.empty:
+            return None, {}
+        codes_in = today_valid["code"].tolist()
+        scores = current_ranker.predict(today_valid)
+        if hasattr(current_ranker, "predict_raw"):
+            raws = current_ranker.predict_raw(today_valid)
+        else:
+            raws = scores
+        raw_score_map = dict(zip(codes_in, raws))
+        scored = sorted(zip(codes_in, scores), key=lambda x: -x[1])
+        if COST_AWARE_REBALANCE:
+            from mp.backtest.ml_backtest import _cost_aware_select
+            selection = _cost_aware_select(scored, TOP_K, broker, dt, adv_lk)
+        else:
+            selection = scored[:TOP_K]
+        try:
+            pred_top_k = [c for c, _ in scored[:TOP_K]]
+            fwd_ret_map = dict(zip(today_valid["code"], today_valid["fwd_ret"]))
+            valid_fwd = {c: r for c, r in fwd_ret_map.items() if pd.notna(r)}
+            if len(valid_fwd) >= TOP_K * 5:
+                tail_quality_records.append({
+                    "date": dt,
+                    "pred_top_k": pred_top_k,
+                    "fwd_ret_map": valid_fwd,
+                })
+        except Exception as e:
+            logger.debug("tail_quality record skip {}: {}", dt, e)
+        if POSITION_SIZING == "conviction_oracle":
+            oracle_map = {}
+            for _, row in today_valid.iterrows():
+                fr = row.get("fwd_ret")
+                oracle_map[row["code"]] = float(fr) if pd.notna(fr) else 0.0
+            raw_scores = oracle_map
+        else:
+            raw_scores = raw_score_map
+        return selection, raw_scores
 
     # 4. Main loop — retrain monthly, score & rebalance daily
     for step, dt in enumerate(trading_dates):
@@ -691,7 +1218,7 @@ def run_walk_forward():
                 logger.warning("Too few training rows ({}), skipping retrain", len(train_df))
             else:
                 try:
-                    if RANKER_KIND == "blend":
+                    if RANKER_KIND in ("blend", "intraday_blend"):
                         from mp.ml.model import BlendRanker
                         ranker = BlendRanker(feature_cols=feature_cols)
                         metrics = ranker.train_fast(train_df)
@@ -715,6 +1242,19 @@ def run_walk_forward():
                 except Exception as e:
                     logger.error("  Training failed: {}", e)
 
+        # Round 147 (fix ② same-day timing): for SAME_DAY_14_30 the decision
+        # uses today's ≤14:29 injected factors and fills at TODAY's 14:29
+        # close — so we score BEFORE Step A and feed today's selection into
+        # the same pending mechanism, which Step A then executes at dt.
+        # Other modes (baseline / ③ next-day open / 14_30 legacy next-day
+        # with INTRADAY_NEXT_DAY=1) keep scoring at Step B → pending for
+        # tomorrow (unchanged).
+        if SAME_DAY_14_30:
+            _sel, _raws = _score_today(dt)
+            if _sel is not None:
+                pending_selection = _sel
+                pending_raw_scores = _raws
+
         # --- Step A: Execute pending signal from previous close at today's open ---
         if pending_selection is not None:
             sel_codes = {c for c, _ in pending_selection}
@@ -729,7 +1269,7 @@ def run_walk_forward():
                 # Compute current weights using today's open (execution price).
                 pos_values = {}
                 for c in held_codes:
-                    p = open_lk.get((c, dt), broker.positions[c].current_price)
+                    p = _entry_price(c, dt) or broker.positions[c].current_price
                     pos_values[c] = broker.positions[c].shares * p
                 total_equity = broker.cash + sum(pos_values.values())
                 target_w = 1.0 / TOP_K
@@ -750,8 +1290,8 @@ def run_walk_forward():
                     total_value_now = broker.total_value
                     target_per_stock = total_value_now / TOP_K
                     for code in list(broker.positions.keys()):
-                        price_raw = open_lk.get((code, dt))
-                        if price_raw is None or price_raw <= 0:
+                        price_raw = _entry_price(code, dt)
+                        if price_raw is None or pd.isna(price_raw) or price_raw <= 0:
                             continue
                         current_value = broker.positions[code].shares * price_raw
                         excess = current_value - target_per_stock
@@ -765,7 +1305,7 @@ def run_walk_forward():
                 # (b) Sell positions not in new selection at today's open
                 for code in list(broker.positions.keys()):
                     if code not in sel_codes:
-                        sell_price = open_lk.get((code, dt), broker.positions[code].current_price)
+                        sell_price = _entry_price(code, dt) or broker.positions[code].current_price
                         broker.sell(code, sell_price, date=dt_str,
                                     adv=adv_lk.get((code, dt)))
 
@@ -778,8 +1318,8 @@ def run_walk_forward():
                     raw_scores=pending_raw_scores,
                 )
                 for code, score in pending_selection:
-                    price_raw = open_lk.get((code, dt))
-                    if price_raw is None or price_raw <= 0:
+                    price_raw = _entry_price(code, dt)
+                    if price_raw is None or pd.isna(price_raw) or price_raw <= 0:
                         continue
                     target_value = total_value_now * weights.get(code, 1.0 / TOP_K)
                     broker.buy(code, price_raw, target_value=target_value,
@@ -793,58 +1333,14 @@ def run_walk_forward():
             pending_selection = None  # consumed
 
         # --- Step B: Score stocks at today's close, store as pending for tomorrow ---
-        # Filter to the universe that was known on this date to avoid look-ahead
-        # from index membership.  When only today's snapshot is available,
-        # current_universe == all current codes (no filtering effect).
-        # StockRanker stores its booster as `.model`; BlendRanker has no `.model`
-        # attribute but is ready as long as its sub-rankers are trained.
-        ranker_ready = current_ranker is not None and (
-            getattr(current_ranker, "model", None) is not None
-            or (
-                hasattr(current_ranker, "primary")
-                and getattr(current_ranker.primary, "model", None) is not None
-            )
-        )
-        if ranker_ready:
-            today_df = panel_by_date.get(dt)
-            if today_df is not None:
-                today_df = today_df[today_df["code"].isin(current_universe)]
-                today_valid = today_df.dropna(subset=core)
-                if not today_valid.empty:
-                    codes_in = today_valid["code"].tolist()
-                    scores = current_ranker.predict(today_valid)
-                    # Also capture raw excess predictions for conviction sizing
-                    # (BlendRanker.predict_raw returns primary's excess prediction
-                    # in decimal; StockRanker.predict_raw == predict).
-                    if hasattr(current_ranker, "predict_raw"):
-                        raws = current_ranker.predict_raw(today_valid)
-                    else:
-                        raws = scores
-                    raw_score_map = dict(zip(codes_in, raws))
-                    scored = sorted(zip(codes_in, scores), key=lambda x: -x[1])
-
-                    if COST_AWARE_REBALANCE:
-                        from mp.backtest.ml_backtest import _cost_aware_select
-                        pending_selection = _cost_aware_select(
-                            scored, TOP_K, broker, dt, adv_lk,
-                        )
-                    else:
-                        pending_selection = scored[:TOP_K]
-                    # Snapshot the raw scores keyed by date for the buy step.
-                    # In conviction_oracle mode (leak check ONLY), replace with
-                    # the realized forward 20d return — this is the perfect
-                    # conviction upper bound.
-                    if POSITION_SIZING == "conviction_oracle":
-                        oracle_map = {}
-                        for _, row in today_valid.iterrows():
-                            fr = row.get("fwd_ret")
-                            if pd.notna(fr):
-                                oracle_map[row["code"]] = float(fr)
-                            else:
-                                oracle_map[row["code"]] = 0.0
-                        pending_raw_scores = oracle_map
-                    else:
-                        pending_raw_scores = raw_score_map
+        # Round 147: SAME_DAY_14_30 already scored & consumed above (fix ②);
+        # the default path (baseline / ③ / 14_30 legacy next-day) scores here
+        # and stores pending for tomorrow's open execution in Step A.
+        if not SAME_DAY_14_30:
+            _sel, _raws = _score_today(dt)
+            if _sel is not None:
+                pending_selection = _sel
+                pending_raw_scores = _raws
 
         # --- Daily NAV ---
         close_snap = {}
@@ -874,7 +1370,29 @@ def run_walk_forward():
 
     # 5. Performance metrics
     nav_df = pd.DataFrame(nav_records)
+    # Round 135: NAV_DUMP writes the daily (date, daily_return, nav) series for
+    # regime bucketing (Arm B vs A daily excess by ZZ500 up/flat/down day).
+    _nav_dump = os.environ.get("NAV_DUMP")
+    if _nav_dump and not nav_df.empty:
+        nav_df.to_csv(_nav_dump, index=False)
+        logger.info("NAV_DUMP: wrote {} daily rows → {}", len(nav_df), _nav_dump)
     metrics = calc_performance(nav_df)
+
+    # 5b. Tail-quality metrics — Hit Rate@K and NDCG@K averaged over
+    # all scoring days.  Measures how good the model is at the TAIL
+    # (top-K picks), which is what actually drives a Top-K strategy.
+    tail_q = _compute_tail_quality_metrics(tail_quality_records, k=TOP_K)
+    metrics["hit_rate_at_k"] = tail_q["hit_rate"]
+    metrics["ndcg_at_k"] = tail_q["ndcg"]
+    metrics["actual_topk_alpha"] = tail_q["actual_topk_fwd_mean"]
+    metrics["selected_topk_alpha"] = tail_q["selected_topk_fwd_mean"]
+    metrics["topk_alpha_capture_rate"] = tail_q["alpha_capture_rate"]
+    metrics["tail_q_n_days"] = tail_q["n_days"]
+    logger.info("Tail quality ({} days @ K={}):  Hit Rate={:.1%}  NDCG={:.3f}  "
+                "Selected alpha={:.3%}  Realistic top-K alpha={:.3%}  Capture={:.1%}",
+                tail_q["n_days"], TOP_K, tail_q["hit_rate"], tail_q["ndcg"],
+                tail_q["selected_topk_fwd_mean"], tail_q["actual_topk_fwd_mean"],
+                tail_q["alpha_capture_rate"])
 
     # Fetch ZZ500 benchmark
     benchmark_ret = _calc_benchmark_return(trading_dates, close_lk, bars_map)
@@ -891,6 +1409,66 @@ def run_walk_forward():
     _save_report(metrics, monthly_returns, benchmark_ret, broker.trade_log, elapsed)
 
     return metrics, monthly_returns, current_ranker, benchmark_ret
+
+
+def _compute_tail_quality_metrics(records: List[dict], k: int = 10) -> Dict[str, float]:
+    """Compute Hit Rate@K, NDCG@K, and alpha capture rate over the daily
+    prediction records.
+
+    For each scoring day:
+      - actual top-K = the K codes with highest realized fwd_ret that day
+      - selected top-K = the K codes the model picked
+      - hit_rate@K = |selected ∩ actual| / K
+      - NDCG@K = sum(realized_fwd_ret[selected[i]] / log2(i+2)) /
+                 sum(realized_fwd_ret[actual[i]]    / log2(i+2))
+      - alpha capture rate = mean(selected fwd_ret) / mean(actual top-K fwd_ret)
+    """
+    if not records:
+        return {"hit_rate": float("nan"), "ndcg": float("nan"),
+                "actual_topk_fwd_mean": float("nan"),
+                "selected_topk_fwd_mean": float("nan"),
+                "alpha_capture_rate": float("nan"), "n_days": 0}
+
+    hits, ndcgs, sel_means, act_means = [], [], [], []
+
+    for rec in records:
+        pred = rec["pred_top_k"]
+        fwd_map = rec["fwd_ret_map"]
+        if not pred or not fwd_map:
+            continue
+        # Filter selected to those with valid fwd_ret
+        sel_valid = [c for c in pred if c in fwd_map]
+        if not sel_valid:
+            continue
+
+        # Actual top-K by realized fwd_ret
+        sorted_actual = sorted(fwd_map.items(), key=lambda x: -x[1])[:k]
+        actual_codes = [c for c, _ in sorted_actual]
+        actual_rets = [r for _, r in sorted_actual]
+
+        # Hit rate
+        hit = len(set(sel_valid) & set(actual_codes)) / len(sel_valid)
+        hits.append(hit)
+
+        # NDCG@K (normalized by ideal DCG of actual top-K)
+        sel_rets = [fwd_map[c] for c in sel_valid][:k]
+        dcg = sum(r / np.log2(i + 2) for i, r in enumerate(sel_rets))
+        ideal_dcg = sum(r / np.log2(i + 2) for i, r in enumerate(actual_rets))
+        if ideal_dcg != 0:
+            ndcgs.append(dcg / ideal_dcg)
+
+        sel_means.append(float(np.mean(sel_rets)))
+        act_means.append(float(np.mean(actual_rets)))
+
+    return {
+        "hit_rate": float(np.mean(hits)) if hits else float("nan"),
+        "ndcg": float(np.mean(ndcgs)) if ndcgs else float("nan"),
+        "actual_topk_fwd_mean": float(np.mean(act_means)) if act_means else float("nan"),
+        "selected_topk_fwd_mean": float(np.mean(sel_means)) if sel_means else float("nan"),
+        "alpha_capture_rate": (float(np.mean(sel_means)) / float(np.mean(act_means))
+                                if act_means and np.mean(act_means) != 0 else float("nan")),
+        "n_days": len(hits),
+    }
 
 
 def _calc_benchmark_return(
@@ -1057,16 +1635,7 @@ def update_production_models(
         logger.info("Production BlendRanker: saved from walk-forward (no retrain)")
         results["blend"] = {"source": "walk-forward", "saved": True}
     elif ranker_20d is None:
-        # --update-only path (no walk-forward ranker): legitimate request to
-        # refresh BlendRanker from scratch.
-        # NOTE 2026-05-24 (P3-1c, docs/dialog/ round 34): train_fast(ds_20) on
-        # full panel is known to produce a weak model (P3-1a evidence: val IC
-        # ~ -0.005). This is a SEPARATE bug (--update-only mode produces an
-        # inferior blend) tracked as a follow-up; not fixed in this commit
-        # because --update-only is rare and the failure is loud (logs show
-        # primary IC immediately, advisor will catch). Touching it here would
-        # widen scope beyond the P3-1c "don't clobber from non-blend caller"
-        # fix.
+        # --update-only path: legitimate refresh from scratch
         logger.info("Training production BlendRanker (0.8 primary + 0.2 extreme)...")
         if ds_20 is None:
             ds_20 = build_dataset(codes, TRAIN_START, horizon=20)
@@ -1092,22 +1661,16 @@ def update_production_models(
         else:
             results["blend"] = {"error": "no dataset"}
     else:
-        # P3-1c (docs/dialog/ round 34): caller passed a non-blend ranker
-        # (typically RANKER_KIND=stock walk-forward path with ranker_20d =
-        # StockRanker). Refresh-from-scratch via train_fast(ds_20) here was
-        # silently clobbering production blend_*.lgb with a model whose val
-        # IC ~ -0.005 (P3-1a incident: 1.90 Sharpe model overwritten;
-        # required manual git-show rollback). Skip the retrain entirely.
+        # P3-1c: caller passed a non-blend ranker (typically RANKER_KIND=stock).
+        # Skip retrain to avoid clobbering production blend (see commit 37ebfa8).
         logger.warning(
             "update_production_models: caller's ranker_20d is {} (not "
-            "BlendRanker); SKIPPING blend_*.lgb retrain to avoid clobbering "
-            "production blend model. Use --update-only to explicitly refresh "
-            "blend from scratch.",
+            "BlendRanker); SKIPPING blend_*.lgb retrain. Use --update-only "
+            "to explicitly refresh blend.",
             type(ranker_20d).__name__,
         )
         results["blend"] = {"skipped": True,
-                            "reason": f"non-blend ranker ({type(ranker_20d).__name__}) passed; "
-                                      "use --update-only to refresh blend"}
+                            "reason": f"non-blend ranker ({type(ranker_20d).__name__})"}
 
     # ── StockRanker fallback (data/model.lgb) ──
     if ranker_is_stock:
@@ -1298,6 +1861,14 @@ def send_model_update_report(
         lines.append("")
 
         # --- P4-1C threshold-breach alerts (BASELINE §4.1) ---
+        # Inline path: append the markdown block to the weekly report so
+        # the operator reading the Feishu weekly summary sees the breach.
+        # P8-α-3 (docs/dialog/ round 53): ALSO dispatch the breach event
+        # through alert_dispatch (Feishu + JSONL audit + stderr) so the
+        # breach record survives even if the weekly report's Feishu send
+        # is silent (e.g. lark-cli broken / webhook muted). Belt-and-
+        # suspenders — the weekly report is for visibility, alert_dispatch
+        # is for audit + SPOF mitigation.
         try:
             from mp.monitor.threshold_alert import (
                 check_thresholds,
@@ -1309,8 +1880,19 @@ def send_model_update_report(
                 if _alert_block:
                     lines.append(_alert_block)
                     lines.append("")
+                # Parallel multi-channel dispatch (P8-α-3)
+                try:
+                    from mp.monitor.alert_dispatch import dispatch_alert
+                    _max_level = "RED" if any(a["level"] == "RED" for a in _alerts) else "YELLOW"
+                    dispatch_alert(
+                        level=_max_level,
+                        title=f"{_max_level}: walk_forward threshold breach ({len(_alerts)} indicator(s))",
+                        body=_alert_block,
+                        source="threshold_alert",
+                    )
+                except Exception as _de:
+                    logger.warning("alert_dispatch failed (inline weekly path still ran): {}", _de)
         except Exception as _e:
-            # Alert dispatch must never break the existing weekly report
             logger.warning("threshold_alert dispatch failed: {}", _e)
 
         # --- Comparison with previous run ---
@@ -1371,7 +1953,21 @@ def send_model_update_report(
 
     # Read default user ID from daily_report constants
     USER_ID = "ou_da792f0119461fb14c41b21b40834b09"
-    cmd = ["lark-cli", "im", "+messages-send", "--as", "bot",
+
+    # round 174 fix: resolve lark-cli via shutil.which (Windows ECS sometimes
+    # lacks PATH inheritance into subprocess → WinError 2).
+    import shutil
+    binary = shutil.which("lark-cli")
+    if binary is None:
+        for cand in ("lark-cli.exe", "lark-cli.cmd", "lark-cli.bat"):
+            binary = shutil.which(cand)
+            if binary is not None:
+                break
+    if binary is None:
+        logger.warning("lark-cli not found on PATH — model update notification skipped")
+        return False
+
+    cmd = [binary, "im", "+messages-send", "--as", "bot",
            "--user-id", USER_ID, "--markdown", markdown]
 
     logger.info("Sending model update report to Feishu...")
@@ -1383,6 +1979,9 @@ def send_model_update_report(
         else:
             logger.error("Feishu send failed: {}", result.stderr or result.stdout)
             return False
+    except FileNotFoundError as e:
+        logger.warning("lark-cli binary at {} not executable ({}) — notification skipped", binary, e)
+        return False
     except Exception as e:
         logger.error("Feishu send error: {}", e)
         return False
@@ -1400,19 +1999,25 @@ if __name__ == "__main__":
     parser.add_argument("--cache-only", action="store_true",
                         help="Only build data cache, don't run backtest")
     parser.add_argument("--update-only", action="store_true",
-                        help="Only retrain production models (no backtest)")
+                        help="[DEPRECATED 2026-05-24 P6-A2] DO NOT USE. "
+                             "Triggered the P3-1c residual train_fast bug "
+                             "(IC=-0.005 weak blend overwrites production). "
+                             "Now raises SystemExit. See docs/dialog/ round 47.")
     args = parser.parse_args()
 
     if args.update_only:
-        t0 = time.time()
-        codes = _merged_current()
-        model_results = update_production_models(codes)
-        elapsed_min = (time.time() - t0) / 60
-        logger.info("Production models updated! ({:.1f} min)", elapsed_min)
-        send_model_update_report(
-            model_results=model_results,
-            elapsed_min=elapsed_min,
-            update_only=True,
+        raise SystemExit(
+            "ERROR: --update-only is deprecated (P3-1c residual bug — it would\n"
+            "       train_fast on full panel and overwrite production blend\n"
+            "       models with a weaker non-walk-forward fit; IC=-0.005 vs\n"
+            "       baseline +0.038).\n"
+            "\n"
+            "       Use full walk-forward retrain instead:\n"
+            "         python scripts/walk_forward_backtest.py [other args]\n"
+            "\n"
+            "       Production crontab was migrated 2026-05-24 (commit f5b5255,\n"
+            "       see docs/cron_setup.md). If you're seeing this from your own\n"
+            "       script/alias, update it too."
         )
     elif args.cache_only:
         codes = _merged_current()

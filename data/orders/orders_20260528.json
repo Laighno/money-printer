@@ -1,0 +1,86 @@
+{
+  "generated_at": "2026-05-28T09:15:05",
+  "report_date": "2026-05-28",
+  "account_snapshot": {
+    "total_assets": 105074.73,
+    "cash_available": 21885.73,
+    "market_value": 83189.0
+  },
+  "holdings_at_plan_time": [
+    {
+      "code": "002385",
+      "name": "大北农",
+      "shares": 3900,
+      "avg_cost": 3.549
+    },
+    {
+      "code": "002439",
+      "name": "启明星辰",
+      "shares": 900,
+      "avg_cost": 15.179
+    },
+    {
+      "code": "002773",
+      "name": "康弘药业",
+      "shares": 600,
+      "avg_cost": 21.188
+    },
+    {
+      "code": "600511",
+      "name": "国药股份",
+      "shares": 500,
+      "avg_cost": 26.88
+    },
+    {
+      "code": "600808",
+      "name": "马钢股份",
+      "shares": 4100,
+      "avg_cost": 3.161
+    },
+    {
+      "code": "000539",
+      "name": "粤电力Ａ",
+      "shares": 2500,
+      "avg_cost": 6.622
+    }
+  ],
+  "orders": [
+    {
+      "code": "002385",
+      "name": "大北农",
+      "action": "减仓",
+      "shares": 1900,
+      "limit_price": 3.29,
+      "cost": -6251.0,
+      "reason": "模型排名 #54/800（跌出 Top 30，减半仓）"
+    },
+    {
+      "code": "600808",
+      "name": "马钢股份",
+      "action": "加仓",
+      "shares": 1600,
+      "limit_price": 3.08,
+      "cost": 4928.0,
+      "reason": "模型 #1/800, 超额 +2.20%，目标仓位 16.9% (现 11.9%)"
+    },
+    {
+      "code": "002439",
+      "name": "启明星辰",
+      "action": "加仓",
+      "shares": 100,
+      "limit_price": 14.87,
+      "cost": 1487.0,
+      "reason": "模型 #2/800, 超额 +1.93%，目标仓位 15.2% (现 12.6%)"
+    },
+    {
+      "code": "002958",
+      "name": "青农商行",
+      "action": "买入",
+      "shares": 4700,
+      "limit_price": 2.89,
+      "cost": 13583.0,
+      "reason": "模型 #11/800, 超额 +1.59%，目标仓位 13.1% (现 0.0%)"
+    }
+  ],
+  "alerts": []
+}

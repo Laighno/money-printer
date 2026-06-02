@@ -3,51 +3,59 @@
 # shares / avg_cost / entry_date: 可选，填写后 Tab4 显示浮动盈亏
 # 更新方式: 发券商截图给 Claude，自动识别并更新
 # 规则: 清仓股票直接从列表移除（不再保留 shares=0 占位）
-# 最后更新: 2026-05-15 10:00 (OCR截图识别)
-# 浮动盈亏 -14,622.64 / 当日盈亏 -7,496.00 (-2.69%)
-# 今日动作 (5-15):
-#   - 卖出 健友股份 9500股 (实现 -3,528.98 / -3.62%, 平均卖价 ~8.81) 止损
-#   - 加仓 粤电力A 12100股 (T+1 锁仓, 摊低成本)
-# 昨日动作 (5-14, 未在 portfolio.yaml 记录):
-#   - 新建仓 粤电力A 14200股 (已 T+1 解锁)
-# 备注: 仓位拉到 99.8%，可用资金仅 502.80 元。粤电力A 早盘 -8.19% 砸盘，
-#       昨天那笔在高位接的（≈7.5-7.7），今天 6.82 浮亏 -¥10,149.53。
-#       新模型 (HS300+ZZ500, walk-forward) 5-15 早盘报告仍把粤电力A 列推荐 #1
-#       (excess +5.08%)，逻辑上"持有 + 摊低成本"是顺着模型；但 99.8% 仓位
-#       完全没有止损余量，下行风险敞口大。
+#
+# 最后更新: 2026-05-28 09:08 (从 QMT 8886933837 实测同步)
+#
+# === 账户切换 (2026-05-26) ===
+# 之前的 27 万账户 yaml 存档于 config/portfolio_27w_pre_qmt_switch.yaml.archive
+# 当前 portfolio.yaml 反映国金证券 QMT 账户 8886933837 实际持仓
+# 5/27 交易后 portfolio.yaml 一度 stale (未回写)；5/28 09:08 advisor 从 QMT
+# query_stock_positions 重新同步 — 002984 已清仓, 002773/600511/600808/000539
+# 新建仓, 002385 减仓, 002439 加仓
 
 # 账户快照（结构化，供 4 点日报订单清单生成用）
+# 2026-05-31 13:14 advisor 从 QMT 直查重 sync 修复 (5/30 auto-sync 抓到 mock 哨兵值 1e10/9999999999)
 account:
-  total_assets: 271428.80      # 总资产
-  market_value: 270926.00      # 持仓市值
-  cash_available: 502.80       # ⚠️ 可用资金接近 0
-  position_pct: 0.998          # ⚠️ 仓位 99.8%（无止损空间）
+  total_assets: 287262.49      # 总资产 (QMT 直查 2026-05-31 13:13)
+  market_value: 70759.00       # 持仓市值
+  cash_available: 216503.49    # 可用资金
+  position_pct: 0.246          # 仓位 = market_value / total_assets
   target_position_pct: 0.70    # 订单生成目标仓位（可调）
-  updated_at: '2026-05-15'
+  updated_at: '2026-05-31'
 
 holdings:
-- name: 粤电力A
-  code: '000539'
+- name: 国药股份
+  code: '600511'
   type: stock
   board: ''
-  shares: 26300              # 14200 (5-14 建仓) + 12100 (5-15 加仓，T+1 锁仓)
-  avg_cost: 7.429            # 显示均价；总成本 195,383
-  entry_date: '2026-05-14'   # 首次建仓日；最近加仓 5-15 T+1 锁仓至 5-18
+  shares: 500
+  avg_cost: 26.880
+  entry_date: '2026-05-30'   # auto-sync 写入时间; 实际建仓日未知
+- name: 马钢股份
+  code: '600808'
+  type: stock
+  board: ''
+  shares: 5700
+  avg_cost: 3.119
+  entry_date: '2026-05-30'   # auto-sync 写入时间; 实际建仓日未知
 - name: 启明星辰
   code: '002439'
   type: stock
   board: ''
-  shares: 4000
-  avg_cost: 16.156           # 反推自浮亏 -126.01 @ 现价 16.140（broker 微调）
-  entry_date: '2026-05-08'
-- name: 大北农
-  code: '002385'
+  shares: 1000
+  avg_cost: 15.136
+  entry_date: '2026-05-30'   # auto-sync 写入时间; 实际建仓日未知
+- name: 康弘药业
+  code: '002773'
   type: stock
   board: ''
-  shares: 7200
-  avg_cost: 3.860            # 反推自浮亏 -818.12 @ 现价 3.750
-  entry_date: '2026-05-11'
-- name: 国防军工
-  code: null
-  type: board
-  board: 军工装备
+  shares: 600
+  avg_cost: 21.188
+  entry_date: '2026-05-30'   # auto-sync 写入时间; 实际建仓日未知
+- name: 青农商行
+  code: '002958'
+  type: stock
+  board: ''
+  shares: 4700
+  avg_cost: 2.861
+  entry_date: '2026-05-30'   # auto-sync 写入时间; 实际建仓日未知

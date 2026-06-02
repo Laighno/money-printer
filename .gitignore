@@ -16,6 +16,8 @@ data/training_dataset*.parquet
 data/backup_pre_volume_fix/
 data/wf_cache/
 data/paper_trade/
+# P11-4 intraday 1m bars from xtquant on ECS — ~1 GB parquet, sync via rsync not git
+data/intraday_1m/
 data/reports/watchlist/
 # Model archives — keep locally as rollback, but don't bloat git
 data/blend_*_v1.lgb

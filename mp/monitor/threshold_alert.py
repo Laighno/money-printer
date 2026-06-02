@@ -23,24 +23,102 @@ health, style drift etc. (BASELINE §4.2-4.4) remain manual review per
 BASELINE §4 intent ("看这些"). Adding more here is a P5 decision; do
 not extend without advisor sign-off (round-39 spec was explicit on
 keeping this minimal).
+
+Threshold rationale (P5-A-light, docs/dialog/ round 41)
+-------------------------------------------------------
+The YELLOW / RED constants below are **absolute pain levels** copied
+from BASELINE.md §4.1 (commit a947303 era). They are NOT statistically
+grounded against a weekly walk-forward Sharpe distribution.
+
+Specifically:
+- Cross-seed σ from β0 spike (round 36, commit b73834a) = 0.13, but
+  this measures **seed lottery**, not weekly walk-forward drift
+- **Weekly walk-forward time-series σ has never been measured**.
+  Production runs deterministic ``LGBM_SEED=42``; weekly drift comes
+  from data-window shifting only (one more week of training data per
+  weekly cron + any new factor-cache invalidations)
+- Therefore framing "RED Sharpe 0.9 = -7σ from cross-seed mean" is a
+  type error — the right σ for tuning these thresholds doesn't exist
+  in this repo yet
+
+Known limitations of the current calibration:
+- RED Sharpe < 0.9 may rarely trigger if true weekly σ is small —
+  Sharpe halving is a catastrophic regime change, not a typical
+  weekly fluctuation
+- YELLOW Sharpe < 1.4 may be too lax if true weekly σ is small enough
+  that real degradation manifests as Δ ~ -0.2 Sharpe, not Δ ~ -0.5
+- Proper grounding requires a "P5-A-mid" follow-up (currently NOT
+  scheduled): rerun weekly walk-forward N weeks back, measure
+  time-series σ, then re-derive YELLOW/RED bands as e.g. (mean −kσ).
+  Cost ~4-6 hr per N=8-12 weeks. Deferred to a separate research chain
+  per advisor round 41.
+
+For now: treat the alerts here as **"absolute pain level" gates**, not
+"statistically significant departure" gates. Manual review of weekly
+``data/reports/walk_forward_result.md`` remains the primary monitoring
+path; the Feishu auto-alert is a backstop for severe breaches, not the
+sole detector of model drift.
+
+THRESHOLD ANCHOR STATUS (P8-α-1 update, 2026-05-25, docs/dialog/ rounds 53-54)
+==============================================================================
+**Re-anchoring complete.**  Operator selected new thresholds anchored
+to the P7-3 deterministic baseline (Sharpe 1.20).  Previous P7-3
+"awaits operator re-anchoring" caveat is RESOLVED.
+
+| Indicator      | Old (1.90 anchor) | **New (1.20 anchor)** | Scale relation |
+|----------------|-------------------|------------------------|----------------|
+| YELLOW Sharpe  | 1.40              | **0.90**               | 75% of baseline |
+| RED Sharpe     | 0.90              | **0.50**               | 42% of baseline |
+| YELLOW Max DD  | -42%              | **-30%**               | TIGHTENED      |
+| RED Max DD     | -50%              | **-40%**               | TIGHTENED      |
+
+Operator rationale (docs/dialog/ round 54):
+ - **Sharpe**: keep the same 75% / 42% scale ratio that the old
+   thresholds had to the old baseline — preserves the semantic
+   ("YELLOW = noticeable degradation, RED = catastrophic regime
+   change") without changing the operator's pain function.
+ - **Max DD**: tightened (-42→-30 YELLOW, -50→-40 RED) because live
+   slippage / overnight gap risk is higher than backtest simulation
+   models.  The deterministic backtest Max DD is -32.74%, which
+   straddles the new YELLOW -30 — expected: the first weekly cron
+   under the new thresholds will likely trip a YELLOW Max DD alert
+   from BACKTEST history (not live).  See "Heads-up" note in
+   docs/dialog/ round 54 — that is calibration noise, not a real
+   live-trading breach.  Operator chose to leave the threshold tight.
+
+annual_return thresholds (30% / 15% YELLOW/RED) are UNCHANGED — the
+operator did not re-anchor that indicator (deterministic baseline
+38.74% still well above 30% YELLOW).
+
+These remain "operator-set absolute pain thresholds" per P5-A-light +
+P7-α semantics.  rule #6 σ-anchor cross-check does NOT apply (these
+are not σ-grounded; see P8 docs ticket in docs/TODO.md for the
+explicit categorization rationale).  If future evidence shifts the
+deterministic baseline, the operator (only) re-runs this anchoring
+exercise.
 """
 from __future__ import annotations
 
 from typing import Optional
 
 
-# YELLOW alert threshold (≈ 50% degradation from BASELINE)
+# YELLOW alert threshold — re-anchored to P10-1 N=3 BlendRanker distribution
+# (P10-2, 2026-05-26, docs/dialog/ round 70). N=3 mean Sharpe = 1.82,
+# worst-seed = 1.67. YELLOW 1.0 means "below worst-seed normal by ~0.67"
+# → anomaly. Was 0.90 (anchored to old P7-γ StockRanker baseline 1.20,
+# which itself was a mis-measurement; see decision_log P10-2 chain).
 YELLOW = {
-    "sharpe_ratio":        1.40,
-    "annual_return_pct":   30.0,
-    "max_drawdown_pct":   -42.0,    # less negative than this = pass (i.e. > -42% is healthy)
+    "sharpe_ratio":        1.00,    # was 0.90 (anchored to 1.20 StockRanker; now 1.82 BlendRanker N=3 mean / 1.67 worst)
+    "annual_return_pct":   30.0,    # unchanged
+    "max_drawdown_pct":   -30.0,    # unchanged
 }
 
 # RED alert threshold (immediate paper-trade halt per BASELINE §4)
+# RED 0.50 ≈ worst-seed (1.67) / 3 = severe degrade. Kept unchanged.
 RED = {
-    "sharpe_ratio":        0.90,
-    "annual_return_pct":   15.0,
-    "max_drawdown_pct":   -50.0,
+    "sharpe_ratio":        0.50,    # unchanged (severe degrade ≈ worst-case / 3)
+    "annual_return_pct":   15.0,    # unchanged
+    "max_drawdown_pct":   -40.0,    # unchanged
 }
 
 

@@ -160,6 +160,18 @@ SOURCE_CONVENTIONS: Dict[str, Dict[str, str]] = {
         "turnover": None,
         "amount": "CNY",
     },
+    "xtdata": {
+        # xtquant/xtdata daily bars (used by intraday_plan's DB-warm path,
+        # P11-5 round 107). The caller (warm_daily_bars_via_xtdata) self-
+        # calibrates the volume unit from the amount/(volume*close) ratio
+        # BEFORE this normalize step — so by the time it reaches here volume
+        # is canonical 股 regardless of whether xtdata returned 股 or 手.
+        # xtdata does not expose 换手率 in the bar, so turnover is left NaN
+        # (Sina often omits it too — not a regression).
+        "volume": "shares",
+        "turnover": None,
+        "amount": "CNY",
+    },
     "test_canonical": {
         # Used by tests — input already in canonical units, no conversion.
         "volume": "shares",

@@ -503,6 +503,11 @@ TwoStageRanker 在回测中未进入37个正式测试变体，说明早期实验
 
 ## 十、结论
 
+> 🚨 **2026-05-26 retraction notice (P10-1)**:
+> 本节及上游"winsorize OLD ≡ NEW byte-identical / 两个 model 在 walk_forward 测量下无显著差异"的结论**仅在 `RANKER_KIND=stock` walk_forward 测量路径下成立**.
+> Production 加载的是 **BlendRanker** (`excess_ret` label, `data/blend_*.lgb`), 后续 P10-1 N=3 BlendRanker A/B (commit `925cc12` `docs/decision_log.md` "## P10 chain") 显示 winsorize 在 production 路径下 **HELPS by +0.26 Sharpe** (3/3 seed directional, NEW > OLD).
+> Production `data/blend_*.lgb` 配置正确, **不要按本节叙事 revert winsorize**. 详见末尾附录 + Catch #10 (Rule #11 派生于此 — measurement ranker 必须与 production 一致).
+
 | 维度 | 评价 |
 |------|------|
 | **模型有效性** | 6年持续正超额，年化+39.4%(扣费)，alpha真实存在 |
@@ -514,3 +519,40 @@ TwoStageRanker 在回测中未进入37个正式测试变体，说明早期实验
 
 ---
 *Money Printer Framework Evaluation | 2026-04-13*
+
+---
+
+## 附录 · P10-1 反转更正 (2026-05-26)
+
+之前章节 "正确测量下: OLD ≡ NEW byte-identical" 的结论**仅在 walk_forward 默认 RANKER_KIND=stock (StockRanker, `fwd_ret` label) 路径下成立** — 那个测量层 winsorize 真是 no-op，所以 OLD ≡ NEW 0 spread 是真的。
+
+但**production 实际加载的是 BlendRanker (`data/blend_primary.lgb` + `data/blend_extreme.lgb`)，用 `excess_ret` label，winsorize 真有 effect**。P10-1 跑了 6 个 deterministic BlendRanker A/B (N=3 per config, seeds 42/43/44, RANKER_KIND=blend):
+
+| seed | OLD Sharpe (no winsorize) | NEW Sharpe (winsorize ON, current production) | spread |
+|---:|---:|---:|---:|
+| 42 | 1.54 | **1.90** | **+0.36** |
+| 43 | 1.52 | **1.89** | **+0.37** |
+| 44 | 1.61 | **1.67** | **+0.06** |
+| mean (N=3) | 1.557 | **1.820** | **+0.263** |
+| std | 0.047 | 0.130 | — |
+
+**3/3 seed 方向一致：NEW (winsorize ON) > OLD**。当前 production `blend_*.lgb` 训练时的 `EXCESS_CAP=0.50` 设置**比 OFF 高 +0.26 Sharpe**，配置正确。
+
+### Catch #10 (跨 var attribution)
+
+P9-0 的 "OLD seed 42 = 1.54 vs NEW seed 42 = 1.20" 原 P9 chain 误归因到 winsorize:
+- 1.54 实际是 **BlendRanker + winsorize OFF** (P10-1 验证: 复现 1.54)
+- 1.20 实际是 **StockRanker + winsorize ON** (P9-CLOSE 验证: StockRanker seed 42 = 1.20)
+- 0.34 spread 是 **BlendRanker - StockRanker 的 ranker 差异**, 不是 winsorize 的 effect
+
+### Rule #10 候选
+
+A/B 测试必须严格单变量，跨多 config dim 的 spread 不能直接归因到单个 var。报告中显式列出"holding constant"清单（哪些 var 是固定的）。
+
+### 最终决策 (P10-CLOSE, commit `925cc12`)
+
+- ✅ production `.lgb` 配置正确（winsorize ON），**不 retrain**
+- ✅ 阈值不重 anchor (mean Sharpe 1.82 远在 alert range 上方)
+- ✅ γ 实盘路径 fully unblock — 之前担心的"winsorize 让模型 worse"已彻底证伪
+- ✅ 详见 `docs/decision_log.md` "P10-1 chain · BlendRanker A/B confirms winsorize lift" section
+

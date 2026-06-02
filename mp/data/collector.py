@@ -210,7 +210,8 @@ def collect_all(codes: Optional[List[str]] = None, backfill: bool = False):
     Parameters
     ----------
     codes : list[str], optional
-        Stock codes for per-stock signals. If None, uses ZZ500.
+        Stock codes for per-stock signals. If None, uses HS300 + ZZ500
+        (the same universe scored by daily_report / paper_trade).
     backfill : bool
         If True, try to backfill margin data for multiple dates.
     """
@@ -218,9 +219,12 @@ def collect_all(codes: Optional[List[str]] = None, backfill: bool = False):
 
     if codes is None:
         try:
-            from mp.data.fetcher import get_index_constituents
-            codes = get_index_constituents("zz500")
-            logger.info("Using ZZ500 universe: {} stocks", len(codes))
+            # Widened from zz500-only on 2026-05-15 to match the
+            # recommendation universe — otherwise HS300 stocks scored by
+            # daily_report would miss fund_flow features.
+            from mp.data.fetcher import get_recommendation_universe
+            codes = get_recommendation_universe()
+            logger.info("Using HS300+ZZ500 universe: {} stocks", len(codes))
         except Exception:
             codes = []
 
