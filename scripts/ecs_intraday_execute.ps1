@@ -85,6 +85,24 @@ if ($LASTEXITCODE -ne 0) { Abort "git pull failed (exit $LASTEXITCODE)" }
 $head = (& git rev-parse --short HEAD).Trim()
 Log "Step 1: HEAD = $head"
 
+# Step 2a (round 194 added): warm 1m cache via download_history_data2.
+# Background: XtMiniQmt 重启后默认只交易, 行情订阅不启动. intraday_plan.py
+# cache-read assumption (line 386-387) broke 6/2 14:30 ("xtdata 1m returned
+# 0 rows for all fields", round 194). This explicit warm step downloads
+# universe 1m bars (~30-60s for 615 codes) so step 2's cache-read works.
+Log "Step 2a: warm 1m cache via download_history_data2 (round 194 fix)"
+$warmArgs = @(
+    "-X", "utf8",
+    "scripts\ecs_warm_intraday_cache.py"
+)
+$warmOutput = & $pythonExe @warmArgs 2>&1 | Out-String
+$warmOutput.Trim().Split("`n") | ForEach-Object { Log "  warm: $_" }
+$warmExit = $LASTEXITCODE
+Log "Step 2a: warm cache exit = $warmExit"
+if ($warmExit -ne 0) {
+    Abort "warm cache failed (exit $warmExit) -- intraday_plan would also fail without 1m cache"
+}
+
 # Step 2: Phase A -- intraday_plan.py generates today's 14:30 plan.
 # Script blocks via sleep_to_trigger until clock = 14:30:00, then
 # fetches + scores + writes data/orders/intraday_latest.json. Exit
