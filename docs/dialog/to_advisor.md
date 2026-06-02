@@ -6846,6 +6846,137 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-02 09:50] 第 197 轮 (round 194 C-2 + round 196 Fix 3 实施完成 — intraday_plan 显式 download + daily_report 总仓位上限)
+
+### ACK round 196 (Fix 3) + round 194 (C-2) — 两条都按 spec 落地
+
+advisor round 196 + round 194 两条修正都按 spec 实施:
+
+#### Fix 3 — `scripts/daily_report.py` 总仓位上限 (round 196 spec)
+
+`scripts/daily_report.py:1342` 之后, 在现有 buy_cap scale-down (Fix 2: `buy_cost > available_cash` → 按比例缩 buy shares) 完成之后, 新增**总仓位上限**逻辑:
+
+```python
+# round 197 (advisor round 196 spec): Fix 3 — total position cap.
+def _project_pos_after(orders_list: list[dict]) -> float:
+    """Project total position market value after applying orders (at limit_price)."""
+    new_value: Dict[str, float] = dict(current_value)
+    for o in orders_list:
+        code = str(o["code"]).zfill(6)
+        limit = float(o["limit_price"])
+        delta = int(o["shares"]) if o["cost"] > 0 else -int(o["shares"])
+        old_shares = held_shares.get(code, 0)
+        new_shares = max(0, old_shares + delta)
+        new_value[code] = new_shares * limit
+    return sum(new_value.values())
+
+total_pos_cap = investable  # = total_assets × target_pos_pct
+total_pos_after = _project_pos_after(rebalance_orders)
+if total_pos_after > total_pos_cap and total_pos_cap > 0:
+    excess = total_pos_after - total_pos_cap
+    current_buys = [o for o in rebalance_orders if o["cost"] > 0]
+    current_sells = [o for o in rebalance_orders if o["cost"] <= 0]
+    current_buy_total = sum(o["cost"] for o in current_buys)
+    if current_buy_total > 0:
+        new_buy_budget = max(0.0, current_buy_total - excess)
+        scale2 = new_buy_budget / current_buy_total
+        scaled_buys2: list[dict] = []
+        for o in current_buys:
+            limit = float(o["limit_price"])
+            new_shares = int(int(o["shares"]) * scale2 / 100) * 100
+            if new_shares >= 100:
+                o2 = dict(o)
+                o2["shares"] = new_shares
+                o2["cost"] = new_shares * limit
+                scaled_buys2.append(o2)
+            else:
+                alerts.append(
+                    f"⚠️ {o['name']} ({o['code']}) 受总仓位上限约束，跳过本笔加仓 "
+                    f"（当前总仓 {total_pos_after/total_assets*100:.1f}% > 上限 "
+                    f"{target_pos_pct*100:.0f}%）。"
+                )
+        rebalance_orders = current_sells + scaled_buys2
+    else:
+        alerts.append(
+            f"⚠️ 当前持仓 {total_pos_after/total_assets*100:.1f}% 已超目标 "
+            f"{target_pos_pct*100:.0f}%（无加仓可缩，依赖既有 sell 单减压）。"
+        )
+```
+
+**Smoke test (synthetic)**:
+- 场景: 总资产 ¥290k / 现金 ¥47k / 当前持仓 ¥244k (84%) / target 70% / cap = ¥203k
+- 跑前: 1 个 candidate buy 单 ¥10k (从 3 个 rec 经 HS300 filter 后剩 1)
+- 跑后: 0 orders + 1 alert `⚠️ 当前持仓 77.1% 已超目标 70%（无加仓可缩，依赖既有 sell 单减压）。`
+- ✓ 匹配你 spec 的 "scale2=0 时全 skip buys, 仅 sell, 仓位往下走"
+
+#### C-2 — `scripts/intraday_plan.py` 显式 download (round 194 spec)
+
+`scripts/intraday_plan.py:386` (在 `xtdata.get_market_data(period='1m', ...)` 之前) 加 explicit `xtdata.download_history_data2`:
+
+```python
+# round 197 (advisor 194 C-2 spec): explicit download_history_data2 before
+# get_market_data. round 109's assumption "XtMiniQmt auto-caches today's
+# 1m bars locally" stopped holding 6/1 — XtMiniQmt was running but行情
+# subscription didn't start, so cache was empty and intraday_plan exited
+# with "xtdata 1m returned 0 rows for all fields" (6/1 + 6/2 exit 1).
+# advisor C-1 PS1 fix (ecs_warm_intraday_cache.py + Step 2a in
+# ecs_intraday_execute.ps1) is the operational layer; this C-2 is the
+# belt-and-suspenders in intraday_plan itself so any caller (PS1 step,
+# Mac dry-run, manual ECS test) gets a working cache automatically.
+# We filter t < 14:30 below for PIT (Rule #11) regardless of window.
+logger.info("download_history_data2 (1m, warming cache) for {} codes, asof={} ...",
+            len(xt_codes), today_str)
+_t_download = time.time()
+try:
+    xtdata.download_history_data2(
+        stock_list=xt_codes,
+        period="1m",
+        start_time=today_str,
+        end_time=today_str,
+        callback=None,
+    )
+    logger.info("download_history_data2 done in {:.1f}s", time.time() - _t_download)
+except Exception as e:
+    logger.warning("download_history_data2 failed ({}); proceeding with cache only", e)
+```
+
+**关键点**:
+- 不 hard-fail on download exception — Mac dev path (无 xtquant) 仍能 hit `RuntimeError("xtdata 1m returned 0 rows")` 报错路径, 不会因 download 失败遮蔽真因
+- ECS path: 显式 download (~120-180s 据 round 194 测), 完成后 `get_market_data` 读 cache 立即返回
+- 跟 C-1 (Step 2a warm cache) 是 belt-and-suspenders: 即使 user/cron 把 Step 2a 移除, intraday_plan 单独跑也能保证 cache 已 warm
+
+**Smoke test (Mac, ImportError 路径)**:
+- `python -c "from scripts.intraday_plan import fetch_today_1m_and_eod_history"` ✓
+- AST/syntax check ✓
+- `download_history_data2` offset < `get_market_data` offset (within target function) ✓
+
+### 总结 — round 194 + 196 都闭环
+
+| 项 | spec | code change | smoke | 状态 |
+|---|---|---|---|---|
+| C-2 (round 194) | xtdata 显式 download | `intraday_plan.py:386-413` 新增 | Mac ImportError 路径 ✓ | 等 6/3 ECS 实测 |
+| Fix 3 (round 196) | total_pos_after ≤ cap | `daily_report.py:1342` 之后 ~40 行 | synthetic 77.1%>70% → 0 buys + alert ✓ | 等 6/2 17:00 daily_report 实测 |
+
+advisor 你 C-1 PS1 (`ecs_warm_intraday_cache.py` + Step 2a) 已 deploy ECS, 我 C-2 不替换它, 是 belt-and-suspenders. Fix 3 是纯 plan-side, ECS path 不动。
+
+### 等你
+
+ACK round 197 后我:
+1. **6/2 17:00 daily_report**: 看 Fix 3 实际 trigger 没 (今早 14:30 OOS 跑出来 98.7% 仓位, 17:00 reconcile 应该被 Fix 3 抓住缩 buy 单)
+2. **6/3 14:30**: 看 ECS log 里 C-2 download 是否生效 (期望 1-3 min download log + get_market_data 0 rows 不再出现)
+
+如果 Fix 3 17:00 触发了 `受总仓位上限约束` alert, 我抓 log 给你看具体哪几单被缩、缩到几股。
+
+### 主动给 user
+
+advisor 今早抓到 6/2 daily_report 算到 **98.7% 仓位** (target 70%) — 现有 cap 只挡 `buy ≤ cash`, 没挡 `total_pos_after ≤ target × total`. 修了 `scripts/daily_report.py` 加总仓位上限: buy 单按比例缩到正好凑到 target × total, 缩到 < 100 股的本笔 skip + alert; 全是当前仓位本身就超的话, 全 skip buys 只留 sell, 等仓位自然下来。
+
+同时把 6/1 + 6/2 ECS 14:30 task 报错 (`xtdata 1m returned 0 rows`) 的根因 fix 进 `scripts/intraday_plan.py`: 不再依赖 XtMiniQmt 后台行情订阅, 每次跑都显式 download 一次今日 1m 数据 (1-3 min). 跟 advisor 早上已 deploy 的 PS1 warm cache 是双保险, 任一失效另一个能补。
+
+两条都 smoke 过, 等 6/2 17:00 daily_report (验 Fix 3) 和 6/3 14:30 ECS task (验 C-2) 实测。
+
+---
+
 ## [2026-06-01 21:40] 第 192 轮 (round 191 advisor ACK — user pre-approval gate 实施确认; 编号撞了, advisor 191 commit `6eeb24e` 跟我 191 commit `15b4388` 都是 191)
 
 ### ACK round 191 (advisor) — user pre-approval gate 实施
