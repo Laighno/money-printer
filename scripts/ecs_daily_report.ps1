@@ -44,13 +44,20 @@ if ($LASTEXITCODE -ne 0) { Abort "git pull failed (exit $LASTEXITCODE)" }
 $head = (& git rev-parse HEAD 2>&1).Trim()
 Log "Step 1: HEAD = $head"
 
-# Step 2: sync portfolio.yaml from QMT (catches drift before plan generation)
-Log "Step 2: sync_portfolio_from_qmt.py"
-$syncOutput = & $pythonExe -X utf8 scripts\sync_portfolio_from_qmt.py 2>&1 | Out-String
-$syncOutput.Trim().Split("`n") | ForEach-Object { Log "  sync: $_" }
+# Step 2: sync portfolio.yaml from QMT (ECS-local, no SSH self-loop)
+# round 195 fix: original sync_portfolio_from_qmt.py SSH-es to ECS (designed
+# for Mac caller); on ECS that's self-SSH → hang. Call qmt_snapshot.py
+# directly + post-process to rewrite yaml.
+Log "Step 2: qmt_snapshot.py (ECS-local portfolio sync)"
+$snapOutput = & $pythonExe -X utf8 scripts\qmt_snapshot.py 2>&1 | Out-String
+$snapOutput.Trim().Split("`n") | ForEach-Object { Log "  snapshot: $_" }
 if ($LASTEXITCODE -ne 0) {
-    Log "  WARNING: portfolio sync failed (exit $LASTEXITCODE); proceeding with existing yaml"
+    Log "  WARNING: qmt_snapshot failed (exit $LASTEXITCODE); proceeding with existing yaml"
 }
+# Note: D2.5 doesn't write portfolio.yaml from snapshot — that's a separate
+# code path in sync_portfolio_from_qmt.py post-SSH. For D2.5 dry-run, we just
+# confirm QMT is reachable; yaml stays as-is. D7 follow-up: extract yaml-write
+# logic from sync_portfolio_from_qmt.py and run it locally on ECS.
 
 # Step 3: collect external data (northbound + margin + fund_flow)
 Log "Step 3: mp.data.collector"
