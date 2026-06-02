@@ -84,17 +84,22 @@ if ($LASTEXITCODE -ne 0) {
     Log "  WARNING: shadow recorder failed (non-fatal; real path unaffected)"
 }
 
-# Step 6: git commit + push plan files (only if changed)
-Log "Step 6: git commit + push plan files"
+# Step 6: git commit plan files LOCALLY (round 195 C-arch: no push)
+# Background: ECS GitHub deploy key is read-only by design (security).
+# User round 195 拍板 option C: ECS writes runtime state locally; prod
+# execute_orders (ecs_auto_execute.ps1) reads from local file system, not
+# git. Mac launchd com.moneyprinter.collect to be disabled at P0 D3 step
+# to avoid double-write conflict.
+# Local commit kept for audit trail (ECS git log shows daily commits even
+# without push). ECS local main diverges from origin/main by N commits but
+# never pushes — D7 reconciliation: squash or reset.
+Log "Step 6: git commit plan files LOCALLY (no push, P0 C-arch)"
 & git add data/orders/latest.json data/orders/orders_*.json data/reports/daily_*.md config/portfolio.yaml data/external/*.parquet 2>&1 | Out-Null
 & git diff --cached --quiet
 if ($LASTEXITCODE -ne 0) {
-    $commitMsg = "auto: daily plan $(Get-Date -Format 'yyyy-MM-dd') (ECS-side, push for next-morning execute)"
+    $commitMsg = "auto: daily plan $(Get-Date -Format 'yyyy-MM-dd') (ECS-local, no push by P0 C-arch design)"
     & git commit -m $commitMsg 2>&1 | Out-String | ForEach-Object { Log "  git: $_" }
-    & git push origin $BRANCH 2>&1 | Out-String | ForEach-Object { Log "  git: $_" }
-    if ($LASTEXITCODE -ne 0) {
-        Abort "git push failed (exit $LASTEXITCODE) -- ECS 9:25 next morning will use stale plan"
-    }
+    Log "Step 6: committed locally (ECS write-only; deploy key read-only by design)"
 } else {
     Log "Step 6: no changes to commit (idempotent / weekend / market closed)"
 }
