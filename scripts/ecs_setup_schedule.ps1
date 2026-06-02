@@ -83,13 +83,16 @@ Register-MPTask `
 # complete before intraday_plan.py's sleep_to_trigger 14:30:30 deadline.
 # 6/1 14:30 run actually fired exit 2 because `git pull` took 33s (cold
 # cache after weekend) and missed the deadline by ~3s — see round 184.
-# 14:28:00 gives 120s of slack: git pull typically <10s but can hit 60s+
-# on a cold cache; sleep_to_trigger still anchors execution to exactly
-# 14:30:00 (Rule #11 unchanged).
+# 14:25:00 (round 194 fix): git pull (~10-30s) + Step 2a warm cache (~141s
+# for 615 codes, measured 6/2) + intraday_plan setup needs ~3 min total.
+# sleep_to_trigger deadline = 14:30:30, so fire 14:25:00 gives 5:30 buffer
+# (300s+30s safety). Previous 14:28:00 schedule (round 185) was only 2:30
+# which fit git pull but NOT post-round-194 warm step.
+# sleep_to_trigger still anchors execution to 14:30:00 (Rule #11 unchanged).
 Register-MPTask `
     -TaskName "MoneyPrinter-IntradayPipeline" `
     -Script "$REPO\scripts\ecs_intraday_execute.ps1" `
-    -RunTime "14:28:00" `
+    -RunTime "14:25:00" `
     -Description "Money Printer: 14:30 entry path (intraday_plan + preflight + execute_orders). Writes intraday_success flag on success -- next morning's 9:25 task skips." `
     -ExecutionLimitMinutes 35
 
