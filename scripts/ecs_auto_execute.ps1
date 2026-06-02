@@ -24,7 +24,7 @@
 # Pre-conditions (must be set up MANUALLY before this task runs):
 #   - XtMiniQmt.exe started and logged in with account 8886933837
 #     (recommended: enable QMT auto-login on Windows boot, or RDP each morning)
-#   - ECS git is on the same branch as Mac (collab/advisor-dialog currently)
+#   - ECS git is on the same branch as Mac (main, since round 193 merged collab/advisor-dialog)
 #
 # Safety guards:
 #   - If git pull fails -> abort (would reconcile against stale scripts)
@@ -38,7 +38,7 @@ $LogPath = "C:\money-printer\data\orders\ecs_auto.log"
 $REPO = "C:\money-printer"
 $EXPECTED_ACCOUNT = "8886933837"
 $USERDATA = "C:\guojin\userdata_mini"
-$BRANCH = "collab/advisor-dialog"
+$BRANCH = "main"
 
 function Log {
     param([string]$msg)

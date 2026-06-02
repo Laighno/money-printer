@@ -35,7 +35,7 @@
 #
 # Pre-conditions (MANUAL setup, one-time):
 #   - XtMiniQmt logged in with account 8886933837 (same as 9:30 path)
-#   - ECS git on the same branch as Mac (collab/advisor-dialog currently)
+#   - ECS git on the same branch as Mac (main, since round 193 merged collab/advisor-dialog)
 #   - Task Scheduler task MoneyPrinter-IntradayPipeline registered to
 #     fire at 14:29:55 Mon-Fri (see scripts/ecs_setup_schedule.ps1)
 #
@@ -53,7 +53,7 @@ $LogPath = "C:\money-printer\data\orders\ecs_intraday.log"
 $REPO = "C:\money-printer"
 $EXPECTED_ACCOUNT = "8886933837"
 $USERDATA = "C:\guojin\userdata_mini"
-$BRANCH = "collab/advisor-dialog"
+$BRANCH = "main"
 
 function Log {
     param([string]$msg)
