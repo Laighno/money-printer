@@ -10423,3 +10423,100 @@ Step 1-7 仍然自动跑:
 - ssh ECS 设 env + 跑 execute_orders 手动批准
 - 或者拍板 unfreeze 这个 gate (改 default OOS_AUTO_EXEC=1 让它 auto)
 - 第 1 周观察期 user 每天看一次, 第 2 周以后看舒不舒服决定
+
+---
+## [2026-06-02 14:50] 第 194 轮 (🔴 6/2 14:30 OOS task 第二次连续失败 — xtdata 1m cache empty; advisor C-1 PS1 已 fix, 请求 C-2 永久 fix in intraday_plan.py)
+
+### 6/2 14:30 task 失败诊断
+
+- 14:28:28 task fire (按 round 185 schedule fix 14:28:00) ✓
+- 14:30:00.013 sleep_to_trigger 准时 (round 185 timing fix valid) ✓
+- 14:30:55 `RuntimeError: xtdata 1m returned 0 rows for all fields` → exit 1
+- 没生成 plan, 没下任何单, Step 8 user pre-approval gate 根本没轮到
+
+### Root cause 亲核
+
+1. XtMiniQmt 进程 running 但**行情订阅没启动**
+2. 测试 `xtdata.get_market_data` for 2 known stocks (000001.SZ + 600000.SH):
+   - **1m**: shape=(2, 0), empty ✗
+   - **daily** (5/01~6/02): 只到 5/28, **5/29~6/2 全缺**
+3. 进一步 trade API 测试 (`XtQuantTrader.connect/subscribe`):
+   - connect=0 OK, query_stock_asset 正常 (¥286k, 9 positions)
+   - → **登录交易 OK, 但行情订阅断**
+4. `intraday_plan.py:386-387` 的 assumption "XtMiniQmt auto-caches today's 1m bars locally" **不再成立**
+
+### advisor C-1 已 fix (round 194 commit `2d5c13e` on main)
+
+新增 `scripts/ecs_warm_intraday_cache.py`:
+- load_universe + xtdata.download_history_data2 for universe 1m
+- 实测 615 codes ~30-60s, 在 sleep_to_trigger deadline (14:30:30) 内
+
+`scripts/ecs_intraday_execute.ps1` Step 2a 新增:
+- 在 Step 2 (intraday_plan.py) 之前调 warm script
+- warm 失败 → Abort (避免 intraday_plan 再 fail)
+
+明早 6/3 14:30 task 流程:
+- 14:28 fire → Step 1 git pull (~10s)
+- 14:28-14:29 Step 2a warm cache (~30-60s)
+- 14:29 Step 2 intraday_plan.py 启动, sleep_to_trigger 等到 14:30:00
+- 14:30 fetch_today_1m_and_eod_history 从 warm 过的 cache 读 ✓
+
+### 请你做 C-2 (永久 fix in intraday_plan.py)
+
+C-1 是 PS1 层 workaround. 长期更稳是 intraday_plan 自身有 fallback:
+
+```python
+# scripts/intraday_plan.py:380-420 修改 fetch_today_1m_and_eod_history
+# 在 raw = xtdata.get_market_data(...) 之前, 加个 explicit download:
+
+def fetch_today_1m_and_eod_history(codes, asof_date):
+    ...
+    # round 194 fix: explicit download (don't rely on auto-cache; auto-subscribe
+    # 经常没启动, 见 round 194 advisor diagnosis)
+    logger.info("download_history_data2 for {} codes 1m (warming cache)...", len(xt_codes))
+    download_start = time.time()
+    try:
+        xtdata.download_history_data2(
+            stock_list=xt_codes,
+            period='1m',
+            start_time=today_str,
+            end_time=today_str,
+            callback=None,
+        )
+        logger.info("download done in {:.1f}s", time.time() - download_start)
+    except Exception as e:
+        logger.warning("download_history_data2 failed (proceeding with cache only): {}", e)
+        # Fall through to get_market_data — if cache really empty,
+        # raise RuntimeError below catches it.
+
+    field_list = ["open", "high", "low", "close", "volume", "amount"]
+    raw = xtdata.get_market_data(...)  # 原代码不变
+    ...
+```
+
+好处:
+- intraday_plan 自己能跑 (不依赖 ecs PS1 layer)
+- Mac 端跑 intraday_plan (e.g. dry-run / test) 也 works
+- 删 round 109 注释 "auto-cache" assumption + 替换 round 194 注释
+
+### 影响 testing
+
+C-2 改 intraday_plan 要测试:
+- 单元: 跑 `intraday_plan --skip-sleep --asof 20260602` on ECS, 看 ~30-60s 后 plan 生成正常
+- 集成: 等 6/3 14:30 真盘 task 自动 fire, 看 ECS log 显示 download + 后续步骤 OK
+
+### 关于 daily 数据 5/29~6/2 缺失
+
+daily 5/29~6/2 也缺 (不只 1m), 说明这 4-5 个交易日的 EOD 数据没 fetch 过. Mac 端 launchd `com.moneyprinter.collect` 17:00 daily 应该会跑 `mp.data.collector` 更新 daily, **但 Mac 可能这几天关机/sleep** → daily 也没 update. 这是 P0 ECS-standalone (feat/ecs-standalone 分支 P0 spec) 要修的根本问题.
+
+C-2 修了 1m 但不修 daily — daily 长期解决方案是 P0 migration (collect 17:00 跑在 ECS).
+
+### Rule reminders
+- Rule #4 ✓: 不动 model
+- Rule #11 ✓: PIT (download 拉到 14:30 当下的 1m, 但 intraday_plan filter t<14:30 仍 enforce)
+- Rule #1 ✓: code 进 git
+- C-1 PS1 commit `2d5c13e` (round 194) already pushed to main
+
+### 主动给 user (你 C-2 跑通时 round 195 报告也讲)
+
+工程方 C-2 做完后 advisor C-1 PS1 仍可保留作 safety net (双层 download), 或者删掉 PS1 Step 2a 让 intraday_plan 自己负责. 我建议**保留 PS1 Step 2a 作 hard guard** (10s 开销但额外保险), 直到 1 周观察期通过再决定。
