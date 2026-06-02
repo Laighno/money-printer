@@ -96,8 +96,41 @@ Register-MPTask `
     -Description "Money Printer: 14:30 entry path (intraday_plan + preflight + execute_orders). Writes intraday_success flag on success -- next morning's 9:25 task skips." `
     -ExecutionLimitMinutes 35
 
+# ── Task 3: 17:00 daily report (P0-A migration from Mac launchd ─────
+# com.moneyprinter.collect, feat/ecs-standalone branch)
+# Replaces Mac launchd 17:00 daily that became single point of failure
+# when Mac shut down. Runs collect + daily_report + push so ECS 9:25
+# next-day task has a fresh plan.
+# Note: registered DISABLED by default; D3 in P0-A migration plan enables
+# this AND disables Mac launchd `com.moneyprinter.collect` simultaneously.
+Register-MPTask `
+    -TaskName "MoneyPrinter-DailyReport" `
+    -Script "$REPO\scripts\ecs_daily_report.ps1" `
+    -RunTime "17:00:00" `
+    -Description "Money Printer: 17:00 daily report (sync portfolio + collect + daily_report + push plan). P0-A migration from Mac launchd com.moneyprinter.collect." `
+    -ExecutionLimitMinutes 30
+
+# ── Task 4: Saturday 10:00 qfq refresh (P0-B migration from Mac ──
+# launchd com.moneyprinter.qfq, feat/ecs-standalone branch)
+# Replaces Mac launchd weekly Saturday qfq refresh. Heavy (~30-60 min).
+# Note: registered DISABLED by default; D3 in P0-B migration plan enables.
+Register-MPTask `
+    -TaskName "MoneyPrinter-QfqRefresh" `
+    -Script "$REPO\scripts\ecs_qfq_refresh.ps1" `
+    -RunTime "10:00:00" `
+    -Description "Money Printer: Saturday 10:00 weekly qfq refresh. P0-B migration from Mac launchd com.moneyprinter.qfq." `
+    -ExecutionLimitMinutes 90
+
+# Disable Task 3 + 4 by default (P0 D2 stage; enable manually D3 step
+# when ready to migrate from Mac launchd).
+Disable-ScheduledTask -TaskName "MoneyPrinter-DailyReport" | Out-Null
+Disable-ScheduledTask -TaskName "MoneyPrinter-QfqRefresh" | Out-Null
+Write-Host "Task 3 (DailyReport) and Task 4 (QfqRefresh) registered DISABLED (P0 D2)."
+
 Write-Host ""
 Write-Host "Done. Verify with:"
 Write-Host "  Get-ScheduledTask -TaskName MoneyPrinter-AutoExecute"
 Write-Host "  Get-ScheduledTask -TaskName MoneyPrinter-IntradayPipeline"
+Write-Host "  Get-ScheduledTask -TaskName MoneyPrinter-DailyReport       # P0-A, default Disabled"
+Write-Host "  Get-ScheduledTask -TaskName MoneyPrinter-QfqRefresh        # P0-B, default Disabled"
 Write-Host "  Get-ScheduledTaskInfo -TaskName MoneyPrinter-IntradayPipeline"
