@@ -44,20 +44,15 @@ if ($LASTEXITCODE -ne 0) { Abort "git pull failed (exit $LASTEXITCODE)" }
 $head = (& git rev-parse HEAD 2>&1).Trim()
 Log "Step 1: HEAD = $head"
 
-# Step 2: sync portfolio.yaml from QMT (ECS-local, no SSH self-loop)
-# round 195 fix: original sync_portfolio_from_qmt.py SSH-es to ECS (designed
-# for Mac caller); on ECS that's self-SSH → hang. Call qmt_snapshot.py
-# directly + post-process to rewrite yaml.
-Log "Step 2: qmt_snapshot.py (ECS-local portfolio sync)"
-$snapOutput = & $pythonExe -X utf8 scripts\qmt_snapshot.py 2>&1 | Out-String
-$snapOutput.Trim().Split("`n") | ForEach-Object { Log "  snapshot: $_" }
+# Step 2: sync portfolio.yaml from QMT (ECS-local mode, round 197 fix)
+# sync_portfolio_from_qmt.py --local: in-process qmt_snapshot + write yaml,
+# no SSH self-loop. Replaces D2.5 stop-gap that only printed JSON.
+Log "Step 2: sync_portfolio_from_qmt.py --local (ECS-local mode)"
+$syncOutput = & $pythonExe -X utf8 scripts\sync_portfolio_from_qmt.py --local 2>&1 | Out-String
+$syncOutput.Trim().Split("`n") | ForEach-Object { Log "  sync: $_" }
 if ($LASTEXITCODE -ne 0) {
-    Log "  WARNING: qmt_snapshot failed (exit $LASTEXITCODE); proceeding with existing yaml"
+    Log "  WARNING: ECS-local sync failed (exit $LASTEXITCODE); proceeding with existing yaml"
 }
-# Note: D2.5 doesn't write portfolio.yaml from snapshot — that's a separate
-# code path in sync_portfolio_from_qmt.py post-SSH. For D2.5 dry-run, we just
-# confirm QMT is reachable; yaml stays as-is. D7 follow-up: extract yaml-write
-# logic from sync_portfolio_from_qmt.py and run it locally on ECS.
 
 # Step 3: collect external data (northbound + margin + fund_flow)
 Log "Step 3: mp.data.collector"
@@ -73,16 +68,34 @@ $reportOutput = & $pythonExe -X utf8 scripts\daily_report.py 2>&1 | Out-String
 $reportOutput.Trim().Split("`n") | ForEach-Object { Log "  report: $_" }
 if ($LASTEXITCODE -ne 0) { Abort "daily_report.py failed (exit $LASTEXITCODE)" }
 
-# Step 5: Arm B shadow recorder (non-fatal, research)
-Log "Step 5: shadow_930_intraday.py (Arm B shadow, non-fatal)"
+# Step 5: Arm B shadow recorder (non-fatal, research; 10 min timeout)
+# Shadow re-fetches 60-day daily bars for 615 codes (~30-60 min on slow
+# network). Cap at 10 min: if not done, kill + skip (research data is
+# nice-to-have, prod execute path unaffected). round 197 fix.
+Log "Step 5: shadow_930_intraday.py (Arm B shadow, 10 min timeout, non-fatal)"
 if (-not (Test-Path "$REPO\data\shadow_930")) {
     New-Item -ItemType Directory -Path "$REPO\data\shadow_930" -Force | Out-Null
 }
-$shadowOutput = & $pythonExe -X utf8 scripts\shadow_930_intraday.py 2>&1 | Out-String
-$shadowOutput.Trim().Split("`n") | ForEach-Object { Log "  shadow: $_" }
-if ($LASTEXITCODE -ne 0) {
-    Log "  WARNING: shadow recorder failed (non-fatal; real path unaffected)"
+$shadowJob = Start-Job -ScriptBlock {
+    param($py, $repo)
+    Set-Location $repo
+    & $py -X utf8 scripts\shadow_930_intraday.py 2>&1
+} -ArgumentList $pythonExe, $REPO
+$completed = Wait-Job $shadowJob -Timeout 600
+if ($completed) {
+    $shadowOutput = Receive-Job $shadowJob | Out-String
+    $shadowExit = if ($shadowJob.State -eq 'Failed') { 1 } else { 0 }
+    $shadowOutput.Trim().Split("`n") | Select-Object -Last 5 | ForEach-Object { Log "  shadow: $_" }
+    if ($shadowExit -ne 0) {
+        Log "  WARNING: shadow failed (non-fatal)"
+    } else {
+        Log "  shadow OK"
+    }
+} else {
+    Stop-Job $shadowJob
+    Log "  WARNING: shadow timeout (>10 min) — killed, research data skipped (non-fatal)"
 }
+Remove-Job $shadowJob -Force -ErrorAction SilentlyContinue
 
 # Step 6: git commit plan files LOCALLY (round 195 C-arch: no push)
 # Background: ECS GitHub deploy key is read-only by design (security).

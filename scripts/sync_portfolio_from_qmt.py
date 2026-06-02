@@ -37,12 +37,50 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+def fetch_qmt_snapshot_local() -> Dict[str, Any]:
+    """ECS-local mode (round 197 fix): build snapshot in-process, no SSH.
+
+    Use when running ON ECS (e.g. from scheduled task) — SSH self-loop would
+    hang. Mirrors qmt_snapshot.py logic, returns dict (not stdout-marker form).
+    """
+    from mp.execution.qmt_broker import QMTBroker
+    broker = QMTBroker(account_id="8886933837", qmt_userdata_path=r"C:\guojin\userdata_mini")
+    broker.connect()
+    try:
+        info = broker.get_account_info()
+        positions = broker.get_positions()
+    finally:
+        broker.disconnect()
+    return {
+        "account": {
+            "total_assets": float(info.total_assets),
+            "cash_available": float(info.cash_available),
+            "market_value": float(info.market_value),
+            "updated_at": info.updated_at,
+        },
+        "positions": [
+            {
+                "code": p.code,
+                "name": p.name or "",
+                "shares": int(p.shares_total),
+                "avg_cost": float(p.avg_cost),
+                "market_price": float(getattr(p, "market_price", 0.0) or 0.0),
+                "market_value": float(getattr(p, "market_value", 0.0) or 0.0),
+            }
+            for p in positions if int(p.shares_total) > 0
+        ],
+    }
+
+
 def fetch_qmt_snapshot(ecs_user: str, ecs_host: str) -> Dict[str, Any]:
     """SSH to ECS, run scripts/qmt_snapshot.py via .venv python, return parsed JSON.
 
     Assumes ECS has the repo pulled at C:\\money-printer with scripts/qmt_snapshot.py
     present (committed alongside this file). No stdin-piped snippet — the script
     lives in the repo so SSH command is simple.
+
+    Use --local flag (or fetch_qmt_snapshot_local() directly) when running on ECS
+    itself, to avoid SSH self-loop hang.
     """
     # Pass the entire ssh command as a single string to subprocess to avoid
     # double-shell-escape (Mac → ssh → cmd.exe → powershell). Empirically the
@@ -191,6 +229,9 @@ def main():
     ap.add_argument("--portfolio", default="config/portfolio.yaml")
     ap.add_argument("--dry-run", action="store_true",
                     help="print rendered yaml to stdout, do not overwrite")
+    ap.add_argument("--local", action="store_true",
+                    help="ECS-local mode: call qmt_snapshot in-process, no SSH "
+                         "(use when running ON ECS, avoids self-SSH hang)")
     args = ap.parse_args()
 
     portfolio_path = Path(args.portfolio)
@@ -198,8 +239,12 @@ def main():
         sys.stderr.write(f"[sync_portfolio] {portfolio_path} not found\n")
         sys.exit(2)
 
-    print(f"[sync_portfolio] fetching QMT snapshot via SSH {args.ecs_user}@{args.ecs_host} ...")
-    snapshot = fetch_qmt_snapshot(args.ecs_user, args.ecs_host)
+    if args.local:
+        print(f"[sync_portfolio] ECS-local mode (in-process qmt_snapshot, no SSH)")
+        snapshot = fetch_qmt_snapshot_local()
+    else:
+        print(f"[sync_portfolio] fetching QMT snapshot via SSH {args.ecs_user}@{args.ecs_host} ...")
+        snapshot = fetch_qmt_snapshot(args.ecs_user, args.ecs_host)
     n_pos = len(snapshot["positions"])
     print(f"[sync_portfolio]   account total={snapshot['account']['total_assets']:.2f} "
           f"cash={snapshot['account']['cash_available']:.2f} positions={n_pos}")
