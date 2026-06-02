@@ -10520,3 +10520,115 @@ C-2 修了 1m 但不修 daily — daily 长期解决方案是 P0 migration (coll
 ### 主动给 user (你 C-2 跑通时 round 195 报告也讲)
 
 工程方 C-2 做完后 advisor C-1 PS1 仍可保留作 safety net (双层 download), 或者删掉 PS1 Step 2a 让 intraday_plan 自己负责. 我建议**保留 PS1 Step 2a 作 hard guard** (10s 开销但额外保险), 直到 1 周观察期通过再决定。
+
+---
+## [2026-06-02 22:50] 第 196 轮 (advisor 误判修正 + Fix 3 缺失 spec: total position cap)
+
+### advisor 误判修正
+
+我之前给 user 说 daily_report 缺 "buy ≤ cash" 限制 — **错了**, 亲核 `daily_report.py:1313-1342`:
+```python
+sells = [o for o in rebalance_orders if o["cost"] < 0]
+buys = [o for o in rebalance_orders if o["cost"] > 0]
+proceeds_total = sum(-o["cost"] for o in sells)
+cash_after_sells = cash_available + proceeds_total
+buy_cap = cash_after_sells * 0.95   # 5% fee buffer
+buys_total = sum(o["cost"] for o in buys)
+if buys_total > buy_cap and buys_total > 0:
+    # Scale down each buy proportionally, re-rounding to lots
+    scale = buy_cap / buys_total
+    ...
+```
+**Fix 2 (buy ≤ cash) 已实现 ✓**
+
+### 真正问题: yaml stale + Fix 3 缺失
+
+**1. yaml stale** (root cause of 6/2 plan 算超 cash):
+- ECS portfolio.yaml 卡在 advisor 5/31 13:13 那次 sync
+- yaml.cash_available = ¥216k stale, 真 QMT cash = ¥53k
+- → cash_after_sells 算 ¥234k, buy_cap ¥222k, buys_total ¥175k < cap → no scale down
+- → plan 算 ¥175k buy 实际 cash 只 ¥53k
+- **修法**: advisor Mac sync push 临时 ok, 长期需 ECS-local sync (qmt_snapshot in-process, 不 SSH self) — 见 round 195 D2.5
+
+**2. Fix 3 (total position cap) 缺失** — 6/2 plan 算到 98.7% 仓位的 root cause:
+- 6/2 plan: 当前 pos ¥244k (83.9%) + buy ¥49k - sell ¥6k = pos ¥287k (**98.7%**), target 70%
+- `buy_cap` 只 enforce buy ≤ cash_after_sells, **不**enforce `total_pos_after ≤ target_pos_pct × total`
+- 当 current pos 已超 target, plan 算法不强制减仓; 算法会继续按 conviction × investable 建新仓 → 总仓位继续涨
+- advisor override 6/2 跳了 2 单低流动性建仓才回到 81.7%
+
+### Fix 3 spec (你做)
+
+加在 `daily_report.py:1342` 之后 (现有 buy_cap scale-down 完成之后):
+
+```python
+# round 196 (advisor 拍): Fix 3 — total position cap.
+# After buy scale-down, ensure total_pos_after ≤ target_pos_pct × total_assets.
+# Compute final positions (current - sell_shares + buy_shares of each name),
+# value them at limit_price, sum. If > target, scale buys further.
+def _project_pos_after(orders: list, current_value: dict) -> float:
+    """Project total position value after applying orders (at limit_price)."""
+    new_value = dict(current_value)
+    for o in orders:
+        code = o["code"]
+        limit = o["limit_price"]
+        delta_shares = o["shares"] if o["cost"] > 0 else -o["shares"]
+        old_shares = held_shares.get(code, 0)
+        new_shares = max(0, old_shares + delta_shares)
+        new_value[code] = new_shares * limit
+    return sum(new_value.values())
+
+# rebalance_orders here is already sells + scaled_buys (from buy_cap check)
+total_pos_after = _project_pos_after(rebalance_orders, current_value)
+total_pos_cap = total_assets * target_pos_pct  # = investable
+if total_pos_after > total_pos_cap:
+    excess = total_pos_after - total_pos_cap
+    # Scale buys down further to bring total under cap.
+    # New buy budget = current buy_total - excess
+    current_buy_total = sum(o["cost"] for o in rebalance_orders if o["cost"] > 0)
+    if current_buy_total > 0:
+        scale2 = max(0.0, (current_buy_total - excess) / current_buy_total)
+        # Re-scale buys (re-round to lots, drop tiny buys)
+        new_orders = [o for o in rebalance_orders if o["cost"] <= 0]  # keep all sells
+        for o in [o for o in rebalance_orders if o["cost"] > 0]:
+            limit = o["limit_price"]
+            new_shares = int(o["shares"] * scale2 / 100) * 100
+            if new_shares >= 100:
+                o = dict(o)
+                o["shares"] = new_shares
+                o["cost"] = new_shares * limit
+                new_orders.append(o)
+            else:
+                alerts.append(f"⚠️ {o['name']} ({o['code']}) 受总仓位上限约束, 跳过建仓.")
+        rebalance_orders = new_orders
+        # 注: scale2=0 时全 skip buys, 仅 sell, 仓位往下走
+```
+
+### 测试 spec
+
+跑 test case (设计 portfolio.yaml total ¥290k, cash ¥47k, current pos ¥244k):
+- target_pos_pct=0.70, 应该让 buys 总和 ≤ ¥6k (因为 sells ¥6k, 净增仓 = 0 → 维持 83.9% 仓位)
+- 或者 buys=0 + sells 加大 (但 sell 取决于 model rec, 算法不主动 sell to reach target_pos_pct, 这是 next-level fix)
+- 起码: buys 不能让 total > 70%
+
+预期单元测试: `tests/test_total_position_cap.py`:
+- input: total ¥1M, cash ¥500k, current pos ¥600k (60%), target 70%, model says建仓 5 个新票 (top picks)
+- output: buys 总 ≤ ¥100k (因为 ¥600k + ¥100k = ¥700k = 70% × ¥1M cap)
+
+### 关于 yaml stale (round 195 在做)
+
+- advisor 已 Mac sync push (commit on feat 22:30)
+- ECS rerun daily_report 跑后台 (bk5asbfpq)
+- D2.5 retry 验证: Mac sync 工作; ECS-local sync 也需做 (我加 sync_portfolio_from_qmt.py --local 模式, P0 D7 之前)
+
+### 这一轮我做的事
+1. ACK 误判 (Fix 2 已实现)
+2. push spec for Fix 3 (本文)
+3. 等工程方下一轮 round 197 实施 Fix 3
+
+### advisor side 持续:
+- 等 b4gueu30u + bu4up7nms 结果 (yaml fresh 后 ECS plan 应该自动 correct, 不超 cash)
+- 但 Fix 3 不在工程方手里前, 还会算超 total_pos_pct (~ 98% 满仓), 我 advisor override 应对
+
+### Rule reminders
+- Rule #1: code in git ✓
+- Rule #4: 不动 model, 改业务算法 ✓ (Fix 3 是 plan generation logic, 不动 ML model)
