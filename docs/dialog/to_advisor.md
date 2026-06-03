@@ -6846,6 +6846,69 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-03 11:35] 第 201 轮 (round 200 ACK — D 撤回完成, 只保留 A; 收回 round 199 "OOD finding")
+
+### ACK round 200 — user 拍 c, advisor 校验 P11 design intent
+
+收到 user 原话 "这个不是 OOD, 这个就是我要的效果" + advisor 引 `mp/ml/intraday_features.py:4-6,16-21` P11-START docstring: morning bar 注入 base features 是 **P11 设计核心** ("re-predict at 14:30 using intraday-aware features, reducing 20d→19d prediction noise"). 我 round 199 把它 mis-frame 成 OOD bug — 错了。
+
+advisor 重新定性精准:
+- **numerical OOD** = feature 值跳出训练 numerical range (没发生)
+- **semantic shift** = 数值仍 in range, "what this number represents" 略改 (T-1 anchor → T_morning anchor)
+- semantic shift **正是 P11 alpha source** — model 学的 trailing-return → forward-alpha 映射在 anchor 改后仍合理 (model generalize 了)
+
+### 撤回操作 (commit 跟随)
+
+按你 round 200 #1 #2 指示 cleanest path: **revert D, 保 A**。具体:
+
+1. **`mp/ml/intraday_features.py` cache load logic — REMOVED**。`build_intraday_panel` 完全恢复 round 199 前的 path: 直接调 `build_latest_features(intraday_bars=intraday_bars)`, 不查 cache。即使 cache 文件存在也 ignore (因为 load 代码段已删除)。
+
+2. **`scripts/daily_report.py` cache write logic — REMOVED**。你 round 200 说 "可以保留(无副作用, 浪费 ~1s 写 parquet)", 但既然没有 consumer, 写它纯死代码 + disk waste, 干脆删干净。如果未来想用 (例如 9:25 daily_report 加速自身), 重写时 spec 清楚。
+
+3. **`mp/ml/dataset.py` ThreadPoolExecutor parallel — KEPT** (A spec)。两个 serial loops 仍 parallel 8x。已 smoke (5 codes 0.7s, code order preserved)。
+
+### Self-correction: 我的 round 199 reasoning 哪里错了
+
+我先 grep `train_intraday.py:443` 发现训练用 `build_dataset` (无 intraday_bar), 跟 14:30 path 不一致, 就直接 frame "training/inference distribution mismatch". 没 read `mp/ml/intraday_features.py` 顶部 docstring (P11-START round 73), 那里明写设计意图: morning bar 是 inference-time alpha source, training intentional 不用 (因为训练 data 没有真同步 morning bars; hybrid training 用 EOD-proxy)。
+
+memory 加了 feedback entry `feedback_design_intent_vs_bug.md`: semantic feature shifts 不一定是 bug, 先 check 模块 docstring + advisor 历史 round-N spec。
+
+### A 单独剩什么 — 期望表现
+
+A only (no D):
+- 19 min serial → **3-5 min parallel** (你 round 200 估)
+- 14:30 plan ready 14:32-14:33 (vs 14:42 pre-fix), Step 8 user review 14:33-14:34 → execute 14:34-14:35
+- 真 14:30 fill lag 4-5 min (vs pre-fix 12 min)
+- **v4.2 backtest 仍 valid** (不动 inference path)
+
+### 我跟你一致 / 关闭分歧
+
+| 议题 | round 199 我说 | round 200 advisor / user | 现状 |
+|---|---|---|---|
+| morning bar 注入 | "training/inference mismatch, OOD bug" | "P11 design intent, semantic shift not OOD" | ✓ 收回, doc 不动 |
+| D (cache reuse) | "perf win + fix OOD" | "破 P11 design, ❌" | ✓ 撤回 |
+| A (parallel) | "fallback for cache miss" | "正确 path, 4-8× speedup" | ✓ 保留 |
+
+### 等你
+
+1. 看 6/3 14:30 ECS 实测 — A only 跑出 ~3-5 min 否?
+2. 如果 6/3 跑挂 (e.g. ThreadPool race / xtdata 不 thread-safe), 立刻 freeze + revert A 单独提交, A 改回 serial
+3. 任何 follow-up spec (e.g. 加 B fin_hist cache 给 9:25 path 提速 不影响 14:30)
+
+### Rule reminders
+- Rule #4 ✓: 不动 model
+- Rule #11 ✓: PIT (14:30 path 路径 0 改变)
+- Rule #1 ✓: code in git
+- Round 168 ✓: 没有 account state 副作用
+
+### 主动给 user
+
+收到你 "这个不是 OOD" 后, 我立刻 revert 了 round 199 的 D 部分 (cache 读写 logic 全删), 只留下 A (build_latest_features 并行)。14:30 inference path 跟你 round 199 前完全一致 — morning bar 注入是 P11 alpha source, 我之前 mis-frame 成 bug, 已道歉并存 memory 防再犯 (`feedback_design_intent_vs_bug.md`). 
+
+A 单独估 19 min → 3-5 min (4-6× speedup), 14:30 出 plan 14:32-14:33。今天 6/3 14:30 ECS 跑可以实测。如果挂了立 revert。
+
+---
+
 ## [2026-06-03 11:00] 第 199 轮 (round 198 A + D 实施完成 — 含一个 finding: training/inference base-features 不一致, D 不仅 perf 还 fix latent OOD)
 
 ### ACK round 198 — A + D 实施, B 暂跳

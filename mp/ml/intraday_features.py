@@ -219,55 +219,15 @@ def build_intraday_panel(
         ``build_latest_features`` (insufficient history, no fundamentals,
         etc.) are not added back.
     """
-    # round 199 (advisor 198 D spec): try EOD panel cache from 9:25 daily_report.
-    # The 9:25 cache contains pure EOD T-1 features (no intraday_bar injection)
-    # — which matches the training distribution (train_intraday uses build_dataset
-    # which doesn't pass intraday_bar). The current 14:30 path's morning-bar
-    # injection into trailing windows is an OOD inference vs training. Cache
-    # reuse therefore both speeds up (~19 min → <30s on cache hit) AND aligns
-    # the 64 base features with training.
-    #
-    # NOTE on the docstring at top of this module (states "OHLCV appended as
-    # synthetic bar"): that documents the current /pre-fix code path, not the
-    # training reality. We're deliberately deviating from the docstring to
-    # match training. If a future model retrain DOES include morning-bar
-    # injection (i.e. train build_dataset would need intraday_bars param), this
-    # cache reuse must be disabled or rewritten.
-    panel: Optional[pd.DataFrame] = None
-    if end is not None:
-        from pathlib import Path as _Path
-        from loguru import logger as _logger
-        _root = _Path(__file__).resolve().parent.parent.parent
-        cache_path = _root / "data" / "cache" / "eod_panel" / f"{end}.parquet"
-        if cache_path.exists():
-            try:
-                cached = pd.read_parquet(cache_path)
-                wanted = {str(c).zfill(6) for c in codes}
-                cached["code"] = cached["code"].astype(str).str.zfill(6)
-                sub = cached[cached["code"].isin(wanted)].copy().reset_index(drop=True)
-                if sub.empty:
-                    _logger.warning("EOD panel cache {} has 0 overlap with {} scoring codes; "
-                                    "falling back to build_latest_features",
-                                    cache_path.name, len(wanted))
-                else:
-                    miss = len(wanted) - len(sub)
-                    _logger.info("EOD panel cache HIT: {} → {}/{} codes (miss={}), "
-                                 "skipping build_latest_features",
-                                 cache_path.name, len(sub), len(wanted), miss)
-                    panel = sub
-            except Exception as e:
-                _logger.warning("EOD panel cache load failed ({}); falling back", e)
-
-    if panel is None:
-        panel = build_latest_features(
-            codes,
-            start=start,
-            end=end,
-            include_fundamentals=include_fundamentals,
-            intraday_bars=intraday_bars,
-        )
-        if panel.empty:
-            return panel
+    panel = build_latest_features(
+        codes,
+        start=start,
+        end=end,
+        include_fundamentals=include_fundamentals,
+        intraday_bars=intraday_bars,
+    )
+    if panel.empty:
+        return panel
 
     extras_rows: List[Dict[str, float]] = []
     for c in panel["code"].astype(str):
