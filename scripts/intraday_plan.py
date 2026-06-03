@@ -383,11 +383,36 @@ def fetch_today_1m_and_eod_history(
     today_start = f"{today_str}000000"
     today_end = f"{today_str}235959"
 
-    # ── 1) today's 1m bars (cache-read, NO download — round 109) ─────
-    # XtMiniQmt runs all day and auto-caches today's 1m bars locally;
-    # get_market_data reads that cache (~35s for 615 codes) vs
-    # download_history_data2's ~6min server pull. We filter t < 14:30
-    # below for the PIT contract (Rule #11) regardless of the window.
+    # ── 1) today's 1m bars (explicit download + cache-read — round 197) ─────
+    # round 197 (advisor 194 C-2 spec): explicit download_history_data2 before
+    # get_market_data. round 109's assumption "XtMiniQmt auto-caches today's
+    # 1m bars locally" stopped holding 6/1 — XtMiniQmt was running but行情
+    # subscription didn't start, so cache was empty and intraday_plan exited
+    # with "xtdata 1m returned 0 rows for all fields" (6/1 + 6/2 exit 1).
+    # advisor C-1 PS1 fix (ecs_warm_intraday_cache.py + Step 2a in
+    # ecs_intraday_execute.ps1) is the operational layer; this C-2 is the
+    # belt-and-suspenders in intraday_plan itself so any caller (PS1 step,
+    # Mac dry-run, manual ECS test) gets a working cache automatically.
+    # We filter t < 14:30 below for PIT (Rule #11) regardless of window.
+    logger.info("download_history_data2 (1m, warming cache) for {} codes, asof={} ...",
+                len(xt_codes), today_str)
+    _t_download = time.time()
+    try:
+        xtdata.download_history_data2(
+            stock_list=xt_codes,
+            period="1m",
+            start_time=today_str,
+            end_time=today_str,
+            callback=None,
+        )
+        logger.info("download_history_data2 done in {:.1f}s", time.time() - _t_download)
+    except Exception as e:
+        # If download fails, proceed to get_market_data anyway — if cache is
+        # really empty, the RuntimeError below catches it. Don't hard-fail
+        # here so Mac dev path (which can't actually download) still surfaces
+        # the proper "0 rows" diagnostic message.
+        logger.warning("download_history_data2 failed ({}); proceeding with cache only", e)
+
     logger.info("get_market_data (1m cache-read) for {} codes, asof={}",
                 len(xt_codes), today_str)
 
@@ -682,6 +707,7 @@ def generate_orders(
     account: dict,
     top_k_df: pd.DataFrame,
     full_scored: pd.DataFrame,
+    intraday_bars: Optional[Dict[str, Dict]] = None,
 ) -> Tuple[list[dict], list[str]]:
     """Delegate to scripts.daily_report.generate_order_list so the
     14:30 path and the 9:30 path emit identical order math for the same
@@ -690,9 +716,24 @@ def generate_orders(
     The single behavioural difference is the input panel (today's 14:30
     morning bars vs yesterday's EOD), which is exactly the alpha source
     P11-4 walk-forward measured (+0.14 Sharpe over EOD baseline).
+
+    round 204 (advisor 203 spec): pass today's 14:30 morning close as
+    closes_override so the buy/sell limit (close × 1.01 / × 0.99) tracks
+    the actual 14:30 market rather than T-1 EOD close. Without this fix,
+    on a -2-6% intraday move the limit sits well above market and the
+    broker rejects with "订单价格超出范围" (3/7 orders dropped 6/3).
     """
     from scripts.daily_report import generate_order_list
-    return generate_order_list(holdings_full, account, top_k_df, full_scored)
+
+    closes_override: Optional[Dict[str, float]] = None
+    if intraday_bars:
+        closes_override = {
+            str(c).zfill(6): float(b["close"])
+            for c, b in intraday_bars.items()
+            if b and "close" in b and b["close"]
+        }
+    return generate_order_list(holdings_full, account, top_k_df, full_scored,
+                                closes_override=closes_override)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -849,7 +890,8 @@ def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
     logger.info("Top-{}:\n{}", TOP_K,
                 top_k_df[["code", "name", "predicted_excess", "_rank"]].to_string(index=False))
 
-    orders, alerts = generate_orders(holdings, account, top_k_df, full_scored)
+    orders, alerts = generate_orders(holdings, account, top_k_df, full_scored,
+                                      intraday_bars=intraday_bars)
     logger.info("Generated {} orders, {} alerts", len(orders), len(alerts))
 
     out_dir = PROJECT_ROOT / "data" / "orders"

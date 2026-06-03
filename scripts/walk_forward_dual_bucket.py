@@ -245,15 +245,39 @@ def top_k_picks(scores_df: pd.DataFrame, k: int,
 # Rebalance logic
 # ───────────────────────────────────────────────────────────────────
 
+def _limit_locked(price: float, prev_close: Optional[float],
+                   direction: str, threshold: float = 0.0995) -> bool:
+    """Round 208 (advisor #2): A-share 涨/跌停板 fill block.
+
+    direction ∈ {'buy', 'sell'}:
+      - 'buy' blocked if price ≥ prev_close × (1 + threshold)  (limit-up封板)
+      - 'sell' blocked if price ≤ prev_close × (1 - threshold) (limit-down封板)
+    """
+    if prev_close is None or prev_close <= 0:
+        return False
+    if direction == "buy":
+        return price >= prev_close * (1.0 + threshold)
+    if direction == "sell":
+        return price <= prev_close * (1.0 - threshold)
+    return False
+
+
 def rebalance_to_targets(broker: SimulatedBroker, top_picks: pd.DataFrame,
                           prices: Dict[str, float],
                           adv_lookup: Dict[str, float],
                           sim_date: str,
-                          target_pos_pct: float = 0.70) -> List[str]:
+                          target_pos_pct: float = 0.70,
+                          prev_close_map: Optional[Dict[str, float]] = None,
+                          protected_codes: Optional[set] = None,
+                          ) -> List[str]:
     """Rebalance broker to equal-weighted target across `top_picks`.
 
     Cap each name at target_pos_pct × total_value / len(top_picks).
     Returns the picks list (as codes) for picks_log tracking.
+
+    If ``prev_close_map`` is provided (round 208 advisor #2): block buys
+    of limit-up (涨停封板) and sells of limit-down (跌停封板) — matches
+    real A-share fill constraints.
     """
     total = broker.total_value
     investable = total * target_pos_pct
@@ -266,9 +290,13 @@ def rebalance_to_targets(broker: SimulatedBroker, top_picks: pd.DataFrame,
     # First: sell anything not in top_picks
     for code in list(broker.positions.keys()):
         if code not in pick_set:
+            if protected_codes and code in protected_codes:
+                continue  # round 208 #4 diagnostic: keep OOS-bought positions an extra session
             price = prices.get(code)
             if price is None or price <= 0 or pd.isna(price):
                 continue  # skip stocks without today's price (suspended / no data)
+            if prev_close_map and _limit_locked(price, prev_close_map.get(code), "sell"):
+                continue  # 跌停封板, 卖不出
             adv = adv_lookup.get(code)
             broker.sell(code, price, date=sim_date, adv=adv)
 
@@ -277,6 +305,8 @@ def rebalance_to_targets(broker: SimulatedBroker, top_picks: pd.DataFrame,
         price = prices.get(code)
         if price is None or price <= 0 or pd.isna(price):
             continue
+        if prev_close_map and _limit_locked(price, prev_close_map.get(code), "buy"):
+            continue  # 涨停封板, 买不到
         adv = adv_lookup.get(code)
         broker.buy(code, price, target_value=per_name, date=sim_date, adv=adv)
 
@@ -288,7 +318,9 @@ def execute_oos_rebalance(broker: SimulatedBroker,
                            prices: Dict[str, float],
                            adv_lookup: Dict[str, float],
                            sim_date: str,
-                           target_pos_pct: float = 0.70) -> Tuple[List[str], List[dict]]:
+                           target_pos_pct: float = 0.70,
+                           prev_close_map: Optional[Dict[str, float]] = None,
+                           ) -> Tuple[List[str], List[dict]]:
     """round 184 (v4 spec-faithful, after round 183 push-back):
 
     OOS path now mirrors EOD ``rebalance_to_targets`` — sell out-of-picks
@@ -322,6 +354,8 @@ def execute_oos_rebalance(broker: SimulatedBroker,
             price = prices.get(code)
             if price is None or price <= 0 or pd.isna(price):
                 continue
+            if prev_close_map and _limit_locked(price, prev_close_map.get(code), "sell"):
+                continue  # 跌停封板, 卖不出
             adv = adv_lookup.get(code)
             broker.sell(code, price, date=sim_date, adv=adv, action="SELL_OOS")
 
@@ -330,6 +364,9 @@ def execute_oos_rebalance(broker: SimulatedBroker,
         price = prices.get(code)
         if price is None or price <= 0 or pd.isna(price):
             skipped.append({"code": code, "reason": "no_price_or_nan"})
+            continue
+        if prev_close_map and _limit_locked(price, prev_close_map.get(code), "buy"):
+            skipped.append({"code": code, "reason": "limit_up_locked"})
             continue
         adv = adv_lookup.get(code)
         trade = broker.buy(code, price, target_value=per_name,
@@ -517,6 +554,8 @@ def run_seed(seed: int, mode: str,
              eod_ranker: BlendRanker, oos_ranker: BlendRanker,
              adv_lookup: Dict[Tuple[str, pd.Timestamp], float],
              merged_hard_max_pct: float = MERGED_HARD_MAX_PCT_DEFAULT,
+             enforce_price_limit: bool = False,
+             protect_oos_overnight: bool = False,
              ) -> BacktestResult:
     """round 180 (v3 production-faithful, advisor 178 spec):
 
@@ -543,6 +582,12 @@ def run_seed(seed: int, mode: str,
     result = BacktestResult(seed=seed, mode=mode)
     eod_plan_for_tomorrow: Optional[pd.DataFrame] = None
 
+    # round 208 #4 diagnostic: track OOS picks bought yesterday so 9:25 EOD
+    # rebalance can be told to NOT sell them (test the "open-time exit" alpha
+    # hypothesis — if removing the 9:25 OOS exit kills dual alpha, the +30pp
+    # was specifically the overnight-to-open scalp).
+    oos_bought_yesterday: set = set()
+
     bars_by_date_code = {(str(r["code"]).zfill(6), r["date"]): r
                          for _, r in bars[["code", "date", "open", "close"]].iterrows()}
 
@@ -558,12 +603,26 @@ def run_seed(seed: int, mode: str,
                 close_prices[code] = float(row["close"])
         adv_today = {code: adv_lookup.get((code, D), 0.0) for code in close_prices}
 
+        # round 208 (advisor #2): prev_close map for limit-up/down detection.
+        # 9:25 fill uses today open; 14:30 fill uses 14:29 close. Both
+        # compared vs yesterday close (D-1 from bars cache).
+        prev_close_map: Optional[Dict[str, float]] = None
+        if enforce_price_limit and i > 0:
+            prev_D = trading_dates[i - 1]
+            prev_close_map = {
+                code: float(row["close"])
+                for (code, date), row in bars_by_date_code.items()
+                if date == prev_D
+            }
+
         # ─── 1. EOD execute yesterday's plan on today's open (shared broker) ───
         eod_picks_executed: List[str] = []
         if enable_eod and eod_plan_for_tomorrow is not None and not eod_plan_for_tomorrow.empty:
             eod_picks_executed = rebalance_to_targets(
                 broker, eod_plan_for_tomorrow, open_prices,
                 adv_today, sim_date_str, target_pos_pct=0.70,
+                prev_close_map=prev_close_map,
+                protected_codes=oos_bought_yesterday if protect_oos_overnight else None,
             )
 
         # ─── 2. OOS score + only-buy at 14:30 (shared broker, fights for cash) ───
@@ -591,6 +650,7 @@ def run_seed(seed: int, mode: str,
                 # EOD vs OOS sells.
                 oos_picks_executed, oos_skipped = execute_oos_rebalance(
                     broker, top, oos_prices, adv_today, sim_date_str,
+                    prev_close_map=prev_close_map,
                 )
 
         # ─── 3. Mark-to-market at D close ───
@@ -610,11 +670,20 @@ def run_seed(seed: int, mode: str,
         result.nav_records.append(nav_row)
 
         # ─── 4. Generate EOD plan for D+1 ───
+        # round 210 (B1 fix): EOD also drops low-ADV stocks to match prod
+        # daily_report.py:1004 (LOW_LIQUIDITY_FILTER_AMOUNT = 1e8).
+        # Without this, WF EOD could pick illiquid stocks that prod EOD's
+        # filter chain would drop. NO price cap — prod EOD doesn't limit price
+        # (¥50 cap is OOS-only Arm B Phase 2 guardrail, not EOD).
         if enable_eod:
             eod_panel = make_eod_panel_for(factors, D)
             eod_scores = score_panel(eod_ranker, eod_panel)
             if not eod_scores.empty:
-                eod_plan_for_tomorrow = top_k_picks(eod_scores, k=top_k)
+                eod_plan_for_tomorrow = top_k_picks(
+                    eod_scores, k=top_k,
+                    adv_lookup={c: adv_today.get(c, 0.0) for c in eod_scores["code"]},
+                    adv_floor=100_000_000.0,
+                )
             else:
                 eod_plan_for_tomorrow = pd.DataFrame()
 
@@ -629,6 +698,9 @@ def run_seed(seed: int, mode: str,
             "oos_skipped_count": len(oos_skipped),
         }
         result.picks_log.append(picks_row)
+
+        # round 208 #4: roll OOS-bought set for next iteration's EOD protect-check
+        oos_bought_yesterday = set(oos_picks_executed)
 
         if i % 20 == 0:
             logger.info("[seed={} {}] D={} ({}/{}) NAV: {:.0f}",
@@ -928,6 +1000,16 @@ def main() -> int:
     ap.add_argument("--oos-model-prefix", default="data/intraday_blend",
                     help="round 189: OOS model glob prefix. For true OOS, "
                          "use cutoff-trained 'data/intraday_blend_cutoff20250831'.")
+    ap.add_argument("--enforce-price-limit", action="store_true",
+                    help="Round 208 (advisor #2): block fills at 涨停板/跌停板 "
+                         "(price change vs prev close ≥ ±9.95%). Default off "
+                         "preserves legacy WF behavior.")
+    ap.add_argument("--protect-oos-overnight", action="store_true",
+                    help="Round 208 (advisor #4 diagnostic): in dual mode, "
+                         "9:25 EOD rebalance does NOT sell positions that OOS "
+                         "bought yesterday — pushes OOS hold from 18h to 24h "
+                         "(same as oos_only). Tests whether dual alpha is "
+                         "specifically from 9:25-open-exit timing.")
     ap.add_argument("--smoke", action="store_true",
                     help="single seed × 1 month — fast sanity check")
     args = ap.parse_args()
@@ -985,7 +1067,9 @@ def main() -> int:
             res = run_seed(seed, mode, factors, bars, morning_bars,
                            list(trading_dates), args.initial_capital, args.top_k,
                            eod_ranker, oos_ranker, adv_lookup,
-                           merged_hard_max_pct=args.merged_hard_max_pct)
+                           merged_hard_max_pct=args.merged_hard_max_pct,
+                           enforce_price_limit=args.enforce_price_limit,
+                           protect_oos_overnight=args.protect_oos_overnight)
             logger.info("  done in {:.1f}s; final NAV: eod={:.0f} oos={:.0f} dual={:.0f}",
                        time.time() - t1,
                        res.nav_records[-1]["eod_nav"] if res.nav_records else 0,

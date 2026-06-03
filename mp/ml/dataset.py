@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1142,6 +1142,27 @@ def filter_universe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _build_latest_worker(args: Tuple[str, str, Optional[str], Any, Any, Any]) -> Tuple[str, Optional[pd.DataFrame]]:
+    """Top-level ProcessPool worker for :func:`build_latest_features`.
+
+    Must be a module-level function (not a closure) so that ProcessPoolExecutor
+    can pickle it for IPC. The `_process_single_stock` callable, pandas, numpy
+    etc. are re-imported once per subprocess (spawn on macOS, fork on Linux).
+
+    round 202 (advisor 201 E spec): ThreadPool gave only 1.7× speedup on
+    615 codes (11.4 min) because pandas + SQLite serialize via GIL. True
+    multiprocessing bypasses GIL — expected 4-6× per advisor's bench plan.
+    """
+    code, start, end, fin_hist, valuation_row, intraday_bar = args
+    try:
+        part = _process_single_stock(code, start, end, horizon=None,
+                                     fin_hist=fin_hist, valuation_row=valuation_row,
+                                     intraday_bar=intraday_bar)
+        return code, part
+    except Exception:
+        return code, None  # main process logs the warning
+
+
 def build_latest_features(
     codes: List[str],
     start: str = "20230101",
@@ -1165,40 +1186,60 @@ def build_latest_features(
     total = len(codes)
     logger.info("build_latest_features: {} codes, start={}", total, start)
 
-    # For live prediction: get today's valuation snapshot + financial history
+    # round 202 (advisor 201 E spec): ThreadPool gave only 1.7× speedup
+    # on 615 codes (11.4 min vs 19 min serial) because pandas + SQLite hold
+    # GIL — ThreadPool's 8 workers effectively serialized to ~2. Switched
+    # main per-stock loop to ProcessPoolExecutor for true parallelism
+    # (expected 4-6×, ~4 min total). fin_hist HTTP fetch loop stays on
+    # ThreadPool since it's pure network IO (GIL releases on socket waits;
+    # ThreadPool is already effective there — measurement evidence).
+    from concurrent.futures import ProcessPoolExecutor
+
+    _WORKERS = 8
+
     valuation_map: Dict[str, Dict[str, float]] = {}
     fin_hist_map: Dict[str, Optional[pd.DataFrame]] = {}
     if include_fundamentals:
         valuation_map = _fetch_valuation_snapshot_map(codes)
         logger.info("Got valuation snapshot for {} stocks", len(valuation_map))
-        for code in codes:
-            fin_hist_map[code] = _fetch_financial_history(code)
+        with ThreadPoolExecutor(max_workers=_WORKERS) as _pool:
+            _futs = {_pool.submit(_fetch_financial_history, c): c for c in codes}
+            for _fut in as_completed(_futs):
+                _c = _futs[_fut]
+                try:
+                    fin_hist_map[_c] = _fut.result()
+                except Exception:
+                    fin_hist_map[_c] = None
         n_ok = sum(1 for v in fin_hist_map.values() if v is not None)
-        logger.info("Got financial history for {}/{} stocks", n_ok, total)
+        logger.info("Got financial history for {}/{} stocks (parallel)", n_ok, total)
 
-    rows: List[pd.DataFrame] = []
     core_cols = TECHNICAL_COLUMNS[:13]
 
-    for idx, code in enumerate(codes):
-        try:
-            fin_hist = fin_hist_map.get(code) if include_fundamentals else None
-            val_row = valuation_map.get(code) if include_fundamentals else None
-            bar = intraday_bars.get(code) if intraday_bars else None
-            part = _process_single_stock(code, start, end, horizon=None,
-                                         fin_hist=fin_hist, valuation_row=val_row,
-                                         intraday_bar=bar)
-            if part is not None:
+    args_iter = (
+        (code, start, end,
+         fin_hist_map.get(code) if include_fundamentals else None,
+         valuation_map.get(code) if include_fundamentals else None,
+         intraday_bars.get(code) if intraday_bars else None)
+        for code in codes
+    )
+
+    rows: List[pd.DataFrame] = []
+    completed = 0
+    # pool.map preserves submission order, so rows append in original code
+    # order natively — no post-hoc sort needed (vs ThreadPool as_completed).
+    with ProcessPoolExecutor(max_workers=_WORKERS) as _pool:
+        for code, part in _pool.map(_build_latest_worker, args_iter, chunksize=20):
+            completed += 1
+            if part is None:
+                logger.warning("Failed to process {}, skipping", code)
+            else:
                 clean = part.dropna(subset=core_cols)
                 if not clean.empty:
                     rows.append(clean.iloc[[-1]])
-        except Exception:
-            logger.warning("Failed to process {}, skipping", code)
-
-        if progress_callback is not None:
-            progress_callback(idx + 1, total)
-
-        if (idx + 1) % 50 == 0 or (idx + 1) == total:
-            logger.info("build_latest_features progress: {}/{}", idx + 1, total)
+            if progress_callback is not None:
+                progress_callback(completed, total)
+            if completed % 50 == 0 or completed == total:
+                logger.info("build_latest_features progress: {}/{}", completed, total)
 
     if not rows:
         logger.error("build_latest_features: no valid data produced")

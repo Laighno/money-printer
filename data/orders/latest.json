@@ -1,17 +1,29 @@
 {
-  "generated_at": "2026-06-01T17:22:23",
-  "report_date": "2026-06-01",
+  "generated_at": "2026-06-02T17:38:49",
+  "report_date": "2026-06-02",
   "account_snapshot": {
-    "total_assets": 290348.9,
-    "cash_available": 46845.9,
-    "market_value": 243503.0
+    "total_assets": 286292.25,
+    "cash_available": 53069.25,
+    "market_value": 233223.0
   },
   "holdings_at_plan_time": [
     {
+      "code": "600208",
+      "name": "衢州发展",
+      "shares": 11000,
+      "avg_cost": 2.93
+    },
+    {
+      "code": "600363",
+      "name": "联创光电",
+      "shares": 1700,
+      "avg_cost": 35.764
+    },
+    {
       "code": "600511",
       "name": "国药股份",
-      "shares": 300,
-      "avg_cost": 26.548
+      "shares": 200,
+      "avg_cost": 26.204
     },
     {
       "code": "600808",
@@ -20,10 +32,22 @@
       "avg_cost": 3.119
     },
     {
+      "code": "002153",
+      "name": "石基信息",
+      "shares": 4900,
+      "avg_cost": 8.288
+    },
+    {
       "code": "002439",
       "name": "启明星辰",
       "shares": 2200,
       "avg_cost": 14.627
+    },
+    {
+      "code": "002583",
+      "name": "海能达",
+      "shares": 3700,
+      "avg_cost": 8.381
     },
     {
       "code": "002773",
@@ -34,32 +58,8 @@
     {
       "code": "002958",
       "name": "青农商行",
-      "shares": 2400,
-      "avg_cost": 2.866
-    },
-    {
-      "code": "002153",
-      "name": "石基信息",
-      "shares": 4900,
-      "avg_cost": 8.288
-    },
-    {
-      "code": "600363",
-      "name": "联创光电",
-      "shares": 1700,
-      "avg_cost": 35.764
-    },
-    {
-      "code": "002583",
-      "name": "海能达",
-      "shares": 3700,
-      "avg_cost": 8.381
-    },
-    {
-      "code": "600208",
-      "name": "衢州发展",
-      "shares": 11000,
-      "avg_cost": 2.931
+      "shares": 1200,
+      "avg_cost": 2.817
     }
   ],
   "orders": [
@@ -68,45 +68,46 @@
       "name": "国药股份",
       "action": "减仓",
       "shares": 100,
-      "limit_price": 27.11,
-      "cost": -2711.0,
-      "reason": "模型排名 #39/781（跌出 Top 30，减半仓）"
+      "limit_price": 27.15,
+      "cost": -2715.0,
+      "reason": "模型排名 #56/781（跌出 Top 30，减半仓）"
+    },
+    {
+      "code": "002773",
+      "name": "康弘药业",
+      "action": "减仓",
+      "shares": 300,
+      "limit_price": 21.12,
+      "cost": -6336.0,
+      "reason": "模型排名 #36/781（跌出 Top 30，减半仓）"
     },
     {
       "code": "002958",
       "name": "青农商行",
       "action": "减仓",
-      "shares": 1200,
+      "shares": 600,
       "limit_price": 2.9,
-      "cost": -3480.0,
-      "reason": "模型排名 #36/781（跌出 Top 30，减半仓）"
+      "cost": -1740.0,
+      "reason": "模型排名 #51/781（跌出 Top 30，减半仓）"
+    },
+    {
+      "code": "603737",
+      "name": "三棵树",
+      "action": "买入",
+      "shares": 1300,
+      "limit_price": 30.9,
+      "cost": 40170.0,
+      "reason": "模型 #3/781, 超额 +6.14%，目标仓位 15.1% (现 0.0%)"
+    },
+    {
+      "code": "600808",
+      "name": "马钢股份",
+      "action": "加仓",
+      "shares": 3500,
+      "limit_price": 2.91,
+      "cost": 10185.0,
+      "reason": "模型 #11/781, 超额 +3.60%，目标仓位 9.3% (现 5.7%)"
     }
   ],
-  "alerts": [],
-  "advisor_override": {
-    "timestamp": "2026-06-01T17:44:30.214060",
-    "reason": "A 选项 (user round 189): 跳过 2 个低流动性💧新建仓 (悍高 001221, DR三棵树 603737). 原因: (1) 明早执行后仓位将达 98.7% 严重过高 (target 70%), (2) 两单都低流动性 (20日均成交<¥3亿), slippage + 卡死风险叠加",
-    "removed_orders": [
-      {
-        "code": "001221",
-        "name": "悍高集团",
-        "action": "买入",
-        "shares": 600,
-        "limit_price": 50.43,
-        "cost": 30258.0,
-        "reason": "模型 #4/781, 超额 +6.56%，目标仓位 16.0% (现 0.0%)"
-      },
-      {
-        "code": "603737",
-        "name": "DR三棵树",
-        "action": "买入",
-        "shares": 600,
-        "limit_price": 31.79,
-        "cost": 19074.0,
-        "reason": "模型 #5/781, 超额 +4.26%，目标仓位 10.8% (现 0.0%)"
-      }
-    ],
-    "kept_orders_count": 2,
-    "orig_orders_count": 4
-  }
+  "alerts": []
 }

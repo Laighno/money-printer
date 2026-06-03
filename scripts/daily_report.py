@@ -1105,6 +1105,7 @@ def generate_order_list(
     account: dict | None,
     recommendations: pd.DataFrame,
     full_scored: pd.DataFrame | None,
+    closes_override: dict[str, float] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Generate next-day open order list.
 
@@ -1156,6 +1157,17 @@ def generate_order_list(
     held_names = {str(h["code"]).zfill(6): h.get("name", h["code"]) for h in holdings_full}
 
     closes = _latest_closes(list(set(rec_codes) | set(held_shares.keys())))
+
+    # round 204 (advisor 203 spec): closes_override lets the 14:30 intraday_plan
+    # path inject today's morning 14:30 close in place of T-1 EOD close, so the
+    # buy/sell limit (close × 1.01 / × 0.99) tracks the current market instead
+    # of yesterday's close. 6/3 14:30 incident: 3 of 7 orders were rejected by
+    # the broker as "订单价格超出范围" because limit (T-1 close × 1.01) sat
+    # 2-6% above the actual 14:30 market.
+    if closes_override:
+        for _c, _px in closes_override.items():
+            if _px and _px > 0:
+                closes[str(_c).zfill(6)] = float(_px)
 
     # Conviction weights — predicted_excess is in pp (already × 100)
     excess_map = {}
@@ -1340,6 +1352,65 @@ def generate_order_list(
         rebalance_orders = sells + scaled_buys
     else:
         rebalance_orders = sells + buys
+
+    # ──────────────────────────────────────────────────────────────
+    # round 197 (advisor round 196 spec): Fix 3 — total position cap.
+    # After buy ≤ cash scale-down, ensure
+    #   total_pos_after ≤ target_pos_pct × total_assets
+    # — i.e., don't let aggregate position drift above the target.
+    # 6/2 plan triggered this gap: current pos 83.9% + buy ¥49k → 98.7%
+    # because Pass-1 sizes by conviction-target individually, never
+    # checking aggregate. Fix here scales remaining buys proportionally
+    # to bring totals under cap; if cap already breached by current
+    # positions alone, drops all buys (sells will pull it down naturally).
+    # ──────────────────────────────────────────────────────────────
+    def _project_pos_after(orders_list: list[dict]) -> float:
+        """Project total position market value after applying orders (at limit_price)."""
+        new_value: Dict[str, float] = dict(current_value)
+        for o in orders_list:
+            code = str(o["code"]).zfill(6)
+            limit = float(o["limit_price"])
+            delta = int(o["shares"]) if o["cost"] > 0 else -int(o["shares"])
+            old_shares = held_shares.get(code, 0)
+            new_shares = max(0, old_shares + delta)
+            new_value[code] = new_shares * limit
+        return sum(new_value.values())
+
+    total_pos_cap = investable  # = total_assets × target_pos_pct
+    total_pos_after = _project_pos_after(rebalance_orders)
+    if total_pos_after > total_pos_cap and total_pos_cap > 0:
+        excess = total_pos_after - total_pos_cap
+        current_buys = [o for o in rebalance_orders if o["cost"] > 0]
+        current_sells = [o for o in rebalance_orders if o["cost"] <= 0]
+        current_buy_total = sum(o["cost"] for o in current_buys)
+        if current_buy_total > 0:
+            new_buy_budget = max(0.0, current_buy_total - excess)
+            scale2 = new_buy_budget / current_buy_total
+            scaled_buys2: list[dict] = []
+            for o in current_buys:
+                limit = float(o["limit_price"])
+                new_shares = int(int(o["shares"]) * scale2 / 100) * 100
+                if new_shares >= 100:
+                    o2 = dict(o)
+                    o2["shares"] = new_shares
+                    o2["cost"] = new_shares * limit
+                    scaled_buys2.append(o2)
+                else:
+                    alerts.append(
+                        f"⚠️ {o['name']} ({o['code']}) 受总仓位上限约束，跳过本笔加仓 "
+                        f"（当前总仓 {total_pos_after/total_assets*100:.1f}% > 上限 "
+                        f"{target_pos_pct*100:.0f}%）。"
+                    )
+            rebalance_orders = current_sells + scaled_buys2
+        else:
+            # No buys to scale; cap exceeded by existing holdings alone.
+            # Surface as alert so user sees the over-allocation; sells (if any)
+            # will pull it back. Algorithm doesn't force additional sells —
+            # that's a next-level "rebalance to target" feature.
+            alerts.append(
+                f"⚠️ 当前持仓 {total_pos_after/total_assets*100:.1f}% 已超目标 "
+                f"{target_pos_pct*100:.0f}%（无加仓可缩，依赖既有 sell 单减压）。"
+            )
 
     # Strip the internal _priority field before returning
     for o in rebalance_orders:
