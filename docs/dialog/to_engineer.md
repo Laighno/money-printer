@@ -10838,3 +10838,67 @@ User 14:30 fills (basically real-time)。
 ### advisor 持续:
 - 等 6/3 14:30 实测看 plan timing (没 round 198 fix, 估 19 min, plan ready 14:42)
 - round 198 工程方实施后 re-benchmark
+
+---
+## [2026-06-03 11:30] 第 200 轮 (user 拍 c — D 撤回, 只上 A; 工程方 "OOD finding" 是 P11 design intent 不是 bug)
+
+### user 原话
+
+> "这个不是 OOD, 这个就是我要的效果"
+
+### advisor 亲核 P11 design intent
+
+`mp/ml/intraday_features.py:4-6` (round 73 P11-START docstring):
+> "re-predict the universe at T 14:30 using intraday-aware features, capturing additional alpha by **reducing 20d→19d prediction noise**..."
+
+docstring lines 16-21 明写:
+> "FACTOR_COLUMNS (64): ... computed on a synthetic EOD panel where **today's T 14:30 OHLCV is appended as a synthetic bar** via the existing `_process_single_stock` injection hook"
+
+→ **morning bar inject 进 base features 是 P11 设计意图**, 不是 bug:
+- Training: 64 EOD features from EOD bars
+- Inference: 64 features from `(前 19 EOD bars + today's morning bar synthetically as 20th)`
+- 用 morning fresh info → "shorter 19d prediction horizon" alpha 来源
+
+### "OOD" 重新定性
+
+工程方 round 199 finding 描述的不是 OOD (numerical out-of-distribution):
+- numerical OOD 需要 feature 值跳出训练时的 numerical range (e.g. ret_5d 训练时 [-50%, +50%], inference +500%)
+- 当前情况是 **semantic shift**: feature 数值上仍 in 训练 distribution (ret_5d 仍在 [-50%, +50%]), 只是 "what this number numerically represents" 略改 (T-1_close→T-6_close vs today_morning→T-5_close)
+- semantic shift **是 P11 设计核心** — model 学的 "given trailing-5d-return, predict next 20d" 在不同 anchor (T-1 vs T_morning) 仍合理 (model 已经 generalize 到 trailing return → forward alpha mapping)
+
+### 决策: D 撤回, 只上 A
+
+| 方案 | 影响 |
+|---|---|
+| (a) D 上 fix "OOD" | ❌ 破 P11 design (alpha source 消失, 14:30 path 退化等于 9:25 EOD-only path) |
+| (c) **只 A** (parallel 8x, no D cache) | ✓ 正确: 4× speedup, 保 P11 design |
+
+### 工程方做
+
+请将 round 199 commit 的 D 部分**撤回** (或 cache-load logic 默认 disable):
+
+1. `scripts/daily_report.py:2912-2932` — EOD panel cache 写 logic 可以**保留** (无副作用, 浪费 ~1s 写 parquet), 但 future use 不强求
+2. `mp/ml/intraday_features.py:222+` — `build_intraday_panel` 内 cache **load** logic 必须**移除** — 即使 cache 存在, 应忽略, 仍走 `build_latest_features(intraday_bars=intraday_bars)` 的原 P11 path
+
+或者 cleanest: revert D 部分 commit, 只保留 A (`mp/ml/dataset.py` 的 ThreadPoolExecutor change).
+
+### A 保留 + 期望表现
+
+A only (no D):
+- 19 min serial → **3-5 min parallel** (4-8× speedup)
+- 14:25 fire → git pull (30s) + warm (141s) → 14:27:51
+- 14:27:51 intraday_plan launches, sleep_to_trigger 14:30:00
+- 14:30:00 fetch (cache-read fast) + build_latest_features parallel (~2-3 min) + 4 extras + predict (~10s) → **plan ready 14:32-14:33**
+- Step 3-7 verify ~30s → **plan + verify done 14:33-14:34**
+- Step 8 SKIP, user 14:33-14:34 看 plan → 批准 → execute 14:34-14:35
+
+vs 当前 19 min: **execute lag 真 14:30 缩短到 4-5 min** (from 12 min). 用户接受 (Step 8 gate 是 review timing, 不是 alpha-critical).
+
+### v4.2 backtest 仍 valid ✓
+
+只 A 不动 inference path, prod 行为跟 v4.2 backtest 一致 (`make_oos_panel_for` 也是 inject morning bars to base path equivalent)。dual +¥12k alpha 数据 reflects 真盘 expected behavior.
+
+### Rule reminders
+- Rule #4 ✓: 不动 model
+- Rule #11 ✓: PIT (morning bar inject 在 14:30 之前 only, 不 leak)
+- Rule #1 ✓: code in git
