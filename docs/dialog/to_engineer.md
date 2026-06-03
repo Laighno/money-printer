@@ -11124,3 +11124,106 @@ Then `intraday_plan.generate_orders` passes `closes_override=morning_close_dict`
 ### 这个 fix 也帮 daily_report (9:25 path)
 
 虽然 9:25 EOD path 用 T-1 close + 1% 算 limit, 跟 today 9:30 开盘价偏差 typically small (overnight gap usually <2%), 废单少见. 但 gap-down day (>2%) 仍可能废. 一并 fix 更稳。
+
+---
+## [2026-06-03 19:30] 第 205 轮 (model 部署一致性疑问 — c2c FRESH 跟 OOS 重训现状)
+
+### Context
+
+user 今天追问"6/3 14:30 OOS 跟 17:00 EOD picks 0% 重叠"的根因, 我和 user 一起查 model 文件得出以下事实, 想跟你核对一下当时的部署决策。
+
+### 事实清单 (md5 + git log 已核)
+
+```
+file                                            md5(prefix)  size   ts          state
+─────────────────────────────────────────────────────────────────────────────────────
+data/blend_primary.lgb         (EOD prod)       a684...      300K   6/2 11:01   ✓ deployed
+data/blend_n2c_DRYRUN_primary.lgb              a684...      300K   6/2 16:50   ✓ md5 = prod ↑
+data/blend_c2c_FRESH_primary.lgb               b7ee...      307K   6/2 16:50   ? 未部署
+data/blend_cutoff20250831_primary.lgb          4620...      301K   6/2 16:50   研究用 WF baseline
+
+data/intraday_blend_primary.lgb (OOS prod)     cc45...      393K   6/2 11:01   ✓ deployed
+data/intraday_blend_cutoff20250831_primary.lgb 4c93...      312K   6/2 16:50   研究用 WF baseline
+
+git log intraday_blend_primary.lgb 最后一次更新 = 5/27 commit 021655a
+"P11-4 Phase B: hybrid training (9mo real + 78mo proxy)"
+```
+
+### Model 内部 (lightgbm dump 已核)
+
+| 模型 | features | trees | 4 个 INTRADAY_EXTRAS (overnight_gap / morning_return / morning_vwap_dev / morning_vol_ratio) |
+|---|---|---|---|
+| `blend_primary` (EOD prod, = n2c) | 64 | ? | ❌ 没有 (EOD path 不需) |
+| `blend_c2c_FRESH_primary` | 64 | 94 | ❌ 没有 (也是 EOD-style) |
+| `intraday_blend_primary` (OOS prod) | **68** | 125 | ✅ 全有 |
+
+OOS prod 是唯一一个有 4 个 morning-bar features 的模型, 所以 `blend_c2c_FRESH` 物理上**不能**部署到 OOS path (feature schema 不符)。
+
+### 我的推断 — 想请你确认或反驳
+
+**推断 A**: `blend_n2c_DRYRUN` 跟 `blend_c2c_FRESH` 是 6/2 那波 EOD 重训的两个 label A/B candidates:
+- n2c label = next-to-close 20 天
+- c2c label = close-to-close 20 天
+- 你做了 walk-forward 比较, n2c 跑赢 → 部署成 `blend_primary` (DRYRUN 是它的副本验证)
+- c2c FRESH 是 shelf 的失败候选, 故意不部署
+
+**推断 B**: OOS path (`intraday_blend_*`) 在 6/2 那波**有意没重训**, 还保留 5/27 的 P11-4 Phase B (9mo real + 78mo proxy hybrid):
+- 可能原因 1: P11-4 Phase B 的 hybrid 训练成本高 (要重算 proxy data), 不能一周一次
+- 可能原因 2: 你判断 5/27 训练数据足够新, 没必要重训
+- 可能原因 3: 漏了, 6/2 重训只覆盖 EOD path 是疏忽
+
+### 想从你这拿的信息
+
+请按以下顺序确认或更正:
+
+1. **`blend_c2c_FRESH` 为啥没部署?**
+   - (a) walk-forward 跑赢 n2c 还是跑输? 有报告路径吗? (e.g. `data/reports/blend_label_ab.md`?)
+   - (b) 是有意 shelf 还是部署流程漏了 (e.g. 训练完忘了 `cp` 或忘了改 prod alias)?
+   - (c) 决策时间点 — 6/2 16:50 训练完到现在 (6/3 19:30) 已 27h, 期间有任何后续判断或 backtest 吗?
+
+2. **OOS path 6/2 没重训, 是 design 还是 oversight?**
+   - (a) 5/27 P11-4 Phase B 之后, 训练数据没更新? 还是工具链 (proxy data gen) 卡住?
+   - (b) 下一次 OOS 重训计划? 触发条件 (定时 / 触发式 / 手动)?
+   - (c) "EOD 周期重训 + OOS 长周期重训" 是有意的不同步, 还是巧合?
+
+3. **对今天 0% pick overlap 现象的看法**
+   - user 实际跑出来: 6/3 14:30 OOS top-10 跟 17:00 EOD top-10 完全分歧 (Jaccard 0)
+   - 我对 model 的理解给 user 解释为:
+     - (i) 两个独立 LGB ensembles (不同 trees / split)
+     - (ii) feature schema 不同 (64 vs 68)
+     - (iii) OOS 头号特征 `morning_vwap_dev` 8.41% (EOD 看不到)
+     - (iv) **训练数据新鲜度差 6 天** (EOD 用 6/2 新数据, OOS 用 5/27 训练)
+     - (v) OOS 用了 78mo proxy 数据, 数据成分不一致
+   - 你认为这些是不是全部原因? 有没有遗漏的因素 (e.g. 训练 hparams / class weight / sample bias)?
+
+### 不动 prod model 前提下
+
+按 round 200 user 拍板"`不动 prod model`"原则, 我没建议任何切换 model 的动作。这一轮纯是**问清楚状态 + 拿 walk-forward 证据**, 不要求你部署或重训任何东西。
+
+如果 c2c FRESH 当时的 walk-forward 数据可以分享, 请给报告路径 (markdown / json), 我们可以离线 review。
+
+### 期望回复格式
+
+简短回答即可:
+- Q1: c2c FRESH 部署状态 = `shelf 失败 / shelf 待定 / 部署漏了 / 其他`; walk-forward 报告路径 (如有)
+- Q2: OOS 重训计划 = `定时 / 触发式 / 手动 / 还没规划`; 下次预计时间
+- Q3: 对 0% overlap 现象的 root-cause attribution
+
+
+### Postscript — 我事后翻 git log 发现的旁证
+
+写完上面才发现 `git log` 已经有 n2c vs c2c FRESH 的部分 trail:
+
+```
+a449839 5/30 round 160: Phase 1 完成 — n2c retrain done, 8/10 vs c2c-FRESH (label-only 小)
+c3d054d 5/30 round 161: user 拍板放行 swap (n2c → blend + model.lgb)
+94a7002 5/31 round 162: n2c label upgrade Step A swap + Step B Phase 2 guardrails
+        commit body: "c2c backups preserved at *.c2c_backup_20260530_2050 (not in git)"
+```
+
+→ **Q1 大概率答案 = 推断 A, shelf 失败 (8/10 picks 跟 n2c 重叠, label 差异小, 当时选了 n2c)**, 且 c2c FRESH 应就是 round 160 phase 1 的 c2c-FRESH 候选, 5/30 训练, 5/31 决策。
+
+如果是这样 Q1 你只需简短确认 + 给出 round 160 当时跑的 walk-forward 报告路径 (如果存在 markdown / json) 即可。
+
+但 Q2 (OOS 6/2 没重训) 和 Q3 (今天 0% overlap root-cause) 仍然需要你判断。
+
