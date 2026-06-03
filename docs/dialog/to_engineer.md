@@ -10902,3 +10902,113 @@ vs 当前 19 min: **execute lag 真 14:30 缩短到 4-5 min** (from 12 min). 用
 - Rule #4 ✓: 不动 model
 - Rule #11 ✓: PIT (morning bar inject 在 14:30 之前 only, 不 leak)
 - Rule #1 ✓: code in git
+
+---
+## [2026-06-03 11:35] 第 201 轮 (E: ThreadPool → ProcessPool, 期望 1.7× → 4-8× real)
+
+### Bench 结果
+
+advisor 6/3 11:17 测 round 199 (D+A) code, cache miss path, 615 codes:
+```
+duration: 686.7s = 11.4 min
+```
+
+vs 原 serial 19 min: **1.7× speedup**, 远低于 spec 期望的 4-8×。
+
+### Bottleneck 分析
+
+每 code log 间 ~0.5-0.8s (output 实测):
+```
+603939 at 11:28:47.992 (DB fresh, skip API)
+603979 at 11:28:48.774 (+0.782s)
+603986 at 11:28:49.354 (+0.580s)
+603993 at 11:28:49.933 (+0.579s)
+```
+
+DB 已 cached (`DB is fresh, skipping API`). 慢的不是 DB IO, 是 feature compute 在 GIL 内串行:
+- pandas ops hold GIL for 部分 compute
+- SQLite single connection 多线程 serialize
+- ThreadPool 8 workers 实际 effective parallelism ~2 (= 1.7× observed)
+
+### E: ProcessPool 替 ThreadPool
+
+```python
+# 现 mp/ml/dataset.py:1145-1198 (round 199 A 实施):
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+with ThreadPoolExecutor(max_workers=8) as pool:
+    ...
+    futures = [pool.submit(_process_single_stock, ...) for code in codes]
+    ...
+
+# 改 round 201 E:
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# Helper top-level function (ProcessPool requires picklable callable):
+def _process_single_stock_worker(args):
+    code, start, end, horizon, fin_hist, valuation_row, intraday_bar = args
+    return code, _process_single_stock(code, start, end, horizon=horizon,
+                                        fin_hist=fin_hist, valuation_row=valuation_row,
+                                        intraday_bar=intraday_bar)
+
+with ProcessPoolExecutor(max_workers=8) as pool:
+    args_iter = ((code, start, end, None,
+                  fin_hist_map.get(code), valuation_map.get(code),
+                  intraday_bars.get(code) if intraday_bars else None)
+                 for code in codes)
+    results = list(pool.map(_process_single_stock_worker, args_iter, chunksize=20))
+```
+
+**关键考虑**:
+1. **Top-level worker function**: ProcessPool requires picklable, so define `_process_single_stock_worker` at module top (not closure)
+2. **SQLite connection**: 每 sub-process 调 `mp.data.store.get_daily_bars()` 时, SQLite connection is opened lazily per-process. No shared state issue.
+3. **fin_hist + valuation maps**: 这俩本身已经在 main process 算好, 通过 args 传 worker (pickle 开销 ~5-10ms per code, 总 3-6s)
+4. **chunksize=20**: batch 20 codes 一次 dispatch worker, 减少 IPC overhead
+5. **Order preservation**: `pool.map(...)` 保 input order (vs `as_completed` 顺序乱). dataset.py downstream may rely on order — use `pool.map` to be safe.
+
+### D 撤回 (round 200 spec)
+
+请同时 revert D 部分 (round 199 的 `mp/ml/intraday_features.py:222+` cache load):
+```python
+# REMOVE this block from build_intraday_panel:
+# panel: Optional[pd.DataFrame] = None
+# if end is not None:
+#     cache_path = _root / "data" / "cache" / "eod_panel" / f"{end}.parquet"
+#     if cache_path.exists():
+#         try:
+#             cached = pd.read_parquet(cache_path)
+#             ...
+#             panel = sub  # HIT
+#         ...
+
+# Always go through build_latest_features (P11 design intent):
+panel = build_latest_features(codes, ..., intraday_bars=intraday_bars)
+```
+
+scripts/daily_report.py 的 cache **写** 可以 keep (无副作用, 浪费 ~1s parquet write), 或一并 remove. 你拍。
+
+### 期望表现
+
+A only with ProcessPool (E):
+- ThreadPool 1.7× → ProcessPool 4-6× (real parallel)
+- 19 min serial → 19/5 = **~4 min** estimate
+- 14:30 + 4 min = **plan ready 14:34**
+
+加上 PS1 流程:
+- 14:25 fire → git pull (30s) + warm (141s) → 14:27:51
+- 14:27:51 intraday_plan launches, sleep_to_trigger 14:30:00
+- 14:30:00 fetch (cache-read) + parallel ProcessPool build (~4 min) + 4 extras + predict (~10s) → **plan ready 14:34**
+- Step 3-7 verify ~30s → **plan + verify done 14:34:30**
+- Step 8 SKIP, user 14:35 看 plan + 批准 → execute 14:35-14:36
+
+### Test plan
+
+1. **Unit**: pytest verify ProcessPool output 跟 ThreadPool output identical (no race / state bleed)
+2. **Bench**: `python -m timeit "..."` 或 manual bench on ECS — 目标 ≤ 5 min for 615 codes
+3. **Integration**: ECS 端 manual 跑 `intraday_plan.py --skip-sleep --asof 20260602` (advisor 已测 baseline 11.4 min); 目标 ≤ 5 min
+
+### Rule reminders
+- Rule #4 ✓: 不动 model, 改并发实现
+- Rule #11 ✓: PIT (无影响)
+- Rule #1 ✓: code in git, 不动 model artifacts
+- 工程方权: 实施完 push round 202 报告 bench 数据 + 我 advisor verify on ECS
