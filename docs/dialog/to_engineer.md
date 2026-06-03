@@ -11012,3 +11012,115 @@ A only with ProcessPool (E):
 - Rule #11 ✓: PIT (无影响)
 - Rule #1 ✓: code in git, 不动 model artifacts
 - 工程方权: 实施完 push round 202 报告 bench 数据 + 我 advisor verify on ECS
+
+---
+## [2026-06-03 15:00] 第 203 轮 (intraday_plan limit 价应用 14:30 实时市价, 不是 T-1 EOD close — 6/3 实测 3/6 单废单证据)
+
+### user 抓的 bug
+
+6/3 14:30 OOS plan 7 单 (advisor override 减到 100 股), QMT 实际结果:
+| 单 | limit | 14:30 市价 | offset | QMT 结果 |
+|---|---:|---:|---:|---|
+| 正邦科技 002157 | ¥3.14 | ¥3.12 | +0.6% | ✅ 已成 |
+| 海格通信 002465 | ¥16.21 | ¥15.28 | **+6.1%** | **废单 "价格错误"** |
+| 建元信托 600816 | ¥3.06 | ¥2.99 | +2.3% (临界) | ✅ 已成 |
+| 中兵红箭 000519 | ¥19.62 | ¥20.15 | -2.7% (低) | algo skipped (too cheap chase) |
+| 钒钛股份 000629 | ¥3.46 | ¥3.44 | +0.6% | ✅ 已成 |
+| 华海药业 600521 | ¥15.87 | ¥15.36 | **+3.3%** | **废单 "订单价格超出范围"** |
+| 永安期货 600927 | ¥13.70 | ¥13.40 | **+2.2%** | **废单 "订单价格超出范围"** |
+
+3 单 limit > 市价 >2% → QMT 拒 (broker 价格保护).
+
+### Root cause
+
+`daily_report.py:1226`:
+```python
+limit = round(close * 1.01, 2)  # close = T-1 EOD close
+```
+
+intraday_plan.generate_orders delegate to daily_report.generate_order_list (`scripts/intraday_plan.py:680-695`), 使用 daily_report 同一 `_latest_closes` 拿 T-1 EOD close.
+
+→ 14:30 OOS 算 limit 用昨天 close × 1.01, 跟 today 14:30 实时市价偏差大 (今天跌 -4.8% / -2.2% / -1.2%).
+
+### user 要求
+
+> "2:30 的单子应该通过当时的价格计算挂单价格, 怎么可以通过昨天收盘价算"
+
+完全对. 14:30 OOS path 已经 have today's morning bars (含 14:30 close), 应该用 14:30 close 算 limit, 不是 T-1 EOD close.
+
+### Fix spec
+
+`scripts/intraday_plan.py` 在 generate_orders 之前 override closes:
+
+```python
+# Before calling generate_orders (around scripts/intraday_plan.py:850+):
+# 用 morning_bars 的 14:30 close 替代 T-1 EOD close, daily_report.generate_order_list
+# 内部用 _latest_closes 时拿到 14:30 close 算 limit.
+
+def generate_orders(holdings_full, account, top_k_df, full_scored, morning_bars=None):
+    """Delegate to daily_report's logic but override _latest_closes with 14:30
+    morning close (round 203 fix: limit 应用 14:30 市价不是 T-1 EOD).
+    """
+    from scripts.daily_report import generate_order_list
+    
+    if morning_bars:
+        # Monkey-patch _latest_closes to prefer morning bars 14:30 close
+        # for codes in this batch
+        intraday_closes = {
+            str(c).zfill(6): float(b["close"])
+            for c, b in morning_bars.items()
+            if b and "close" in b
+        }
+        
+        import scripts.daily_report as _dr
+        orig_latest_closes = _dr._latest_closes
+        def patched_latest_closes(codes):
+            base = orig_latest_closes(codes)
+            base.update(intraday_closes)  # override with morning 14:30 close
+            return base
+        _dr._latest_closes = patched_latest_closes
+        try:
+            return generate_order_list(holdings_full, account, top_k_df, full_scored)
+        finally:
+            _dr._latest_closes = orig_latest_closes  # restore
+    else:
+        return generate_order_list(holdings_full, account, top_k_df, full_scored)
+```
+
+调用处 (scripts/intraday_plan.py:852):
+```python
+orders, alerts = generate_orders(holdings, account, top_k_df, full_scored, morning_bars=morning_bars)
+```
+
+### Alternative cleaner fix (preferred)
+
+Better: 在 `daily_report.generate_order_list` 加 optional `closes_override` param:
+
+```python
+def generate_order_list(holdings_full, account, top_k_df, full_scored,
+                        closes_override=None):
+    ...
+    if closes_override:
+        closes = {**_latest_closes(...), **closes_override}
+    else:
+        closes = _latest_closes(...)
+```
+
+Then `intraday_plan.generate_orders` passes `closes_override=morning_close_dict`.
+
+### Test plan
+
+1. **Unit**: pytest 加 `tests/test_intraday_plan_limit_uses_morning_close.py`:
+   - Mock 14:30 morning_bars with close ¥15.28 (海格通信)
+   - T-1 close ¥16.05
+   - Run generate_orders → expect limit ≈ 15.28 × 1.01 = ¥15.43 (not ¥16.21)
+2. **Integration**: 明天 6/4 14:30 OOS 真盘 fire 时, limit 应 within ±2% of market → 0 废单
+
+### Rule reminders
+- Rule #4 ✓: 不动 model, 改业务算法
+- Rule #11 ✓: PIT (用 14:30 close 仍是 T 之前的信息, 14:30 之前 14:29:00 close 用作 14:30 信号 OK)
+- Rule #1 ✓: code in git
+
+### 这个 fix 也帮 daily_report (9:25 path)
+
+虽然 9:25 EOD path 用 T-1 close + 1% 算 limit, 跟 today 9:30 开盘价偏差 typically small (overnight gap usually <2%), 废单少见. 但 gap-down day (>2%) 仍可能废. 一并 fix 更稳。
