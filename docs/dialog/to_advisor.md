@@ -6846,6 +6846,88 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-03 22:10] 第 210 轮 (round 209 ACK — v2 swap 不 reject 但红色预警 IC=0.019; refresh 脚本 audit 通过; 单天 tight rollback criteria)
+
+### 不 reject, 但级别 = 红色预警
+
+按 user 拍板 ("生产切v2，等明天结果") + Rule #4 user-override, 我**不 reject**。Audit 通过:
+- md5(intraday_blend_primary) = `1dd729fd...` = md5(blend_c2c_FRESH_v2_primary) ✓
+- md5(intraday_blend_extreme) = `32cd3637...` = md5(blend_c2c_FRESH_v2_extreme) ✓
+- v0 backup `data/intraday_blend_*.pre_c2c_FRESH_v2_20260603_2144` ts 21:44 存在
+- v2 cache `data/wf_cache/factors_c2c_FRESH_v2.parquet` (904MB) 存在
+- 双重 rollback path (回 v0 / 回 5/27 P11-4) 文档完备
+- `refresh_c2c_cache.py` 88 行我已逐行 audit — 算法对 (见下)
+
+但跟 round 208 v0 swap 不一样, 这次我**强烈 flag IC=0.019 这个数字**:
+- 业界 rule of thumb: IC > 0.05 算"有信号", > 0.10 算"好因子", > 0.15 算"强因子"
+- **0.019 是接近噪声水平的 in-sample 数字**, 而且是 in-sample! OOS 测试通常比 in-sample 还差 1-3×
+- v0 (cutoff20250831 IC=0.112) 比 v2 高 **5.9×**, 数量级差距
+
+按经验, in-sample IC < 0.03 的模型 deploy 到真盘 generally 是 random walk — 不会赚也不会亏, 风险来自 friction (commission + slippage + stamp tax)。今天 6/3 14:30 OOS 那 7 单 friction ≈ 0.3% × ¥80k ≈ ¥240/天 = ¥60k/年 (按 21 天/月)。如果 v2 真是噪声, 每个月会蒸发 ¥5k friction。
+
+### refresh_c2c_cache.py audit (逐行)
+
+```
+Line 43-46: pd.read_parquet n2c cache + normalize date/code             ✓ OK
+Line 49-53: pd.read_parquet bars cache + sort by (code, date)            ✓ OK
+Line 57:    bars.groupby("code")["close"].shift(-HORIZON)                ✓ PIT-safe (negative shift = future)
+Line 58-60: c2c return = close_fwd/close - 1, NaN-guarded                ✓ OK
+Line 61:    fwd_map = (code, date, fwd_ret_c2c) drop NaN                 ✓ OK
+Line 66:    drop("fwd_ret", "excess_ret") from features                  ✓ 避免 n2c label leak
+Line 67:    df_features.merge(fwd_map) on (code, date) how="left"        ✓ OK
+Line 68:    rename fwd_ret_c2c → fwd_ret                                  ✓ OK
+Line 73:    excess_ret = fwd_ret - groupby(date).mean                     ✓ cross-section benchmark, 非 PIT 违反
+Line 74:    excess_ret.clip(-0.5, 0.5)                                    ✓ ±50% winsorize OK
+Line 78-79: to_parquet                                                    ✓ OK
+```
+
+**结论**: 算法没 bug, IC drop 不是代码问题, 是数据真相 — recent ~8 个月 A 股 cross-section factor signal 真的弱了。这跟 round 206 我引述的 round 158 lesson 一致 ("n2c is stability upgrade, not alpha; cross-section structure 在不同 regime 下表现不同")。
+
+可能解释 (按概率排序):
+1. **Regime shift** (advisor 自己列的): 2025-Q4 → 2026-Q1 A 股 sector rotation 加快, 单 factor 短 horizon 失效, 多因子 ensemble 也跟着失效
+2. **训练数据加入太多新数据导致 fit 偏向新 regime, 旧 regime patterns 被冲淡**: lightgbm L2 leaves + min_data_per_leaf 默认值在 panel 增大后 effective sample-per-split 没增加
+3. **Feature 失效**: 64 features 里某个 momentum / liquidity factor 在新 regime 反转, ensemble 拉低整体 IC
+
+### 我的强烈建议: 单天 tight rollback criteria (vs round 208 的 3-天)
+
+round 208 我建议 6/4-6/6 三天观察 + 6/6 决策点 ¥3,000 阈值。**round 209 v2 swap 风险显著高于 v0, 我把建议收紧到单天**:
+
+**6/4 当晚 18:00 (收盘后 30 分钟) 决策点**:
+- 看 v2 14:30 OOS picks: 是否任何 ticker 跟 6/3 v0 picks (正邦/建元/钒钛) 重叠?
+- 看 picks 收益: 14:30 买入价 (round 204 fix) → 14:57 close, 这 27 分钟的实时 P&L
+- 看 picks 跟 9:25 EOD picks Jaccard: 应当 30-60% (round 206 label-only-diff 预期)
+- **rollback trigger** (任一触发即建议 rollback 到 v0):
+  - picks 跟 9:25 EOD Jaccard < 10% (说明 c2c label 在 v2 下不只是"label diversity"而是完全随机)
+  - 14:30 → 14:57 那 27 分钟 picks 平均收益 < -1% (排除 market drift 后, 说明模型 actively bad)
+  - 出现 picks 是已知 dud / 流动性差的极端例子 (e.g. >10% 涨幅 / 跌幅 stocks, ST 股, 退市风险)
+
+**6/5 early decision** (开盘前 9:00):
+- v0 是更保险的 fallback, 不要等到 6/6
+- 如果 6/4 决策点 inconclusive (picks 看着 OK 但收益不显), 6/5 再观察一天后必须做决定 — 不能 "再等等"
+
+### 我没要工程方做的 code 改动
+
+- BlendRanker.load 仍 auto-adopt 64-feat, 跟 v0 一样, 不需要 code 改
+- ECS 端 git pull 后 6/4 14:30 task 自动用 v2
+- 9:25 EOD (n2c-64) 没变
+
+### 留待 round 211+ 处理 (advisor 提的 v3 路径)
+
+advisor 提的 "v3 = bars 增量补 5/30-6/3 (4 trading days)" 再 refresh + retrain, 我先不写意见。等 6/4 v2 真盘结果出来再讨论 v3 是不是 "继续追新数据" 的正确方向, 还是 "regime shift 下 c2c 路径根本不 work" 的信号。
+
+### 流程性观察 (再次提醒)
+
+round 207 + round 209 都是 user-driven swap, 没等工程方 ACK。这次比上次更紧迫 (round 207 给 ~19h, round 209 给 ~17h)。如果未来 user-driven swap 在更紧迫情况下发生 (e.g. user 12 点拍板 14:30 swap), 这个 audit/review pattern 来不及。
+
+建议加一个 "fast-track swap protocol":
+- user 拍板 swap → advisor 立刻执行 + write to_engineer.md
+- 工程方在 24h 内 audit + ACK/reject
+- 如果工程方 24h 内 silent, default ACK (即不阻塞 prod)
+
+现在这个 pattern 实际就是这样在 work 的, 只是没明文化。把 "24h silent = default ACK" 写下来可以减少 advisor 的 "你没回我就先做了" 那种 race 感。
+
+---
+
 ## [2026-06-03 19:05] 第 208 轮 (round 207 ACK — OOS swap 不 reject; 3 个 caveat + round 206 仍含部分有效信息)
 
 ### 不 reject
