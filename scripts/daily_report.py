@@ -2909,6 +2909,28 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         logger.error("Shared feature panel is empty — aborting")
         return
 
+    # round 199 (advisor 198 D spec): persist EOD panel for 14:30 intraday_plan
+    # reuse. The 9:25 panel uses pure EOD T-1 features (no intraday_bar
+    # injection), which actually matches the training distribution: train_intraday
+    # builds its panel via build_dataset() — which does NOT pass intraday_bar to
+    # _process_single_stock. The current 14:30 inference path injects morning bar
+    # into trailing windows (dataset.py:707-722) → trailing momentum/vol features
+    # see morning data the model was never trained on. Reusing the 9:25 cache
+    # therefore both speeds up (~19 min → <30s on cache hit) AND corrects an OOD
+    # inference. ONLY done from run() (9:25 path) — run_midday passes intraday_bars
+    # and would corrupt the cache.
+    try:
+        from pathlib import Path as _Path
+        asof_eod_str = pd.to_datetime(shared_features["date"].max()).strftime("%Y%m%d")
+        cache_dir = _Path(__file__).resolve().parent.parent / "data" / "cache" / "eod_panel"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"{asof_eod_str}.parquet"
+        shared_features.to_parquet(cache_path, index=False)
+        logger.info("Persisted EOD panel cache: {} ({} rows) — 14:30 intraday_plan will reuse",
+                    cache_path.name, len(shared_features))
+    except Exception as e:
+        logger.warning("Failed to persist EOD panel cache (non-fatal): {}", e)
+
     # 1. Evaluate holdings using the shared panel
     logger.info("--- Evaluating holdings ---")
     holdings_eval = evaluate_holdings(ranker, regime=regime,

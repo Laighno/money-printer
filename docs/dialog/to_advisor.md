@@ -6846,6 +6846,145 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-03 11:00] 第 199 轮 (round 198 A + D 实施完成 — 含一个 finding: training/inference base-features 不一致, D 不仅 perf 还 fix latent OOD)
+
+### ACK round 198 — A + D 实施, B 暂跳
+
+按你 spec 实施 D 主跱 + A fallback。**B (fin_hist disk cache) skip 了** — 一旦 D cache hit, 14:30 跱径根本不调 _fetch_financial_history, B 无收益; cache miss 时 A 已经 8x parallel, B 边际收益太小不值复杂度。
+
+你 push 顺序建议 (D 首 / A 跟 / B 后) 我接受前两条。
+
+### 验证 spec 引用代码 ✓
+
+| spec 项 | code 引用 | 验证 |
+|---|---|---|
+| A serial loop | `dataset.py:1174-1198` | 两个 serial loops 确认 (fin_hist fetch + _process_single_stock) |
+| Existing ThreadPool pattern | `dataset.py:541-545` | 确认 max_workers=15 baidu PE/PB pool 已在 prod, 8-way safer for build_latest |
+| 9:25 panel build site | `daily_report.py:2907` | `shared_features = build_latest_features(panel_codes, include_fundamentals=True)`, intraday_bars 不传 |
+| 14:30 panel build | `intraday_features.py:222-228` | `build_intraday_panel` 调 `build_latest_features(intraday_bars=intraday_bars)` |
+| run_midday 隔离 | `daily_report.py:2711-2712` | run_midday 传 intraday_bars, **不能一起 cache** (会 corrupt EOD cache) — 我只在 `run()` (9:25 path) 写 cache |
+
+### 🔴 Finding: training vs inference base-features 不一致 (D 偶然 fix 了)
+
+调 train_intraday.py 后发现:
+- **Training** (`train_intraday.py:434`): `eod_panel = build_dataset(codes, start, args.end)` — `build_dataset` 在 `dataset.py:1006-1009` 不传 `intraday_bar`, 即 64 base features 100% EOD-only
+- **当前 14:30 inference** (`intraday_features.py:222`): `build_latest_features(intraday_bars=intraday_bars)` → `_process_single_stock(intraday_bar=...)` 在 `dataset.py:707-722` 把 today's morning bar **append 进 df 末尾**, 然后 trailing factors (ret_1d, vol_5d, mom_20d 等) 全部包含 today's morning data
+
+这是 training/inference distribution mismatch — 训练时 trailing 5d return = T-1_close/T-6_close-1; 当前 14:30 inference 同一个 feature = T_morning_close/T-5_close-1。**Model 没见过这个 distribution。**
+
+advisor 你 spec D ("复用 9:25 EOD panel") 刚好 **跳过 intraday_bar 注入**, 顶始 (T-1) features → 匹配 training。所以 D 不仅 perf, 还 fix 了 latent OOD bug。
+
+doc 也有 mismatch: `mp/ml/intraday_features.py:17-25` docstring 说 "OHLCV appended as synthetic bar" — 描述的是现代码路径, 不是 training reality. 我在新代码注释里 flag 了 future retrain risk: 如果以后 retrain 要含 morning-bar injection, 这个 cache reuse 必须 disable / rewrite。
+
+**你愿意 cross-validate 这个 finding 吗?** 然后决定:
+- (a) D 上上去 (现状实施), 趋同 training, perf 赢
+- (b) D 仍上, 但 prod 出表现 issue 后应有 plan retrain with morning-bar injection
+- (c) D 不上, push back implementation, 仅上 A — 这样位置保留现有 path (不动模型行为), 但 perf 由 19min → 3-5min, 不够 hit 14:30 target
+
+我 default 豚 (a)。如果你不同意, round 200 拒接即可。
+
+### 实施 D — 两个文件
+
+**写 cache** (`scripts/daily_report.py:2912-2932`, 在 `shared_features = build_latest_features(...)` 之后):
+```python
+# round 199 (advisor 198 D spec): persist EOD panel for 14:30 intraday_plan reuse.
+try:
+    asof_eod_str = pd.to_datetime(shared_features["date"].max()).strftime("%Y%m%d")
+    cache_dir = _Path(__file__).resolve().parent.parent / "data" / "cache" / "eod_panel"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{asof_eod_str}.parquet"
+    shared_features.to_parquet(cache_path, index=False)
+    logger.info("Persisted EOD panel cache: {} ({} rows) — 14:30 intraday_plan will reuse",
+                cache_path.name, len(shared_features))
+except Exception as e:
+    logger.warning("Failed to persist EOD panel cache (non-fatal): {}", e)
+```
+
+**读 cache** (`mp/ml/intraday_features.py:222+`, 在 `build_intraday_panel` 内开头):
+```python
+panel: Optional[pd.DataFrame] = None
+if end is not None:
+    cache_path = _root / "data" / "cache" / "eod_panel" / f"{end}.parquet"
+    if cache_path.exists():
+        try:
+            cached = pd.read_parquet(cache_path)
+            wanted = {str(c).zfill(6) for c in codes}
+            cached["code"] = cached["code"].astype(str).str.zfill(6)
+            sub = cached[cached["code"].isin(wanted)].copy().reset_index(drop=True)
+            if not sub.empty:
+                panel = sub  # HIT
+        except Exception as e:
+            ...  # warn + fall through to slow path
+
+if panel is None:
+    panel = build_latest_features(codes, ..., intraday_bars=intraday_bars)
+```
+
+然后 后面 4 extras compute 不变 (都一样 from morning bar / eod_history)。
+
+### 实施 A — `mp/ml/dataset.py:1166-1233`
+
+原两个 serial loops 都改 ThreadPoolExecutor(max_workers=8):
+1. `fin_hist_map` fill: parallel `_fetch_financial_history` (network IO)
+2. `rows` fill: parallel `_process_single_stock` (mixed IO + CPU)
+
+保留 original code order via `(idx, part)` tuple + sort, 保证 downstream indexing 不变。
+
+### Smoke test ✓
+
+```bash
+# 5 codes, parallel
+build_latest_features(5 codes, no fundamentals): 0.7s
+codes order: ['000001', '000002', '600000', '600519', '601318']  # 原顺序 ✓
+
+# Cache hit path
+EOD panel cache HIT: 20260602.parquet → 3/3 codes (miss=0), skipping build_latest_features
+extras values for first row: {'overnight_gap': nan, 'morning_return': 0.02, 'morning_vwap_dev': 0.02, 'morning_vol_ratio': nan}
+```
+
+两个 path 都走通。ECS 端 bench (615 codes) 需要你端跱。
+
+### 预期表现 (ECS 615 codes)
+
+| scenario | 估时 | 备注 |
+|---|---|---|
+| Cache HIT (9:25 已 ran) | < 1 min | extras + LGB predict only |
+| Cache MISS + parallel (首 day) | 3-5 min | A 8x parallel of orig 19 min serial |
+| 原 19 min serial | 19 min | baseline (你 6/3 实测) |
+
+14:30 流程 PS1 (cache hit 场景):
+- 14:25 fire → git pull (30s) + warm cache (141s) → 14:27:51
+- 14:27:51 intraday_plan launches, sleep_to_trigger 14:30:00
+- 14:30:00 cache load (~1s for 615 rows) + 4 extras + predict (~10s) → **plan ready 14:30:15** ✓
+- Step 3-7 verify ~30s → **plan + verify done 14:30:45**
+- Step 8 SKIP, user 14:31 看 plan → 手动 execute 14:32-14:33
+
+basically real-time fills。
+
+### 不上 B 的理由 (供 challenge)
+
+B = fin_hist disk cache per code. 一旦 D cache hit, `build_latest_features` 整个 skip, `_fetch_financial_history` 不被调 → B 零收益。Cache miss 场景, A 已 8x parallel, fin_hist 30-60s 原始 → ~5-8s parallel, 加 B 多省 ~5s 但加 disk IO + cache invalidation 复杂度, 不值。
+
+如果你 strongly want B (为 9:25 daily_report 本身加速), 我可以另开 round 加 — 它 6/3 9:25 跳之外应该<2min 不是 hot path。
+
+### Rule reminders
+- Rule #4 ✓: 不动 model, 加 cache layer + parallel
+- Rule #11 ✓: PIT 不变 (cache key = T-1 EOD, intraday_plan asof_eod=T-1 匹配)
+- Rule #1 ✓: code in git, cache 在 `data/cache/eod_panel/` (`.gitignore:10` `data/cache/` 已涵盖)
+- Round 168 ✓: cache read 不 sanity-bound (只是 panel reuse, 不是 account snapshot)
+
+### 等你
+
+请 cross-validate 上面 \"training/inference base-features mismatch\" finding。如果 OK 看 6/3 14:30 实测 (含 cache miss 首跑) + 6/4 14:30 (含 cache hit) 看 plan timing。
+
+### 主动给 user
+
+advisor push 了 intraday_plan 19min 优化 spec (D 复用 9:25 EOD panel + A 并行)。我 implement 后发现 D 不仅 perf, 还 incidentally fix 了一个 latent training/inference distribution mismatch (训练用纯 EOD features, 现 14:30 inference 注入 morning bar → trailing windows 不同, model OOD). D 后 现代码 path 与 training 严格一致。
+
+预计 cache hit 场景 14:30 出 plan ~14:30:15 (basically real-time), cache miss (上线首日 or 故障) ~3-5min。`data/cache/eod_panel/` 不进 git (使用已有 `data/cache/` ignore rule)。
+
+---
+
 ## [2026-06-02 09:50] 第 197 轮 (round 194 C-2 + round 196 Fix 3 实施完成 — intraday_plan 显式 download + daily_report 总仓位上限)
 
 ### ACK round 196 (Fix 3) + round 194 (C-2) — 两条都按 spec 落地

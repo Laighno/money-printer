@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1165,21 +1165,34 @@ def build_latest_features(
     total = len(codes)
     logger.info("build_latest_features: {} codes, start={}", total, start)
 
-    # For live prediction: get today's valuation snapshot + financial history
+    # round 199 (advisor 198 A spec): parallelize the two serial loops
+    # (fin_hist fetch + _process_single_stock). Pre-fix this routine spent
+    # ~19 min on 615 codes (1155s walltime, ~1.9s per code) — both loops
+    # bottleneck on IO (fin_hist HTTP fetch + per-stock get_daily_bars SQLite
+    # reads). 8-way ThreadPool mirrors the existing Baidu PE/PB fetch pool
+    # (dataset.py:541-545, max_workers=15) — also IO-heavy + thread-safe.
+    _WORKERS = 8
+
     valuation_map: Dict[str, Dict[str, float]] = {}
     fin_hist_map: Dict[str, Optional[pd.DataFrame]] = {}
     if include_fundamentals:
         valuation_map = _fetch_valuation_snapshot_map(codes)
         logger.info("Got valuation snapshot for {} stocks", len(valuation_map))
-        for code in codes:
-            fin_hist_map[code] = _fetch_financial_history(code)
+        with ThreadPoolExecutor(max_workers=_WORKERS) as _pool:
+            _futs = {_pool.submit(_fetch_financial_history, c): c for c in codes}
+            for _fut in as_completed(_futs):
+                _c = _futs[_fut]
+                try:
+                    fin_hist_map[_c] = _fut.result()
+                except Exception:
+                    fin_hist_map[_c] = None
         n_ok = sum(1 for v in fin_hist_map.values() if v is not None)
-        logger.info("Got financial history for {}/{} stocks", n_ok, total)
+        logger.info("Got financial history for {}/{} stocks (parallel)", n_ok, total)
 
-    rows: List[pd.DataFrame] = []
     core_cols = TECHNICAL_COLUMNS[:13]
 
-    for idx, code in enumerate(codes):
+    def _proc_one(idx_code):
+        idx, code = idx_code
         try:
             fin_hist = fin_hist_map.get(code) if include_fundamentals else None
             val_row = valuation_map.get(code) if include_fundamentals else None
@@ -1187,18 +1200,31 @@ def build_latest_features(
             part = _process_single_stock(code, start, end, horizon=None,
                                          fin_hist=fin_hist, valuation_row=val_row,
                                          intraday_bar=bar)
+            return idx, part
+        except Exception:
+            logger.warning("Failed to process {}, skipping", code)
+            return idx, None
+
+    rows_indexed: List[Tuple[int, pd.DataFrame]] = []
+    completed = 0
+    with ThreadPoolExecutor(max_workers=_WORKERS) as _pool:
+        _futs = [_pool.submit(_proc_one, (i, c)) for i, c in enumerate(codes)]
+        for _fut in as_completed(_futs):
+            idx, part = _fut.result()
+            completed += 1
             if part is not None:
                 clean = part.dropna(subset=core_cols)
                 if not clean.empty:
-                    rows.append(clean.iloc[[-1]])
-        except Exception:
-            logger.warning("Failed to process {}, skipping", code)
+                    rows_indexed.append((idx, clean.iloc[[-1]]))
+            if progress_callback is not None:
+                progress_callback(completed, total)
+            if completed % 50 == 0 or completed == total:
+                logger.info("build_latest_features progress: {}/{}", completed, total)
 
-        if progress_callback is not None:
-            progress_callback(idx + 1, total)
-
-        if (idx + 1) % 50 == 0 or (idx + 1) == total:
-            logger.info("build_latest_features progress: {}/{}", idx + 1, total)
+    # Preserve original code order (matches pre-fix serial behaviour) so
+    # downstream consumers that index by position get the same ordering.
+    rows_indexed.sort(key=lambda x: x[0])
+    rows: List[pd.DataFrame] = [r for _, r in rows_indexed]
 
     if not rows:
         logger.error("build_latest_features: no valid data produced")
