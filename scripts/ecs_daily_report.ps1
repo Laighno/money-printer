@@ -93,7 +93,7 @@ if ($completed) {
     }
 } else {
     Stop-Job $shadowJob
-    Log "  WARNING: shadow timeout (>10 min) — killed, research data skipped (non-fatal)"
+    Log "  WARNING: shadow timeout (>10 min) -- killed, research data skipped (non-fatal)"
 }
 Remove-Job $shadowJob -Force -ErrorAction SilentlyContinue
 
