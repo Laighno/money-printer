@@ -10632,3 +10632,209 @@ if total_pos_after > total_pos_cap:
 ### Rule reminders
 - Rule #1: code in git ✓
 - Rule #4: 不动 model, 改业务算法 ✓ (Fix 3 是 plan generation logic, 不动 ML model)
+
+---
+## [2026-06-03 10:30] 第 198 轮 (intraday_plan scoring 19 min 优化 spec — A + B + D combined)
+
+### Background
+
+6/3 测试 `intraday_plan.py --skip-sleep --asof 20260603` 跑了 **19 分 16 秒** (1155s walltime, CPU 2041s avg 1.78 cores).
+
+PS1 14:30 流程估算:
+- 14:25:00 fire → git pull (30s) + warm cache (141s) → 14:27:51
+- 14:27:51 intraday_plan launches, sleep_to_trigger 等到 14:30:00
+- **14:30:00 score start, plan ready 14:42-14:49** (含 19 min scoring)
+- → user 14:35+ 才能看 plan, fills 14:40+ — lag 真 14:30 fills ~10 min
+
+User 不接受 砍 universe (HS300+ZZ500 minus 创业板/科创板 = 615 codes). 要求 advisor push spec 优化.
+
+### Bottleneck 亲核 (mp/ml/dataset.py:1184)
+
+```python
+# build_latest_features 主体:
+for idx, code in enumerate(codes):   # ← serial loop, 不 parallel!
+    try:
+        fin_hist = fin_hist_map.get(code) if include_fundamentals else None
+        val_row = valuation_map.get(code) if include_fundamentals else None
+        bar = intraday_bars.get(code) if intraday_bars else None
+        part = _process_single_stock(code, start, end, horizon=None,
+                                     fin_hist=fin_hist, valuation_row=val_row,
+                                     intraday_bar=bar)
+        ...
+
+# 上面也有 serial fin_hist fetch:
+for code in codes:                    # ← 第 2 个 serial loop
+    fin_hist_map[code] = _fetch_financial_history(code)
+```
+
+Two serial loops over 615 codes. Each `_process_single_stock` does:
+- `get_daily_bars(code, start, end)` — DB query (~50-200ms cold, ~5-50ms cache hit)
+- 64 features compute (numpy vectorized, ~10-50ms CPU)
+- Total per-code: ~60-250ms
+
+615 × 100ms (median) = 61s serial; 615 × 250ms = 154s. 加上 fin_hist fetch ~30s + valuation snapshot ~5s.
+
+Actual measured 1155s (~19 min) >> 154s estimate — 说明 fetch 慢于 100-250ms per code (network/DB), and possibly some compute hot spots. CPU avg 1.78 cores means partial parallelism exists (xtdata internal multi-thread maybe).
+
+### A. Parallelize `build_latest_features` inner loops
+
+```python
+# 改 dataset.py:1184 + 1178 用 ThreadPoolExecutor
+# pattern: dataset.py:541-545 已有 ThreadPoolExecutor usage 可参考
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Step 1: parallel fin_hist fetch (网络 IO bound)
+if include_fundamentals:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_financial_history, code): code for code in codes}
+        for fut in as_completed(futures):
+            code = futures[fut]
+            try:
+                fin_hist_map[code] = fut.result()
+            except Exception:
+                fin_hist_map[code] = None
+
+# Step 2: parallel _process_single_stock (IO + CPU bound)
+rows = []
+with ThreadPoolExecutor(max_workers=8) as pool:
+    def _process_one(idx, code):
+        try:
+            fin_hist = fin_hist_map.get(code) if include_fundamentals else None
+            val_row = valuation_map.get(code) if include_fundamentals else None
+            bar = intraday_bars.get(code) if intraday_bars else None
+            part = _process_single_stock(code, start, end, horizon=None,
+                                         fin_hist=fin_hist, valuation_row=val_row,
+                                         intraday_bar=bar)
+            return code, idx, part
+        except Exception:
+            return code, idx, None
+
+    futures = [pool.submit(_process_one, idx, code) for idx, code in enumerate(codes)]
+    results = []
+    completed = 0
+    for fut in as_completed(futures):
+        code, idx, part = fut.result()
+        completed += 1
+        if part is not None:
+            clean = part.dropna(subset=core_cols)
+            if not clean.empty:
+                results.append((idx, clean.iloc[[-1]]))
+        if progress_callback:
+            progress_callback(completed, total)
+        if completed % 50 == 0 or completed == total:
+            logger.info("build_latest_features progress: {}/{}", completed, total)
+    # Sort by original idx to preserve order
+    results.sort(key=lambda x: x[0])
+    rows = [part for _, part in results]
+```
+
+**Expected speedup**: 4-8x (limited by xtdata internal lock + DB connection pool).
+**Risk**: thread-safety of `_process_single_stock` — needs verify it doesn't share mutable state. xtdata API is thread-safe per their docs.
+
+### B. Cache fin_hist + valuation per-day to disk
+
+`_fetch_financial_history` 每 code 调一次. 一天内 fundamentals 不变. Cache to disk avoids re-fetch in subsequent runs same-day (e.g. 14:30 run reuses 9:25 EOD's fetch).
+
+```python
+import json
+from datetime import date
+
+CACHE_DIR = Path("data/cache/financial_history")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _fetch_financial_history_cached(code: str) -> Optional[pd.DataFrame]:
+    today = date.today().isoformat()
+    cache_path = CACHE_DIR / f"{today}_{code}.parquet"
+    if cache_path.exists():
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception:
+            cache_path.unlink(missing_ok=True)
+    
+    df = _fetch_financial_history(code)  # original
+    if df is not None and not df.empty:
+        try:
+            df.to_parquet(cache_path, index=False)
+        except Exception:
+            pass
+    return df
+```
+
+Similar pattern for `_fetch_valuation_snapshot_map`.
+
+**Expected speedup**: 1.5-2x on intraday_plan when daily_report cache hit (saves 30-60s).
+
+### D. Reuse 9:25 daily_report 算过的 features (最大 saving)
+
+9:25 EOD task runs `daily_report.py` which calls `recommend_stocks` which calls `build_dataset` (or similar feature compute on full universe). The computed features are used to rank, but **not persisted** — wasted work.
+
+14:30 intraday_plan computes **the same 64 EOD features** + 4 INTRADAY_EXTRAS. 64 EOD features are identical between 9:25 and 14:30 (same T-1 EOD data). Only 4 INTRADAY_EXTRAS change with morning bars.
+
+**Spec**:
+- 9:25 daily_report 跑完后 `build_dataset` 结果 (full panel with EOD features) cache to disk: `data/cache/eod_panel/{date}.parquet`
+- 14:30 intraday_plan 加载 cache panel → skip `build_latest_features` (the heavy serial loop) → directly compute 4 INTRADAY_EXTRAS → merge → score
+
+Pseudocode:
+```python
+# In daily_report.py recommend_stocks:
+panel = build_dataset(codes, ...)  # existing
+# NEW: persist for intraday reuse
+panel.to_parquet(f"data/cache/eod_panel/{today_str}.parquet", index=False)
+
+# In intraday_plan.py score_universe:
+# Try load EOD panel cache (from 9:25 daily_report)
+cache_path = Path(f"data/cache/eod_panel/{asof_eod.strftime('%Y%m%d')}.parquet")
+if cache_path.exists():
+    panel = pd.read_parquet(cache_path)
+    logger.info("Loaded EOD panel cache from 9:25 daily_report ({} rows)", len(panel))
+    # Compute INTRADAY_EXTRAS only (much faster)
+    extras_rows = [compute_intraday_extras(intraday_bars.get(c), 
+                                            eod_history=eod_history_map.get(c))
+                   for c in panel["code"]]
+    extras_df = pd.DataFrame(extras_rows)
+    for col in INTRADAY_EXTRA_COLUMNS:
+        panel[col] = extras_df[col].values
+else:
+    # Fall back to fresh build_intraday_panel
+    panel = build_intraday_panel(...)  # original slow path
+```
+
+**Expected speedup**: **5-10x** (most heavy loop skipped, only 4 EXTRAS compute + LightGBM predict remain). 估 intraday_plan 19min → **1-2 min**.
+
+### Combined A + B + D Expected Total Speedup
+
+- A alone: 5-7 min (19 min → 5-7 min)
+- B alone: -30-60s (~5%)
+- D alone: 1-2 min if cache hit, otherwise fallback to A+B speed
+- A + B + D: **~1-2 min on cache hit, ~3-5 min on cache miss (first run after deploy)**
+
+14:30 流程实际:
+- 14:25 fire → git pull (30s) + warm (141s) → 14:27:51
+- 14:27:51 intraday_plan launches, sleep_to_trigger 14:30:00
+- **14:30:00 cache load + 4 EXTRAS + predict ~30s** → **plan ready 14:30:30** ✓
+- Step 3-7 verify ~30s → **plan + verify done 14:31:00**
+- Step 8 SKIP, user 14:31 看 plan → 批准 → execute 14:32-14:33
+
+User 14:30 fills (basically real-time)。
+
+### 实施顺序 (你拍)
+
+我推 **D 第一** (最大 single saving), 然后 A (parallel) 作 fallback, 最后 B (cache, small saving)。
+
+或者**全部一次性** 一个 PR. 你按工程方 capacity 拍.
+
+### Test Plan
+
+1. **Unit**: pytest `tests/test_build_latest_features.py` 加 parallel 跑 vs serial 比较输出 identical (no thread races).
+2. **Bench**: `python scripts/bench_build_latest_features.py` (新加 script) 跑 615 codes 测 timings.
+3. **Integration**: ECS 端 manual 跑 `intraday_plan --skip-sleep --asof <date>` 测 walltime (目标 ≤ 2 min cache hit).
+
+### Rule reminders
+- Rule #4 ✓: 不动 model, 改业务算法 + cache layer
+- Rule #11 ✓: PIT (EOD panel cache 是 T-1 data, intraday_plan uses 14:30 morning bars — boundary 不变)
+- Rule #1 ✓: code in git, cache files 在 data/cache/ (`.gitignore` 加 entry)
+
+### advisor 持续:
+- 等 6/3 14:30 实测看 plan timing (没 round 198 fix, 估 19 min, plan ready 14:42)
+- round 198 工程方实施后 re-benchmark
