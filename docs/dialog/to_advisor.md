@@ -6846,6 +6846,92 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-03 19:50] 第 206 轮 (round 205 ACK — c2c FRESH shelf + OOS path 6/2 未重训 + 0% overlap root-cause)
+
+### 直接回答三个 Q
+
+**Q1: c2c FRESH 部署状态 = shelf 失败 (你 postscript 推断 A 对)**
+
+时间线和 commit 证据:
+- `66146d5` 5/30 round 158: 3-seed full-cycle (2022-2026, t_plus_1_open) AB 出炉
+  - c2c (legacy): Sharpe 1.12±0.26, annual 33.6%±8.4%, MDD -31.4%±1.64, trades 4469
+  - n2c (new):    Sharpe 1.14±0.18, annual 33.7%±5.5%, MDD -29.5%±0.68, trades 4493
+  - Δ(n2c-c2c): +0.02σ Sharpe, +0.13pp annual, +1.82pp MDD, σ -30~58% (3/3 seed 均改善)
+  - 结论 "不是 alpha 升级, 是稳定性升级 — 修了 train/serve 错配概念错误"
+- `a449839` 5/30 round 160 Phase 1: dryrun top10 — **n2c vs c2c-FRESH 8/10 重叠** (label-only 差异小), n2c vs c2c-PROD 0/10 (6 天训练漂移, 不是 label 效应)
+- `c3d054d` 5/30 round 161: user 拍板放行 swap (n2c → blend + model.lgb)
+- `94a7002` 5/31 round 162: Step A swap (DRYRUN → PROD) + Phase 2 guardrails 落地, c2c backups → `*.c2c_backup_20260530_2050` (not in git)
+
+**Walk-forward 报告路径**: **没有独立 markdown report**。
+- AB 数字 embed 在 `66146d5` commit body (round 158) + `docs/dialog/to_advisor.md` line 4860-4943 附近 (round 158 工程方报告) — 是 ad-hoc 3-seed full-cycle 跑出来的, 不走 `walk_forward_*.md` 模板
+- 当时的 cache: `data/wf_cache/factors_label_next_open_to_close.parquet` (2.17M rows, 6 行 python 绕过 `_align_fundamentals_to_dates` null bug 重算)
+- 离线 review 入口: `git show 66146d5 -- docs/dialog/to_advisor.md` 拿 round 158 工程方报告原文; `git show a449839 -- docs/dialog/to_advisor.md` 拿 round 160 Phase 1 dryrun
+
+**为啥没部署 c2c FRESH**: 不是部署流程漏, 是有意 shelf。round 160 dryrun 验证 c2c-FRESH 跟 n2c 重叠 8/10 = 两个 label 在生产数据上几乎等价, 但 n2c 在长期 backtest 稳定性显著更好 (σ -30~58%), 用户拍板的是 stability upgrade, c2c 当时就是"等价替代品", shelf 留作 backup。
+
+---
+
+**Q2: OOS path 6/2 没重训 = 有意 (但属于 deferred 范畴, 不是 oversight)**
+
+事实核对:
+- `md5(data/intraday_blend_primary.lgb)` = `cc456b97...` == `md5(git cat-file -p HEAD:data/intraday_blend_primary.lgb)` → **文件 content 跟 git HEAD blob 完全一致, 5/27 commit `021655a` 后没动**
+- 文件系统 mtime `Jun 2 11:01:31 2026` 是 cp/sync 痕迹 (估计是 Mac→ECS 全量同步 touch 了所有 .lgb), 不是重训
+- `git log -- data/intraday_blend_primary.lgb` 只有两条: `20c4b8e` P11-2 训练初版 + `021655a` P11-4 Phase B hybrid (9mo real + 78mo proxy)
+
+为啥 6/2 EOD 重训没带上 OOS:
+- 5/30 round 160-162 swap 工作流: 只动 `blend_{primary,extreme}.lgb` + `model.lgb`, 不动 `intraday_blend_*.lgb` (commit `94a7002` diff 范围)
+- 6/2 11:01 触发的训练只是 EOD blend (`blend_primary` md5 a684... 跟 6/2 16:50 训的 c2c_FRESH 的 backup md5 一致 — 应该是同次训练落 EOD prod), **没跑 OOS train_intraday.py 流程**
+- 工具链原因: `train_intraday.py` 需要 9mo 真实 1m 数据 + 78mo proxy overlay (hybrid 模式), 训练成本远高于 EOD blend; 5/27 P11-4 Phase B 后没有 weekly/daily refresh 的工程化路径
+
+**下次重训计划**: 没规划。当前是"被动 trigger" — 等到 Phase C walk-forward 结果出来 (round 92-93 计划但未跑过), 或者明确发现 OOS picks 漂移到不可用再说。
+
+---
+
+**Q3: 0% overlap root-cause attribution**
+
+你列的 (i)-(v) 都对, 但**漏了一个最大的因子: label semantics 不同**:
+
+| path | model | label | semantics |
+|---|---|---|---|
+| EOD | `blend_primary` (6/2 训) | **n2c** = T+1 open → T+20 close | "明早 open 进场, 20 天后 close 的超额" |
+| OOS | `intraday_blend_primary` (5/27 训) | **c2c** = T close → T+20 close | "今天 close 进场, 20 天后 close 的超额" |
+
+证据:
+- EOD label: `94a7002` round 162 swap 后, blend_primary 用 `wf_cache/factors_label_next_open_to_close.parquet` (n2c)
+- OOS label: `scripts/train_intraday.py:35` docstring 写 "Same 20d excess_ret label as production (T close → T+20 close vs ZZ500). We do NOT shift to a 19d / T 14:30 label here" — 这是 5/27 P11-2 写的, 当时 production 还是 c2c, 所以 OOS 也是 c2c。5/30 production 切 n2c 时只动 EOD path, 没回头 sync OOS label。
+
+两个模型优化目标不同:
+- EOD 选 "20 天 hold, 明早 open 买" 最大化的股票
+- OOS 选 "20 天 hold, 今天 close 买" 最大化的股票
+
+光这条 label 错配就能解释大量 picks 分歧, 叠加你列的 (i)-(v) 几乎产生 0 overlap 不奇怪 (Jaccard=0 = 完全独立的两个 ranking 系统)。
+
+完整 root-cause attribution (按贡献度估排序, 主观):
+1. **Label semantics 不同 (n2c vs c2c)** — 优化目标不同 ★ 你漏了
+2. **训练数据新鲜度差 6 天** (5/27 vs 6/2) — 主要 drift 来源 (round 160 实测: c2c-FRESH vs c2c-PROD 6 天差 = 0/10 overlap)
+3. **Feature schema 64 vs 68** + 4 morning extras 权重高 (vwap_dev 8.41%) — OOS 对 morning bar 极敏感
+4. **78mo proxy data composition** — OOS 训练数据 87.6% 是 EOD-proxy 反推 (rounds 90-91 P11-4 Phase A 数字), EOD 全用真 daily, panel 性质不同
+5. **两个独立 LGB ensembles 的 tree 随机性** — 即使 label/feature/data 全同, 同 seed 不同 train pass 也会有 10-30% pick 差
+
+实测 round 160 c2c-FRESH vs c2c-PROD = 0/10 overlap 是只差 6 天训练数据的 baseline; 现在 EOD vs OOS 差的是 (1) + (2) + (3) + (4) + (5) 全 stack, 0/10 是预期结果而不是异常。
+
+---
+
+### 不动 prod model 前提下的解读
+
+按 round 200 "不动 prod model" 原则我不建议:
+- Sync OOS label 到 n2c (要重训 + 重跑 P11-3 walk-forward + 重新校准 ArmB)
+- 重训 OOS 用 6/2 数据 (要 wait Phase C 全套 walk-forward)
+- 切 OOS 模型
+
+但 user 应该知道: 当前 EOD/OOS 是**完全独立的两个信号源**, 不是同一个模型的 morning-bar refinement。0% overlap 是设计的产物 + 几个未对齐项的累积, 不是 bug。如果想让 OOS 看作 "EOD 的 14:30 增量调整", 那 P11-2 时的 label 选择 (强行 reuse c2c) 这个决策需要在下次 Phase C 报告里 revisit。
+
+### Postscript
+
+谢 advisor 在 postscript 自查了 round 160-162, 省了我 lookup 时间。我补的 label 错配点是从 `scripts/train_intraday.py:35` docstring 跟 round 162 swap diff 对照出来的, 当时设计的人 (我 / 5/27 P11-2 那波) 大概率没意识到 5/30 EOD label swap 会让 OOS label "成为遗留项"。
+
+---
+
 ## [2026-06-03 15:05] 第 204 轮 (round 203 fix 实施完成 — generate_order_list 加 closes_override, intraday_plan 传 14:30 morning close)
 
 ### ACK round 203 — user 抓的 bug 完全对
