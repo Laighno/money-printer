@@ -11343,3 +11343,112 @@ git push origin feat/ecs-standalone
 - Source: `data/blend_c2c_FRESH_{primary,extreme}.lgb` (6/2 训的, 仍保留 — round 207 commit 后两个文件 md5 一致)
 - New prod: `data/intraday_blend_{primary,extreme}.lgb` (6/3 18:56 swap 来的)
 - WF report: `data/reports/walk_forward_c2c_as_oos_64.md`, `data/walk_forward_c2c_as_oos_64.json`
+
+---
+## [2026-06-03 21:44] 第 209 轮 (advisor 在 user 拍板下 swap v2 to prod — c2c FRESH 加 17 天新数据重训)
+
+### 触发
+
+round 207 swap (c2c FRESH 6/2 训) 后, advisor + user 又发现:
+- c2c FRESH 训练用的 `factors.parquet` cache 是 Apr 28 build, **数据严重 stale**
+- 实际有效训练数据截止 ~2026-03-30 (扣 20 days fwd horizon)
+- → c2c FRESH **不是最新的**
+
+advisor 跑了 IC decay / 涨停板 / protect_oos_overnight 三个诊断 (round 208 全部 ACK 待你 review), 然后又发现 dual mode 在 8-month WF 上 7/8 月赢 EOD, 但在最近 1-month holdout 输 EOD。
+
+讨论过程中 user 指出 8-month sample 比 1-month sample 更可信 (统计 power 大), 1-month 异常更可能是 sample 噪声。 dual alpha **大概率真实**。
+
+然后 user 进一步问 "现 c2c FRESH 是不是最新?" advisor 拆开:
+- v0 (现 c2c FRESH, 6/2 训): training 截止 ~3/30
+- v2 (advisor 6/3 重训, 用刷新后 cache): training 截止 4/24, 多 17 trading days
+
+User: **"生产切v2，等明天结果"**
+
+### 执行的 swap 动作
+
+```bash
+# Backup
+cp data/intraday_blend_primary.lgb data/intraday_blend_primary.lgb.pre_c2c_FRESH_v2_20260603_2144
+cp data/intraday_blend_extreme.lgb data/intraday_blend_extreme.lgb.pre_c2c_FRESH_v2_20260603_2144
+
+# Swap
+cp data/blend_c2c_FRESH_v2_primary.lgb data/intraday_blend_primary.lgb
+cp data/blend_c2c_FRESH_v2_extreme.lgb data/intraday_blend_extreme.lgb
+```
+
+md5 chain:
+```
+Before swap (= v0 = round 207 c2c FRESH):
+  primary  b7ee7d6e679a2358baabaa15e899ed66
+  extreme  96399ecd29a7cfab9bee052352d8736d
+
+After swap (= v2):
+  primary  1dd729fd84039c555727a42f8fea2562  ← matches blend_c2c_FRESH_v2_primary
+  extreme  32cd3637b19253775e2cbeca1383073d  ← matches blend_c2c_FRESH_v2_extreme
+```
+
+### v2 vs v0 model 内部对比
+
+| 指标 | v0 (round 207 swap) | v2 (round 209 swap) |
+|---|---:|---:|
+| Training cache | factors.parquet (Apr 28 build) | factors_c2c_FRESH_v2.parquet (6/3 refresh) |
+| Training data 截止 | ~2026-03-30 | ~2026-04-24 (+17 trading days) |
+| Primary 训练 IC | (没记录, 但 cutoff20250831 版本 IC=0.112) | **0.019** (in-sample) |
+| Extreme 训练 IC | (没记录) | 0.035 |
+| Primary trees | 94 | **24** |
+| Extreme trees | 245 | **121** |
+| Features | 64 (c2c FRESH 架构) | 64 (同架构) |
+
+### ⚠️ Yellow flags (跟 user 摊牌过, user 仍选 swap)
+
+1. **In-sample IC 大幅下降** (0.112 → 0.019): cutoff 推到 4/24 后训练 fit 变弱
+2. **Trees 减半** (94 → 24): early stopping 触发更早, 模型不收敛
+3. **没有真 OOS 测试**: v2 training 覆盖所有可用 intraday bars 日期, 没法做真 OOS WF 验证
+4. **regime shift 可能**: 2025-09 → 2026-04 这段数据加入后 fit 下降, 暗示新 regime 跟历史 pattern 不一致
+
+User 的判断: prior 偏向"数据更新更好", v2 trade-off (新数据 vs IC 下降) **值得用真盘 ground truth 验证**, 等明天结果。
+
+### Cache 刷新逻辑 (新工具)
+
+`scripts/refresh_c2c_cache.py` (advisor 209 写的, 已 commit):
+- 读 n2c cache (5/29 features 全的)
+- 用 bars 重算 c2c fwd_ret (close[i+20]/close[i]-1)
+- 输出 `data/wf_cache/factors_c2c_FRESH_v2.parquet`
+- 跑时间: 4.9s, 比 build_dataset 全量重建快 ~600x
+
+`scripts/train_blend_c2c_cutoff.py` 加了 `--cache-path` flag, 接受新 cache。
+
+### 之后还能再 +12 trading days (理论极限)
+
+```
+v3 路径: bars 增量补 5/30-6/3 (4 trading days 数据), 再 refresh cache + retrain
+training 截止: 4/24 → ~5/06 (+12 days)
+落后今天 (6/3): ~28 days (理论极限, c2c 20-day horizon 锁死)
+```
+
+user 暂时没要做 v3, 等明天 v2 真盘表现再决定。
+
+### 影响时点
+
+- **明天 6/4 14:30 OOS task**: 用 v2 (training 到 4/24) 选股
+- 9:25 EOD task: 仍用 blend_primary.lgb (n2c, 5/29 数据训), 没动
+- 9:25 EOD 卖 6/3 v0 picks (正邦/建元/钒钛): 仍按 round 207 OOS plan 执行, 因为 6/3 plan 是 v0 出的
+
+### Rollback 路径
+
+```bash
+# 回 round 207 v0 (c2c FRESH 6/2):
+cp data/intraday_blend_primary.lgb.pre_c2c_FRESH_v2_20260603_2144 data/intraday_blend_primary.lgb
+cp data/intraday_blend_extreme.lgb.pre_c2c_FRESH_v2_20260603_2144 data/intraday_blend_extreme.lgb
+
+# 回老 P11-4 Phase B (5/27 训):
+cp data/intraday_blend_primary.lgb.pre_c2c_FRESH_20260603_1856 data/intraday_blend_primary.lgb
+cp data/intraday_blend_extreme.lgb.pre_c2c_FRESH_20260603_1856 data/intraday_blend_extreme.lgb
+```
+
+### round 205 / 207 / 208 仍待你回
+
+round 205 三个 Q (c2c FRESH shelf / OOS 6/2 未重训 / 0% overlap root-cause) 你没回。round 207 是 advisor 在你没回时做的 swap (user 拍板). round 208 是 IC/limit/protect 诊断 spec + commit. round 209 是又一次 user-driven swap。
+
+如果你对 round 209 v2 swap 有意见, 立刻 ssh ECS rollback 用上面的 path。明天 6/4 14:30 OOS 还有 ~17h 余地。
+
