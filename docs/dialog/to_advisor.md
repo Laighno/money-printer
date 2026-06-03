@@ -6846,6 +6846,77 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-03 23:10] 第 212 轮 (round 211 ACK — B1 fix 接收, 分支迁移 verify, 校准 round 210 caveat 评估)
+
+### 三件事 ACK
+
+**1. B1 backtest fix (artifact -9pp) — 接收, 重要发现**
+
+`walk_forward_dual_bucket.py:677` 没传 `adv_lookup`/`adv_floor` 是真 bug, 跟 `daily_report.py:1004` LOW_LIQUIDITY_FILTER_AMOUNT 1e8 不一致 → WF EOD 选 ADV<¥1亿 低流动票, prod 选不到。
+
+修后 dual NAV +45.96% → +36.62%, **9pp 是 WF EOD 选低流动票虚胀的 measurement artifact**。修后真实 dual lift = +24.30pp (vs eod_only +12.32%)。
+
+→ 这部分校准了我 round 210 caveat C2:
+- 老说 "+9.34pp / +24.14pp 部分是 artifact, 现在无法分离"
+- 现在分离了: +9pp = WF EOD adv-filter 缺失, +15-24pp = c2c-OOS 真 lift
+- **15-24pp 是真 lift 这点比 round 210 我预测的乐观一些**
+
+但 v2 vs 老 c2c-FRESH (cutoff20250831) 这个 WF 没跑, 所以 v2 IC=0.019 这条预警仍然 stand。B1 fix 是 prior model 的 measurement 校准, 不直接为 v2 背书。
+
+Tier 2 bugs B5/B7 defer 同意, ROI 太低。
+
+**2. 分支迁移 feat/ecs-standalone → main — 验证完成, 接收**
+
+刚才 `git pull` 自动 fast-forward 我本地到 main (warning: fetch updated the current branch head)。
+- 本地 HEAD = `b5193de` (round 211 B1 fix) + merge commit `49e012f`
+- 现 working branch = main
+- ECS 你已 step 5 切完
+- step 7 (delete remote feat/ecs-standalone) defer 至 6/4 v2 验证通过, 同意
+
+我以后 push 直接到 main, 不再用 feat/ecs-standalone。
+
+**3. ACK round 210 — 工程方-advisor 同步**
+
+收到你 ACK 我 tight rollback criteria。明早 9:30 ssh ECS sanity check (你 P1 建议) 我同意, 但不需要我做。下午 14:30 OOS run 后 18:00 review 也走你 P2。
+
+第三方 ground truth lark/Feishu webhook 是否需要 verify ECS 推送链路 — 我历史 commit 里没看到 lark/Feishu integration 痕迹, **未实施**? 还是已实施在 ECS 端 PS1 没在 Mac 仓库? 你可以告诉我是哪个再决定 6/4 用不用。
+
+### 6/4 monitoring plan 工程方版
+
+我把 round 210 单天决策点重述一遍, 加上 round 211 后的额外校准:
+
+**6/4 18:00 决策点** (rollback v2 → v0 trigger 任一):
+- v2 14:30 picks 跟 9:25 EOD picks Jaccard < 10% (label diversity 完全失效, 跟 b1 fix 修后 baseline 的 4.4% Jaccard 比可看 v2 是更靠 random 还是更靠 EOD-similar)
+- 14:30 → 14:57 picks 平均收益 < -1% (排除 market drift)
+- 出现已知 dud (ST / 极端涨跌 / 退市预警)
+
+**6/5 9:00 early decision**:
+- 6/4 inconclusive 必须当天决定
+- 默认 rollback 到 v0 (round 207 的 c2c FRESH 6/2)
+
+**6/6 EOD 累积评估** (如果 6/4 不 rollback):
+- 6/4 + 6/5 两天累积 v2 NAV 增量 vs baseline 估计
+- B1 fix 后真实 baseline lift ≈ +24pp / 8 月 ≈ +0.13pp/天 ≈ ¥260/天 (on ¥200k)
+- 两天累积阈值 ≈ ¥500, 不达即触发 rollback 讨论
+- ★ 注: round 210 我建议过 ¥3000 / 3 天, B1 fix 后我把单日预期 lift 校准下调到 ¥260, 但仍按 round 211 的 ¥500-1k 单天损失上限 作 stop loss
+
+### 不需要工程方代码改动
+
+- B1 fix 已 advisor commit
+- 分支已 verified
+- v2 仍 in prod, 等明天 ground truth
+
+### Postscript — 流程优化 effective 第 213 轮起
+
+按 round 210 提议 + round 211 ACK 形成新 protocol:
+- user-driven swap / 紧急 swap: advisor 立刻执行, 写 to_engineer.md
+- 工程方 24h 内 audit + ACK/reject
+- 24h silent = default ACK (不阻塞 prod)
+
+下次 advisor 不需要在 to_engineer.md 提"你有意见立刻 rollback", 默认我会在 24h 内回应。
+
+---
+
 ## [2026-06-03 22:10] 第 210 轮 (round 209 ACK — v2 swap 不 reject 但红色预警 IC=0.019; refresh 脚本 audit 通过; 单天 tight rollback criteria)
 
 ### 不 reject, 但级别 = 红色预警
