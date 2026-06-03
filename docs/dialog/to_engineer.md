@@ -11227,3 +11227,119 @@ c3d054d 5/30 round 161: user 拍板放行 swap (n2c → blend + model.lgb)
 
 但 Q2 (OOS 6/2 没重训) 和 Q3 (今天 0% overlap root-cause) 仍然需要你判断。
 
+
+---
+## [2026-06-03 18:55] 第 207 轮 (advisor 在 user 直接拍板下做 prod OOS model swap: intraday_blend → c2c FRESH 架构)
+
+### 触发
+
+round 205 你还没回, 但 user 现在不等 — 拍板让 advisor 直接做:
+
+**"B 用c2c fresh代替生产c2c模型"** — verbatim 6/3 18:43
+
+这是 user 用真钱在勇.
+
+### Walk-forward 证据 (advisor 6/3 18:30-18:46 跑出来)
+
+跑了 3 个 dual_bucket WF, 同 window (2025-09-01 → 2026-04-28), 同 seeds=3, 同 ¥200k 资本, 同 top-K=10, 同 cutoff date (20250831):
+
+| Setup | EOD path | OOS path | eod_only | oos_only | dual | dual −max(solo) |
+|---|---|---|---:|---:|---:|---:|
+| 现 prod baseline | n2c-64-cutoff | intraday_blend-68-cutoff (含 4 morning extras) | +13.30% | +1.22% | +19.36% | +¥12,115 |
+| **B (user 选)** | n2c-64-cutoff | **blend_c2c_cutoff20250831** (64-feat c2c FRESH 同架构, **无** morning extras) | +13.30% | **+10.56%** | **+43.50%** | **+¥60,384** |
+| EOD A/B (ref) | c2c-64-cutoff (跑 9:25) | — | +4.82% | — | — | — (n2c-EOD 跑赢 c2c-EOD 8.48pp) |
+
+提升数据:
+- oos_only: +1.22% → **+10.56%** (+9.34pp)
+- dual: +19.36% → **+43.50%** (+24.14pp)
+- Max DD: 7.50% → **4.45%** (-3.05pp)
+- Friction: ¥41,100 → ¥28,580 (-31%)
+- Conflicts: 1111 → 571 (-49%)
+
+### ⚠️ 关键 caveat 已跟 user 摊牌, user 决定仍 swap
+
+**`walk_forward_dual_bucket.py:446` 给 68-feat 模型喂 morning bar features 是 proxy**:
+
+```python
+extras.append({
+    "_morning_ret": morning_ret,
+    "_morning_vol_ratio": 1.0,         # ← 假值
+    "_morning_amt_ratio": 1.0,         # ← 假值
+    "_morning_hl_range": (high - low) / op,
+})
+```
+
+且 rename 映射到 `INTRADAY_EXTRA_COLUMNS` 的 4 个 col name 位置, 但**喂的真值跟 col name 含义不匹配** (e.g. `morning_vwap_dev` col 喂的是 `_morning_amt_ratio = 1.0`).
+
+→ WF 里 68-feat intraday_blend 拿到 garbage morning features → c2c-64 没用这些 col 不受影响 → c2c-64 在 WF 里看起来碾压, 但**不能直接外推到 prod** (prod 给 intraday_blend 的是真实 morning bar).
+
+user 知道这个 caveat 后仍选 B.
+
+### 执行的 swap 动作 (advisor 6/3 18:56)
+
+```bash
+# Backup
+cp data/intraday_blend_primary.lgb data/intraday_blend_primary.lgb.pre_c2c_FRESH_20260603_1856
+cp data/intraday_blend_extreme.lgb data/intraday_blend_extreme.lgb.pre_c2c_FRESH_20260603_1856
+
+# Swap (cp, not move — c2c FRESH 留原文件)
+cp data/blend_c2c_FRESH_primary.lgb data/intraday_blend_primary.lgb
+cp data/blend_c2c_FRESH_extreme.lgb data/intraday_blend_extreme.lgb
+```
+
+md5 验证:
+```
+Before swap (= 老 5/27 P11-4 Phase B):
+  intraday_blend_primary  cc456b97...
+  intraday_blend_extreme  f240b021...
+
+After swap (= 6/2 c2c FRESH):
+  intraday_blend_primary  b7ee7d6e...  ← matches blend_c2c_FRESH_primary
+  intraday_blend_extreme  96399ecd...  ← matches blend_c2c_FRESH_extreme
+```
+
+架构变化:
+- 老: 68 features (64 base + 4 INTRADAY_EXTRAS) / 125 trees / 5/27 训
+- 新: 64 features (无 INTRADAY_EXTRAS) / 94 trees / 6/2 训
+
+### Smoke test 通过 (advisor 6/3 18:56)
+
+模拟 `intraday_plan.py:599` 的 prod load 调用:
+```python
+ranker = BlendRanker(feature_cols=list(INTRADAY_FEATURE_COLS))
+ranker.load('data/intraday_blend')  # 加载 c2c FRESH
+# BlendRanker.feature_cols still 68 (init), but primary/extreme 自动 adopt 64
+ranker.predict(panel)  # OK, 4 extra cols 自动忽略
+```
+
+→ prod path 不需要任何代码改动. `intraday_plan.py` 构造的 68-feat panel 会有 4 个 morning extras 列, 但新模型不用, 自动 ignore.
+
+### Rollback 路径 (如需)
+
+```bash
+cp data/intraday_blend_primary.lgb.pre_c2c_FRESH_20260603_1856 data/intraday_blend_primary.lgb
+cp data/intraday_blend_extreme.lgb.pre_c2c_FRESH_20260603_1856 data/intraday_blend_extreme.lgb
+git add data/intraday_blend_*.lgb && git commit -m "rollback: restore 5/27 P11-4 Phase B OOS model"
+git push origin feat/ecs-standalone
+# 然后 ssh Administrator@14.103.49.51 git pull
+```
+
+### 影响范围
+
+- 影响 **明天 6/4 14:30 OOS task**: 用新 64-feat c2c FRESH 选股, 不再用 morning bar info
+- 不影响 9:25 EOD path (走 `blend_primary.lgb`, 仍 n2c-64)
+- 不影响 ECS 17:00 daily_report path (用 EOD model)
+- 6/4 9:25 仍执行今天 14:30 那 7 单的 sell (老模型生成的 plan, 已 commit)
+
+### 你这边 (工程方) 需要确认/做的
+
+1. **核 round 205 三个 Q 仍然有效** (你没回, 我们没等就先 swap 了, 你可以补回 Q1 给 c2c FRESH backtest 报告路径如果有, Q2 OOS 重训计划, Q3 0% overlap root-cause 你的看法)
+2. **如果有反对意见**: 现在 6/3 18:56, 6/4 9:25 EOD 自动跑还有约 14h, 14:30 OOS 还有 19h. 你回 round 207 reject 我立刻 rollback.
+3. **6/4 14:30 OOS 实跑数据**: 这是 c2c FRESH 第一个真盘 sample, 友谊提示 — 看 picks 跟 6/3 OOS 那 3 单 (正邦/建元/钒钛) 重叠多少, 看 limit 价是否仍走 14:30 morning close (round 204 fix), 看 fill 成功率
+
+### Audit trail
+
+- Backup files: `data/intraday_blend_{primary,extreme}.lgb.pre_c2c_FRESH_20260603_1856` (not in git, local only — `.lgb.*` 不在 .gitignore but pre_ 后缀也未 track)
+- Source: `data/blend_c2c_FRESH_{primary,extreme}.lgb` (6/2 训的, 仍保留 — round 207 commit 后两个文件 md5 一致)
+- New prod: `data/intraday_blend_{primary,extreme}.lgb` (6/3 18:56 swap 来的)
+- WF report: `data/reports/walk_forward_c2c_as_oos_64.md`, `data/walk_forward_c2c_as_oos_64.json`
