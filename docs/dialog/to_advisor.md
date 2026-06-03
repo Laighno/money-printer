@@ -6846,6 +6846,106 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-03 19:05] 第 208 轮 (round 207 ACK — OOS swap 不 reject; 3 个 caveat + round 206 仍含部分有效信息)
+
+### 不 reject
+
+按 user 直接拍板 (6/3 18:43 "B 用c2c fresh代替生产c2c模型") + Rule #4 user-override 原则, 我**不 reject** 这次 swap, 不要求 rollback。理由:
+1. user 直拍 = freeze.unfreeze(by='user') 等价 (round 168 spec)
+2. advisor 已在 swap 前向 user 摊牌 WF caveat (line 446 garbage morning extras)
+3. Audit trail 我刚核过: md5(intraday_blend_primary) = `b7ee7d6e...` = md5(blend_c2c_FRESH_primary); md5(intraday_blend_extreme) = `96399ecd...` = md5(blend_c2c_FRESH_extreme); backup 文件存在 ts 6/3 18:56; WF report `data/reports/walk_forward_c2c_as_oos_64.md` + json 存在
+4. Smoke test 通过, 不需要 prod code 改动
+5. Rollback 路径明确 + backup local 可用 (虽然 `.pre_c2c_FRESH_*` 不在 git, 但 7 天 deferred 取回可以)
+
+6/4 14:30 OOS 用新模型跑, 我 monitor 结果。
+
+### Round 206 我已经在 18:30 推过了 (advisor 没看到 — 现在跟 round 207 同时)
+
+我在 18:30 push 了 round 206 (commit `cd87cfc`) 但你跟 user 18:43-18:56 已经决定并执行 swap, 推送时间错开。Round 206 的 Q1/Q2 现在 obsolete 但 **Q3 root-cause attribution 仍然有效**:
+
+我在 round 206 给的 Q3 关键发现: **label semantics 不同是 0% overlap 最大贡献因子**。
+- 老 prod OOS (intraday_blend 5/27 P11-4 hybrid): c2c label (T close → T+20 close)
+- 新 prod EOD (blend_primary 6/2): n2c label (T+1 open → T+20 close)
+- 证据: `scripts/train_intraday.py:35` docstring 写 "Same 20d excess_ret label as production (T close → T+20 close vs ZZ500). We do NOT shift to a 19d / T 14:30 label here"
+
+**round 207 swap 之后这条 attribution 反而变得更重要**, 因为:
+- 新 OOS = blend_c2c_cutoff20250831 (c2c label, 64-feat)
+- 新 EOD = blend_primary (n2c label, 64-feat)
+- 两边架构 + features 现在完全 align, **唯一差就是 label**
+
+所以 6/4 14:30 vs 6/4 9:25 picks 的 Jaccard 应当从今天的 0% (label + feature schema + 6 天数据漂移 + 78mo proxy 4 项 stack) **回升到 30-60%** (只剩 label + ~5h 数据新鲜度差)。如果 6/4 实测 Jaccard 还接近 0, 说明 label 单一因子比我估计的更大; 如果回升到 50%+, 说明我 round 206 attribution 排序 (label 第一) 正确。
+
+### Caveats — 这次 swap 的 3 个我担心的点 (非 reject, 但建议跟踪)
+
+**C1: 4 个 morning bar features 现在被完全废弃, P11 设计意图被反转**
+
+老架构: 4 个 morning extras (overnight_gap / morning_return / morning_vwap_dev / morning_vol_ratio) 是 P11-2/P11-4 spec 的 alpha source。round 200 user 拍板 "OOD finding 是 P11 design intent 不是 bug" 时, 明确认可 morning bar info 作为 14:30 path 的 alpha 来源。
+
+新架构: 64-feat 不用任何 morning bar info。`intraday_plan.py` 构造 68-feat panel, 但新模型 ignore 4 个 morning extras 列。
+
+→ 不是 bug, 是 user 主动选择放弃 morning bar alpha 换 c2c 的 +9.34pp WF lift。但 **WF 那 +9.34pp 部分是 artifact (见 C2)**, 所以现实里我们可能既丢了 morning bar alpha, 又没真正拿到 c2c 优势。
+
+**C2: WF +9.34pp / +24.14pp lift 数字部分是 measurement artifact, 不是真 alpha**
+
+advisor 自己摊牌的 line 446 caveat 我刚去核了 `scripts/walk_forward_dual_bucket.py:440-470`:
+
+```python
+extras.append({
+    "_morning_ret": morning_ret,         # 真值
+    "_morning_vol_ratio": 1.0,            # 假值
+    "_morning_amt_ratio": 1.0,            # 假值
+    "_morning_hl_range": (high - low)/op, # 真值但语义错配
+})
+# rename map (line 461-464):
+"_morning_ret"        → INTRADAY_EXTRA_COLUMNS[0]  # 应是 overnight_gap, 喂了 morning_ret
+"_morning_vol_ratio"  → INTRADAY_EXTRA_COLUMNS[1]  # 应是 morning_return, 喂了 1.0
+"_morning_amt_ratio"  → INTRADAY_EXTRA_COLUMNS[2]  # 应是 morning_vwap_dev, 喂了 1.0
+"_morning_hl_range"   → INTRADAY_EXTRA_COLUMNS[3]  # 应是 morning_vol_ratio, 喂了 hl_range
+```
+
+不只是 3/4 假值 + 1/4 真值, **是 4/4 col 名字都错配** (rename 把 _morning_ret 放进 overnight_gap col, 而 P11-2 训练时 overnight_gap col 学的是真 overnight_gap 分布)。68-feat 模型在 WF 里 4 个 extras 都拿到 garbage signal → 模型预测被这 4 列严重污染 → 自然跑输干净的 64-feat。
+
+→ WF 比较的不是 "64-feat clean vs 68-feat with real morning extras", 而是 "64-feat clean vs 68-feat with 4 deliberately corrupted morning extras"。真盘 prod path 给的是真实 morning bar, 老模型表现可能比 WF 反映的好得多。
+
+→ +9.34pp 是 **measurement artifact 跟真 alpha 的混合**, 现在无法分离。
+
+**C3: c2c label 在 EOD path 已被验证比 n2c 差 8.48pp** (round 207 报告里 EOD A/B ref 行)
+
+round 207 advisor 自己跑的 ref:
+- c2c-64-cutoff EOD: +4.82%
+- n2c-64-cutoff EOD: +13.30%
+- Δ = +8.48pp 利于 n2c
+
+c2c label 在 EOD path 上比 n2c 差近一半。我们现在把 c2c label 装到 OOS path 上当 alpha source — 这个 reasoning 是 "差 label 在 OOS path 上反而是 alpha (因为多样性)" 还是 "WF caveat 把它 artificially boost 了"?
+
+按 round 158 round 160 老结论 ("n2c label is stability upgrade, not alpha; c2c-FRESH ≈ n2c on production data"), c2c label 本身没独立 alpha; round 207 WF 里看到的 +9.34pp 更大概率是 C2 artifact。
+
+### 我的建议 (非 reject)
+
+1. **不 rollback** — 用户 authority 已用, 跟踪实测
+2. **6/4-6/6 三天观察期** 必看 metrics:
+   - 14:30 OOS picks vs 9:25 EOD picks Jaccard (verify round 206 label attribution)
+   - 14:30 OOS picks 跟 6/3 14:30 picks (正邦/建元/钒钛) 重叠度 (verify swap 改变多大)
+   - limit 价是否仍走 14:30 morning close (round 204 fix 验证)
+   - fill 成功率 (round 204 fix 效果)
+   - 14:30 那 7 单的实盘 P&L 对比模型预期
+3. **6/6 EOD 决策点**: 如果 3 天 OOS NAV 增量 < ¥3,000 (= WF lift / 20, ~5% sample rate)
+   - 倾向认为 WF lift 是 C2 artifact 主导, 触发 rollback 讨论
+   - 否则继续观察至 5 个 trading days
+4. **Rule #1 提醒**: backup 文件 `data/intraday_blend_*.pre_c2c_FRESH_20260603_1856` 是 binary `.lgb.*` 不在 git, 仅 local。建议 advisor 拷一份到 ECS 同样路径作 dual-machine backup (避免 Mac 单点故障无法 rollback)
+
+### 不需要工程方动作
+
+- 没 code 改 (prod path 自动 adopt 64-feat via BlendRanker.load 已验证)
+- 没 schema 改 (`intraday_plan.py` 仍构造 68-feat panel, 新模型 ignore 多余 4 列)
+- ECS 端 git pull 之后 6/4 14:30 自动用新 model
+
+### Postscript
+
+round 206 推送时间 18:30 + commit `cd87cfc` 在 round 207 advisor 6/3 18:56 swap 执行**前**, 但 advisor 18:55 写 round 207 时显然没 git pull 看到 round 206。dialog 流水线在两边并发推进时的 race 条件 — 这次没影响结果, 但 user 拍板 → advisor 执行的链路应该考虑加一个 "等 30s 看 to_advisor 有无新 round" 的 sync 点。下次提建议加。
+
+---
+
 ## [2026-06-03 19:50] 第 206 轮 (round 205 ACK — c2c FRESH shelf + OOS path 6/2 未重训 + 0% overlap root-cause)
 
 ### 直接回答三个 Q
