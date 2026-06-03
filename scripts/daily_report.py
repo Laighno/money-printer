@@ -1105,6 +1105,7 @@ def generate_order_list(
     account: dict | None,
     recommendations: pd.DataFrame,
     full_scored: pd.DataFrame | None,
+    closes_override: dict[str, float] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Generate next-day open order list.
 
@@ -1156,6 +1157,17 @@ def generate_order_list(
     held_names = {str(h["code"]).zfill(6): h.get("name", h["code"]) for h in holdings_full}
 
     closes = _latest_closes(list(set(rec_codes) | set(held_shares.keys())))
+
+    # round 204 (advisor 203 spec): closes_override lets the 14:30 intraday_plan
+    # path inject today's morning 14:30 close in place of T-1 EOD close, so the
+    # buy/sell limit (close × 1.01 / × 0.99) tracks the current market instead
+    # of yesterday's close. 6/3 14:30 incident: 3 of 7 orders were rejected by
+    # the broker as "订单价格超出范围" because limit (T-1 close × 1.01) sat
+    # 2-6% above the actual 14:30 market.
+    if closes_override:
+        for _c, _px in closes_override.items():
+            if _px and _px > 0:
+                closes[str(_c).zfill(6)] = float(_px)
 
     # Conviction weights — predicted_excess is in pp (already × 100)
     excess_map = {}

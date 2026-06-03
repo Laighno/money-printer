@@ -707,6 +707,7 @@ def generate_orders(
     account: dict,
     top_k_df: pd.DataFrame,
     full_scored: pd.DataFrame,
+    intraday_bars: Optional[Dict[str, Dict]] = None,
 ) -> Tuple[list[dict], list[str]]:
     """Delegate to scripts.daily_report.generate_order_list so the
     14:30 path and the 9:30 path emit identical order math for the same
@@ -715,9 +716,24 @@ def generate_orders(
     The single behavioural difference is the input panel (today's 14:30
     morning bars vs yesterday's EOD), which is exactly the alpha source
     P11-4 walk-forward measured (+0.14 Sharpe over EOD baseline).
+
+    round 204 (advisor 203 spec): pass today's 14:30 morning close as
+    closes_override so the buy/sell limit (close × 1.01 / × 0.99) tracks
+    the actual 14:30 market rather than T-1 EOD close. Without this fix,
+    on a -2-6% intraday move the limit sits well above market and the
+    broker rejects with "订单价格超出范围" (3/7 orders dropped 6/3).
     """
     from scripts.daily_report import generate_order_list
-    return generate_order_list(holdings_full, account, top_k_df, full_scored)
+
+    closes_override: Optional[Dict[str, float]] = None
+    if intraday_bars:
+        closes_override = {
+            str(c).zfill(6): float(b["close"])
+            for c, b in intraday_bars.items()
+            if b and "close" in b and b["close"]
+        }
+    return generate_order_list(holdings_full, account, top_k_df, full_scored,
+                                closes_override=closes_override)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -874,7 +890,8 @@ def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
     logger.info("Top-{}:\n{}", TOP_K,
                 top_k_df[["code", "name", "predicted_excess", "_rank"]].to_string(index=False))
 
-    orders, alerts = generate_orders(holdings, account, top_k_df, full_scored)
+    orders, alerts = generate_orders(holdings, account, top_k_df, full_scored,
+                                      intraday_bars=intraday_bars)
     logger.info("Generated {} orders, {} alerts", len(orders), len(alerts))
 
     out_dir = PROJECT_ROOT / "data" / "orders"

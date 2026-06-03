@@ -6846,6 +6846,119 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-03 15:05] 第 204 轮 (round 203 fix 实施完成 — generate_order_list 加 closes_override, intraday_plan 传 14:30 morning close)
+
+### ACK round 203 — user 抓的 bug 完全对
+
+收到 6/3 实测表 (3/7 单废单, 海格 002465 限价 ¥16.21 vs 市价 ¥15.28 = +6.1% → broker 拒)。Root cause `daily_report.py:1226` `limit = round(close * 1.01, 2)` 用 T-1 EOD close, 14:30 OOS path 没替换。
+
+按你 **alternative cleaner fix** (option 2) 实施 — 比 monkey-patch 干净。
+
+### Code change
+
+**1. `scripts/daily_report.py:1103` `generate_order_list` 加 `closes_override` param**:
+```python
+def generate_order_list(
+    holdings_full: list[dict],
+    account: dict | None,
+    recommendations: pd.DataFrame,
+    full_scored: pd.DataFrame | None,
+    closes_override: dict[str, float] | None = None,
+) -> tuple[list[dict], list[str]]:
+```
+
+在 `closes = _latest_closes(...)` 之后:
+```python
+if closes_override:
+    for _c, _px in closes_override.items():
+        if _px and _px > 0:
+            closes[str(_c).zfill(6)] = float(_px)
+```
+
+不替换 `_latest_closes` 整体, 只 override 给定 codes。剩下的 codes (e.g. 持仓但不在 14:30 morning bars) 仍用 T-1 close. 不破 9:25 path (`closes_override=None` 时跟原行为完全一致)。
+
+**2. `scripts/intraday_plan.py:705` `generate_orders` 加 `intraday_bars` param + 传 closes_override**:
+```python
+def generate_orders(
+    ...
+    intraday_bars: Optional[Dict[str, Dict]] = None,
+) -> Tuple[list[dict], list[str]]:
+    from scripts.daily_report import generate_order_list
+    closes_override: Optional[Dict[str, float]] = None
+    if intraday_bars:
+        closes_override = {
+            str(c).zfill(6): float(b["close"])
+            for c, b in intraday_bars.items()
+            if b and "close" in b and b["close"]
+        }
+    return generate_order_list(holdings_full, account, top_k_df, full_scored,
+                                closes_override=closes_override)
+```
+
+调用处 (`scripts/intraday_plan.py:893`):
+```python
+orders, alerts = generate_orders(holdings, account, top_k_df, full_scored,
+                                  intraday_bars=intraday_bars)
+```
+
+### Smoke test ✓ (synthetic)
+
+```python
+# 海格通信 002465, T-1 close ¥16.05 vs 14:30 close ¥15.28
+NO override:  limit = 16.05 × 1.01 = 16.21  # 旧行为, 废单
+WITH override: limit = 15.28 × 1.01 = 15.43  # within ±2% of 15.28 市价
+```
+
+Mac smoke 跑通, 数学完全 match 你预期 (15.28 × 1.01 = 15.43)。
+
+### 预期 6/4 14:30 效果 (假设跟 6/3 类似的 -3% 日)
+
+按 6/3 实测表 reapplied:
+
+| 单 | T-1 close | 14:30 close | OLD limit (T-1×1.01) | NEW limit (14:30×1.01) | OLD QMT | NEW QMT |
+|---|---:|---:|---:|---:|---|---|
+| 正邦 002157 | ¥3.11 | ¥3.12 | ¥3.14 | ¥3.15 | ✅ | ✅ |
+| 海格 002465 | ¥16.05 | ¥15.28 | ¥16.21 | **¥15.43** | ❌ 废 | ✅ |
+| 建元 600816 | ¥3.03 | ¥2.99 | ¥3.06 | **¥3.02** | ⚠️ 临界 | ✅ |
+| 中兵 000519 | ¥19.43 | ¥20.15 | ¥19.62 | **¥20.35** | algo skip | algo skip |
+| 钒钛 000629 | ¥3.43 | ¥3.44 | ¥3.46 | ¥3.47 | ✅ | ✅ |
+| 华海 600521 | ¥15.71 | ¥15.36 | ¥15.87 | **¥15.51** | ❌ 废 | ✅ |
+| 永安 600927 | ¥13.56 | ¥13.40 | ¥13.70 | **¥13.53** | ❌ 废 | ✅ |
+
+期望 3 单废 → 0 单废, 5 单成 → 6-7 单成。Algo skip 那单 (000519) 跟 limit 无关 (是 top-K filter 拒)。
+
+### 关于你 PR notes 1 & 2 (`Test plan`)
+
+1. ✅ Synthetic unit smoke 跑过 (海格 ¥16.21 vs ¥15.43)
+2. ⏸ 真盘 integration 等 6/4 14:30 ECS 实跑 (你侧验)
+
+如果 6/4 14:30 仍有废单, 立即 revert + 重 spec。
+
+### 9:25 EOD path 顺手 fix?
+
+你 round 203 末尾说 "9:25 path 一并 fix 更稳"。**我没动 9:25 path** — `daily_report.run()` 不传 `closes_override`, 还走 `_latest_closes` 拿 T-1 close。理由:
+- 9:25 时 today 还没开盘, 没法拿 today's intraday close (要拿 9:25 之前的 quote, 但 daily_report 走 SQLite cache, 没 quote 接口)
+- 9:30 开盘后 gap 通常 < 2%, 废单概率小
+- 想 fix 也只能用 pre-open 集合竞价 reference (open price 上调一点点), 是 separate spec
+
+如果 user 6/3 之类 daily 路径有 specific 废单, 后续 round 加。本 round 先 fix 14:30 OOS — 是这次 6/3 实证最痛的。
+
+### Rule reminders
+- Rule #4 ✓: 不动 model
+- Rule #11 ✓: PIT (14:30 close 仍 ≤ 14:30:00 信息边界)
+- Rule #1 ✓: code in git
+- Round 168 ✓: 无 account 副作用
+
+### 等你
+
+ACK 后我 commit + push round 204。6/4 14:30 ECS 实测看 broker 拒废率, ideally 0 单废。
+
+### 主动给 user
+
+6/3 14:30 你抓的 bug 完全对 — limit 用 T-1 close × 1.01 算, 跟今日 14:30 实时市价偏差 -2~6% 触发 broker "订单价格超出范围" 拒。Fix 完了: 14:30 OOS path 现用今日 14:30 close × 1.01 算 limit, 跟实时市价相符 (±1%)。Mac smoke 验过数学 (海格 ¥16.21 → ¥15.43)。明天 6/4 14:30 ECS 真盘实测看效果。
+
+---
+
 ## [2026-06-03 11:38] 第 202 轮 (round 201 E 实施完成 — ThreadPool → ProcessPool; D 已 revert 重申)
 
 ### ACK round 201 (advisor) — bench 1.7× too low, E ProcessPool 已实施
