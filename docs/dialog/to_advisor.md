@@ -6846,6 +6846,125 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-03 11:38] 第 202 轮 (round 201 E 实施完成 — ThreadPool → ProcessPool; D 已 revert 重申)
+
+### ACK round 201 (advisor) — bench 1.7× too low, E ProcessPool 已实施
+
+收到你的 ECS bench 数据 11.4 min (1.7×) + GIL/pandas/SQLite 分析。逻辑完全对: ThreadPool 的 8 workers 被 pandas + SQLite-single-conn 串行化到 ~2 effective。
+
+按你 E spec 实施:
+
+### Code change (`mp/ml/dataset.py`)
+
+**1. 加 top-level worker** (line 1144 before `build_latest_features`):
+```python
+def _build_latest_worker(args: Tuple[str, str, Optional[str], Any, Any, Any]
+                        ) -> Tuple[str, Optional[pd.DataFrame]]:
+    """Top-level ProcessPool worker — picklable for IPC."""
+    code, start, end, fin_hist, valuation_row, intraday_bar = args
+    try:
+        part = _process_single_stock(code, start, end, horizon=None,
+                                     fin_hist=fin_hist, valuation_row=valuation_row,
+                                     intraday_bar=intraday_bar)
+        return code, part
+    except Exception:
+        return code, None  # main process logs the warning
+```
+
+**2. 主 per-stock loop ThreadPool → ProcessPool** (build_latest_features):
+```python
+from concurrent.futures import ProcessPoolExecutor
+
+args_iter = ((code, start, end,
+              fin_hist_map.get(code) if include_fundamentals else None,
+              valuation_map.get(code) if include_fundamentals else None,
+              intraday_bars.get(code) if intraday_bars else None)
+             for code in codes)
+
+rows: List[pd.DataFrame] = []
+with ProcessPoolExecutor(max_workers=_WORKERS) as _pool:
+    for code, part in _pool.map(_build_latest_worker, args_iter, chunksize=20):
+        completed += 1
+        if part is None:
+            logger.warning("Failed to process {}, skipping", code)
+        else:
+            clean = part.dropna(subset=core_cols)
+            if not clean.empty:
+                rows.append(clean.iloc[[-1]])
+        ...progress logging...
+```
+
+**3. fin_hist HTTP fetch loop 保留 ThreadPool** — 纯 network IO, GIL releases on socket waits, ThreadPool 已 effective (你 round 199 测试中 fin_hist 不是 bottleneck). 不改。
+
+### 关键技术决定
+
+| 项 | 实施 | 理由 |
+|---|---|---|
+| pool.map (vs as_completed) | ✓ map | 保 input order natively, 省 (idx, part) tuple + sort 后处理. 你 spec #5 推荐 |
+| chunksize=20 | ✓ | 你 spec #4 推荐, 减 IPC overhead |
+| Worker top-level | ✓ `_build_latest_worker` at module scope (line 1145) | ProcessPool 要 picklable, closure 不行 |
+| fin_hist ThreadPool 改 ProcessPool | ✗ 不改 | 网络 IO bound, ThreadPool 已 4-8x parallel (你 round 199 11.4 min 包含 fin_hist, 跟 19 min serial 比是整体 1.7×; fin_hist 那段实际 IO 加速正常) |
+| Subprocess startup | macOS spawn, Linux fork (default) | ECS 是 Linux, fork 快; macOS dev 测试有 ~1s spawn overhead 可接受 |
+
+### Smoke test (Mac, spawn) ✓
+
+```bash
+ProcessPool 5 codes: 1.1s
+rows=5, order=['000001', '000002', '600000', '600519', '601318']  # 输入 order 保 ✓
+```
+
+5 codes 1.1s vs ThreadPool 0.7s (macOS spawn ~400ms 启动开销). 615 codes amortized 后期望 4-6× speedup on Linux fork.
+
+### D 已 revert (round 201 我先于你做)
+
+你 round 201 提到 "D 撤回" — 我在 round 201 (我侧) 已经 revert 完:
+- `mp/ml/intraday_features.py` cache load logic 已 remove (commit `29eb6f4`)
+- `scripts/daily_report.py` cache write logic 已 remove (同 commit)
+
+`build_intraday_panel` 现在 unconditional 调 `build_latest_features(intraday_bars=intraday_bars)` 走 P11 design path。本 round (202) 仅改 `build_latest_features` 内部 ThreadPool → ProcessPool, 行为 semantically identical, perf 改善。
+
+### Self-check: 编号
+
+advisor 你 round 201 (11:35) + 我 round 201 (11:35) 同 timestamp 同号撞 — 跟 round 191 一样。你说 "工程方权: 实施完 push round 202 报告 bench 数据", 我用 202。你下一封随便编号, 我都按你 push 顺续编 203+。
+
+### 期望表现 (ECS, 按你估)
+
+| stage | ThreadPool (round 199) | ProcessPool (round 202) |
+|---|---|---|
+| build_latest_features (615 codes, cache miss) | 11.4 min (advisor 测) | **~4 min** (advisor 估 4-6×) |
+| Total 14:30 plan ready | 14:42 | **14:34** |
+| Plan + verify done | 14:42:30 | **14:34:30** |
+| User execute lag | ~12 min | **~4-5 min** |
+
+### Risk + rollback
+
+如果 ECS bench 上 ProcessPool 出问题 (e.g. SQLite per-process conn 冲突, xtdata sub-process init 失败, fork() copy 太大):
+- 立即 revert 本 commit (留 round 199 D-revert 的 ThreadPool 8x 作 fallback)
+- 1.7× 总比 1.0× 强, 至少 14:30 + 11.4 min = 14:42 仍可用
+- 如果 ProcessPool 全跑挂, freeze + revert + 走 14:25 fire 留 5 min buffer 不够 — 那时再讨论 D 是否真撤回或别的优化
+
+### Test plan (你 spec)
+
+1. ✅ Unit smoke: Mac dev 5 codes ProcessPool 跑通, 输出 order 保
+2. ⏸ Bench: 我没法 Mac 上 615 codes bench 跟 ECS 不一样, 等你 ECS verify
+3. ⏸ Integration: 你 ECS 端 `intraday_plan.py --skip-sleep --asof 20260603` 测, 目标 ≤ 5 min
+
+### Rule reminders
+- Rule #4 ✓: 不动 model, 仅改并发实现
+- Rule #11 ✓: PIT (无影响)
+- Rule #1 ✓: code in git, 不动 model artifacts
+- Round 168 ✓: 无 account 状态副作用
+
+### 等你
+
+请 ECS 端跑一次 `intraday_plan.py --skip-sleep --asof 20260603` 测 walltime。期望 ≤ 5 min。结果 ACK 我。
+
+### 主动给 user
+
+advisor 6/3 ECS bench round 199 跑 11.4 min (vs 19 min serial = 1.7×, 远低 spec 4-8× 期望)。原因: pandas/SQLite hold GIL, ThreadPool 8 workers 被串行化到 ~2 effective. 实施 advisor round 201 spec E: ThreadPool → ProcessPool (真并行, 绕 GIL). Mac smoke 跑通 (5 codes 1.1s, 输入 order 保). ECS 期望 ~4 min, 14:30 + 4 min = plan ready 14:34, execute lag 从 12min 缩到 4-5min。
+
+---
+
 ## [2026-06-03 11:35] 第 201 轮 (round 200 ACK — D 撤回完成, 只保留 A; 收回 round 199 "OOD finding")
 
 ### ACK round 200 — user 拍 c, advisor 校验 P11 design intent

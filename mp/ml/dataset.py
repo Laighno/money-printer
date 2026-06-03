@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1142,6 +1142,27 @@ def filter_universe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _build_latest_worker(args: Tuple[str, str, Optional[str], Any, Any, Any]) -> Tuple[str, Optional[pd.DataFrame]]:
+    """Top-level ProcessPool worker for :func:`build_latest_features`.
+
+    Must be a module-level function (not a closure) so that ProcessPoolExecutor
+    can pickle it for IPC. The `_process_single_stock` callable, pandas, numpy
+    etc. are re-imported once per subprocess (spawn on macOS, fork on Linux).
+
+    round 202 (advisor 201 E spec): ThreadPool gave only 1.7× speedup on
+    615 codes (11.4 min) because pandas + SQLite serialize via GIL. True
+    multiprocessing bypasses GIL — expected 4-6× per advisor's bench plan.
+    """
+    code, start, end, fin_hist, valuation_row, intraday_bar = args
+    try:
+        part = _process_single_stock(code, start, end, horizon=None,
+                                     fin_hist=fin_hist, valuation_row=valuation_row,
+                                     intraday_bar=intraday_bar)
+        return code, part
+    except Exception:
+        return code, None  # main process logs the warning
+
+
 def build_latest_features(
     codes: List[str],
     start: str = "20230101",
@@ -1165,12 +1186,15 @@ def build_latest_features(
     total = len(codes)
     logger.info("build_latest_features: {} codes, start={}", total, start)
 
-    # round 199 (advisor 198 A spec): parallelize the two serial loops
-    # (fin_hist fetch + _process_single_stock). Pre-fix this routine spent
-    # ~19 min on 615 codes (1155s walltime, ~1.9s per code) — both loops
-    # bottleneck on IO (fin_hist HTTP fetch + per-stock get_daily_bars SQLite
-    # reads). 8-way ThreadPool mirrors the existing Baidu PE/PB fetch pool
-    # (dataset.py:541-545, max_workers=15) — also IO-heavy + thread-safe.
+    # round 202 (advisor 201 E spec): ThreadPool gave only 1.7× speedup
+    # on 615 codes (11.4 min vs 19 min serial) because pandas + SQLite hold
+    # GIL — ThreadPool's 8 workers effectively serialized to ~2. Switched
+    # main per-stock loop to ProcessPoolExecutor for true parallelism
+    # (expected 4-6×, ~4 min total). fin_hist HTTP fetch loop stays on
+    # ThreadPool since it's pure network IO (GIL releases on socket waits;
+    # ThreadPool is already effective there — measurement evidence).
+    from concurrent.futures import ProcessPoolExecutor
+
     _WORKERS = 8
 
     valuation_map: Dict[str, Dict[str, float]] = {}
@@ -1191,40 +1215,31 @@ def build_latest_features(
 
     core_cols = TECHNICAL_COLUMNS[:13]
 
-    def _proc_one(idx_code):
-        idx, code = idx_code
-        try:
-            fin_hist = fin_hist_map.get(code) if include_fundamentals else None
-            val_row = valuation_map.get(code) if include_fundamentals else None
-            bar = intraday_bars.get(code) if intraday_bars else None
-            part = _process_single_stock(code, start, end, horizon=None,
-                                         fin_hist=fin_hist, valuation_row=val_row,
-                                         intraday_bar=bar)
-            return idx, part
-        except Exception:
-            logger.warning("Failed to process {}, skipping", code)
-            return idx, None
+    args_iter = (
+        (code, start, end,
+         fin_hist_map.get(code) if include_fundamentals else None,
+         valuation_map.get(code) if include_fundamentals else None,
+         intraday_bars.get(code) if intraday_bars else None)
+        for code in codes
+    )
 
-    rows_indexed: List[Tuple[int, pd.DataFrame]] = []
+    rows: List[pd.DataFrame] = []
     completed = 0
-    with ThreadPoolExecutor(max_workers=_WORKERS) as _pool:
-        _futs = [_pool.submit(_proc_one, (i, c)) for i, c in enumerate(codes)]
-        for _fut in as_completed(_futs):
-            idx, part = _fut.result()
+    # pool.map preserves submission order, so rows append in original code
+    # order natively — no post-hoc sort needed (vs ThreadPool as_completed).
+    with ProcessPoolExecutor(max_workers=_WORKERS) as _pool:
+        for code, part in _pool.map(_build_latest_worker, args_iter, chunksize=20):
             completed += 1
-            if part is not None:
+            if part is None:
+                logger.warning("Failed to process {}, skipping", code)
+            else:
                 clean = part.dropna(subset=core_cols)
                 if not clean.empty:
-                    rows_indexed.append((idx, clean.iloc[[-1]]))
+                    rows.append(clean.iloc[[-1]])
             if progress_callback is not None:
                 progress_callback(completed, total)
             if completed % 50 == 0 or completed == total:
                 logger.info("build_latest_features progress: {}/{}", completed, total)
-
-    # Preserve original code order (matches pre-fix serial behaviour) so
-    # downstream consumers that index by position get the same ordering.
-    rows_indexed.sort(key=lambda x: x[0])
-    rows: List[pd.DataFrame] = [r for _, r in rows_indexed]
 
     if not rows:
         logger.error("build_latest_features: no valid data produced")
