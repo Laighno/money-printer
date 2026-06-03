@@ -670,11 +670,20 @@ def run_seed(seed: int, mode: str,
         result.nav_records.append(nav_row)
 
         # ─── 4. Generate EOD plan for D+1 ───
+        # round 210 (B1 fix): EOD also drops low-ADV stocks to match prod
+        # daily_report.py:1004 (LOW_LIQUIDITY_FILTER_AMOUNT = 1e8).
+        # Without this, WF EOD could pick illiquid stocks that prod EOD's
+        # filter chain would drop. NO price cap — prod EOD doesn't limit price
+        # (¥50 cap is OOS-only Arm B Phase 2 guardrail, not EOD).
         if enable_eod:
             eod_panel = make_eod_panel_for(factors, D)
             eod_scores = score_panel(eod_ranker, eod_panel)
             if not eod_scores.empty:
-                eod_plan_for_tomorrow = top_k_picks(eod_scores, k=top_k)
+                eod_plan_for_tomorrow = top_k_picks(
+                    eod_scores, k=top_k,
+                    adv_lookup={c: adv_today.get(c, 0.0) for c in eod_scores["code"]},
+                    adv_floor=100_000_000.0,
+                )
             else:
                 eod_plan_for_tomorrow = pd.DataFrame()
 

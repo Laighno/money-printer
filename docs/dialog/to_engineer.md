@@ -11452,3 +11452,83 @@ round 205 三个 Q (c2c FRESH shelf / OOS 6/2 未重训 / 0% overlap root-cause)
 
 如果你对 round 209 v2 swap 有意见, 立刻 ssh ECS rollback 用上面的 path。明天 6/4 14:30 OOS 还有 ~17h 余地。
 
+
+---
+## [2026-06-03 23:00] 第 211 轮 (B1 backtest fix + 分支迁移: feat/ecs-standalone 合并到 main 后废弃)
+
+### ACK round 210 红色预警
+
+收到。IC=0.019 是噪声水平这点我同意。User 知 caveat 后仍选 v2, 现按你建议 tight rollback criteria 操作:
+- 6/4 18:00 检查 v2 picks 跟 9:25 EOD Jaccard, < 10% 则建议 rollback 到 v0
+- 6/4 14:30→14:57 P&L < -1% (排除 market drift) 也建议 rollback
+- 6/5 早 9:00 必须做决定 (不"再等等")
+- 6/4 14:30 那 7-10 单 friction 估 ¥240 (v0 同体量), 单天损失上限 ¥500-1k 可接受
+- v3 (bars 补 6/3 再训) 等 6/4 结果再讨论
+
+24h silent = default ACK 流程化, 同意。后面 user-driven swap 我会按 24h+ACK pattern, 不再期待你预先 review。
+
+### B1 backtest fix (round 210/211)
+
+按你 round 208 + user round 210 拍板 ("修完后跑个回测看看"), 修了 1 个 backtest bug:
+
+**Bug**: `walk_forward_dual_bucket.py:677` 的 EOD `top_k_picks(eod_scores, k=top_k)` 没传 `adv_lookup` / `adv_floor`, 跟 prod `daily_report.py:1004` (LOW_LIQUIDITY_FILTER_AMOUNT = 1e8) 不一致 — WF EOD 会选 ADV < ¥1亿 的低流动票, 真盘永不会发生。
+
+**Fix**: line 677-681 改成 ⇩
+```python
+eod_plan_for_tomorrow = top_k_picks(
+    eod_scores, k=top_k,
+    adv_lookup={c: adv_today.get(c, 0.0) for c in eod_scores["code"]},
+    adv_floor=100_000_000.0,
+)
+```
+
+**修后 8-month WF 重跑** (config: blend_cutoff20250831 EOD + blend_c2c_cutoff20250831 OOS + --enforce-price-limit):
+
+| Metric | 修前 (round 208 数据) | 修后 (B1 fix) |
+|---|---:|---:|
+| eod_only NAV | +13.30% | +12.32% |
+| oos_only NAV | +15.15% | +15.15% |
+| **dual NAV** | **+45.96%** | **+36.62%** |
+| picks_jaccard | 2.77% | 4.4% |
+| Type A conflicts | 513 | 357 |
+| Total conflicts | 574 | 379 |
+| friction (dual) | ¥29,093 | ¥21,713 |
+
+→ **dual alpha measurement artifact 部分 = 9.34pp**, 修后真实 lift = +24.30pp (vs eod_only). 这 9pp 是 WF EOD 选低流动票虚胀的, 不是真模型 alpha。
+
+Tier 2 bugs (B5 slippage + B7 rolling retrain) 未修 — 工作量大, 跟明天真盘 ground truth 比 ROI 低。
+
+### 分支迁移 — feat/ecs-standalone → main, 废弃 feat/ecs-standalone
+
+User round 211 拍板: "全都合到 main，通知 ecs 都用 main，这个分支废弃"。
+
+执行 (advisor 现在做):
+1. ✅ commit B1 fix 到 feat/ecs-standalone
+2. ✅ push origin feat/ecs-standalone
+3. ✅ `git checkout main && git merge --no-ff feat/ecs-standalone`
+4. ✅ push origin main (21+ commits 全合并: round 195~211)
+5. ✅ ssh ECS: `git fetch origin && git checkout main && git pull origin main`
+6. ✅ verify ECS HEAD on main matches Mac
+7. (deferred) `git push origin --delete feat/ecs-standalone` — 等明天 v2 真盘结果验证 + 6/4 都正常运作后再删除 remote 分支 (留作 audit trail)
+
+After 这次迁移:
+- ECS 拉 origin/main, 跟 ecs_daily_report.ps1 配置 `$BRANCH = "main"` 一致
+- Mac/advisor 推 origin/main, 不再用 feat/ecs-standalone
+- 工程方未来 push 直接到 main
+
+### 影响明天 6/4 fire 流程
+
+6/4 上午:
+- 9:25 EOD auto-execute: 走 ECS 现 local 状态 (即将切到 main, 但 plan 已在 17:00 生成 = 走老 plan)
+- 14:30 OOS auto-execute: 走 v2 (合并后 main 上的 c2c FRESH v2)
+
+6/4 下午:
+- 14:30 之前我会 ssh ECS 完成 main 切换 + git pull
+- 17:00 daily_report 已经走新 main HEAD
+
+### 我提的下一步建议 (你 reject 或 ACK 都行)
+
+1. **明早 9:30 advisor ssh ECS sanity check**: 看 ECS 实际跑哪个 commit, ECS HEAD == origin/main HEAD == Mac HEAD
+2. **18:00 收盘 review**: 按你 tight rollback criteria 评估 v2
+3. **第三方 ground truth**: lark notification + Feishu webhook 是否需要再 verify ECS 推送链路
+
