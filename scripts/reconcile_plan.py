@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -333,7 +334,23 @@ def main() -> int:
     for a in alerts:
         logger.warning("  reconcile alert: {}", a)
 
+    # Round 217 Tier 1: stamp source provenance so execute_orders' Tier 0
+    # source.is_prod check passes when reconcile is run inside the scheduled
+    # ECS task (MP_ALLOW_PROD_WRITE=1 env set by ecs_auto_execute.ps1).
+    from mp.common.paths import (
+        make_plan_source,
+        assert_prod_write_allowed,
+        audit_prod_write,
+    )
+    allow_prod_write = os.environ.get("MP_ALLOW_PROD_WRITE") == "1"
+    source = make_plan_source(
+        allow_prod_write=allow_prod_write,
+        asof=None,
+        dry_run=False,
+        script="reconcile_plan.py",
+    )
     payload = {
+        "source": source,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "report_date": date.today().strftime("%Y-%m-%d"),
         "entry_path": "reconcile_930",
@@ -353,7 +370,9 @@ def main() -> int:
     }
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    assert_prod_write_allowed(out_path)
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    audit_prod_write(out_path, source)
 
     if not orders:
         logger.info("Residual empty → 14:30 target already met; wrote no-op plan {}", out_path)

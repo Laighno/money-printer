@@ -3043,12 +3043,19 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
                     "alerts": order_alerts,
                 }
                 p = orders_dir / f"orders_{date.today().strftime('%Y%m%d')}.json"
+                latest_p = orders_dir / "latest.json"
+                # Round 217 Tier 1: hard-fail at write site
+                from mp.common.paths import assert_prod_write_allowed, audit_prod_write
+                assert_prod_write_allowed(p)
+                assert_prod_write_allowed(latest_p)
                 p.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                              encoding="utf-8")
                 # Also write `latest.json` symlink-style for executor convenience
-                (orders_dir / "latest.json").write_text(
+                latest_p.write_text(
                     json.dumps(payload, ensure_ascii=False, indent=2),
                     encoding="utf-8")
+                audit_prod_write(p, source)
+                audit_prod_write(latest_p, source)
                 logger.info("Order plan saved → {}", p)
             except Exception as e:
                 logger.warning("Order plan JSON save failed (non-fatal): {}", e)
@@ -3124,6 +3131,12 @@ if __name__ == "__main__":
                              "Scheduled-task only; ad-hoc invocations write to "
                              "data/_scratch/.")
     args = parser.parse_args()
+
+    # Round 217 Tier 1: env-set so any downstream write to a PROTECTED_PROD_PATH
+    # is allowed by `assert_prod_write_allowed`.
+    if args.allow_prod_write:
+        import os as _os
+        _os.environ["MP_ALLOW_PROD_WRITE"] = "1"
 
     if args.intraday_2pm:
         run_midday(dry_run=args.dry_run, chat_id=args.chat_id, user_id=args.user_id,

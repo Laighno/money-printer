@@ -799,8 +799,16 @@ def write_plan_json(
     dated_path = out_dir / f"intraday_{asof_date.strftime('%Y%m%d')}.json"
     latest_path = out_dir / "intraday_latest.json"
     text = json.dumps(payload, ensure_ascii=False, indent=2)
+    # Round 217 Tier 1: hard-fail if a refactor ever hard-codes a prod path
+    # without going through get_orders_output_dir.
+    from mp.common.paths import assert_prod_write_allowed, audit_prod_write
+    assert_prod_write_allowed(dated_path)
+    assert_prod_write_allowed(latest_path)
     dated_path.write_text(text, encoding="utf-8")
     latest_path.write_text(text, encoding="utf-8")
+    if source:
+        audit_prod_write(dated_path, source)
+        audit_prod_write(latest_path, source)
     return dated_path, latest_path
 
 
@@ -947,6 +955,14 @@ def main() -> int:
     asof = None
     if args.asof:
         asof = datetime.strptime(args.asof, "%Y%m%d").date()
+
+    # Round 217 Tier 1: env-set so any downstream write to a PROTECTED_PROD_PATH
+    # is allowed by `assert_prod_write_allowed`. Without this, ad-hoc invocations
+    # raise even if the writer is in this script.
+    if args.allow_prod_write:
+        import os as _os
+        _os.environ["MP_ALLOW_PROD_WRITE"] = "1"
+
     return run(asof_date=asof, skip_sleep=args.skip_sleep,
                allow_prod_write=args.allow_prod_write)
 

@@ -616,13 +616,20 @@ def main() -> int:
         out = log_dir / f"exec_{date_part}_intraday_{time_part}.json"
     else:
         out = log_dir / f"exec_{date_part}_{time_part}.json"
+    # Round 217 Tier 1: hard-fail if exec log path is reclassified as protected
+    # AND env gate is not set (won't fire today since ecs_auto_execute.ps1 sets
+    # MP_ALLOW_PROD_WRITE=1, but defends against ad-hoc invocations).
+    from mp.common.paths import assert_prod_write_allowed, audit_prod_write
+    assert_prod_write_allowed(out)
     out.write_text(json.dumps({
+        "source": plan.get("source", {}),  # propagate plan's source for traceability
         "executed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "mode": args.mode,
         "entry_path": plan.get("entry_path"),
         "plan_generated_at": plan.get("generated_at"),
         "results": results,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
+    audit_prod_write(out, plan.get("source") or {})
     logger.info("Execution log → {}", out)
 
     if args.feishu:

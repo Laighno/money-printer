@@ -56,6 +56,13 @@ function Abort {
 
 Log "==================== ECS auto-execute start ===================="
 
+# Round 217 Tier 1: this scheduled task is the authoritative live-trading
+# entry point; allow downstream prod-state writes (reconcile_latest.json,
+# exec_*.json). Ad-hoc CLI / ssh invocations don't set this env, so the
+# Tier 1 hard-fail in mp.common.paths.assert_prod_write_allowed protects
+# every protected path globally.
+$env:MP_ALLOW_PROD_WRITE = "1"
+
 # Ensure log dir exists
 $LogDir = Split-Path $LogPath
 if (-not (Test-Path $LogDir)) { New-Item -Type Directory -Path $LogDir -Force | Out-Null }
