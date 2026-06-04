@@ -114,7 +114,8 @@ Log "Step 2: intraday_plan.py (sleep_to_trigger 14:30:00 + fetch + score)"
 $pythonExe = "$REPO\.venv\Scripts\python.exe"
 $planArgs = @(
     "-X", "utf8",
-    "scripts\intraday_plan.py"
+    "scripts\intraday_plan.py",
+    "--allow-prod-write"  # Round 213 Tier 0: only scheduled tasks write to data/orders/
 )
 $planOutput = & $pythonExe @planArgs 2>&1 | Out-String
 $planOutput.Trim().Split("`n") | ForEach-Object { Log "  plan: $_" }

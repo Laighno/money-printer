@@ -765,6 +765,7 @@ def write_plan_json(
     orders: list[dict],
     alerts: list[str],
     out_dir: Path,
+    source: dict | None = None,
 ) -> Tuple[Path, Path]:
     """Write both ``intraday_latest.json`` and ``intraday_<YYYYMMDD>.json``.
 
@@ -772,6 +773,7 @@ def write_plan_json(
     after fills land; the former is what Phase B's executor consumes.
     """
     payload = {
+        "source": source or {},
         "generated_at": generated_at.isoformat(timespec="seconds"),
         "report_date": asof_date.strftime("%Y-%m-%d"),
         "entry_path": "intraday_14_30",
@@ -806,7 +808,11 @@ def write_plan_json(
 # Main
 # ─────────────────────────────────────────────────────────────────────
 
-def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
+def run(
+    asof_date: Optional[date] = None,
+    skip_sleep: bool = False,
+    allow_prod_write: bool = False,
+) -> int:
     """End-to-end Phase A flow.  Returns process exit code."""
     if asof_date is None:
         asof_date = date.today()
@@ -894,7 +900,20 @@ def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
                                       intraday_bars=intraday_bars)
     logger.info("Generated {} orders, {} alerts", len(orders), len(alerts))
 
-    out_dir = PROJECT_ROOT / "data" / "orders"
+    from mp.common.paths import get_orders_output_dir, make_plan_source
+    asof_arg = asof_date.strftime("%Y%m%d") if asof_date != date.today() else None
+    out_dir = get_orders_output_dir(
+        asof=asof_arg,
+        dry_run=False,
+        allow_prod_write=allow_prod_write,
+    )
+    source = make_plan_source(
+        allow_prod_write=allow_prod_write,
+        asof=asof_arg,
+        dry_run=False,
+        script="intraday_plan.py",
+    )
+    logger.info("plan output dir = {} (is_prod={})", out_dir, source["is_prod"])
     dated, latest = write_plan_json(
         asof_date=asof_date,
         generated_at=generated_at,
@@ -903,6 +922,7 @@ def run(asof_date: Optional[date] = None, skip_sleep: bool = False) -> int:
         orders=orders,
         alerts=alerts,
         out_dir=out_dir,
+        source=source,
     )
     logger.info("Wrote {}", dated)
     logger.info("Wrote {}", latest)
@@ -919,12 +939,16 @@ def main() -> int:
                     help="YYYYMMDD trading date (default: today). Useful for replay.")
     ap.add_argument("--skip-sleep", action="store_true",
                     help="Skip the 14:30:00 sleep-to-snapshot (testing only).")
+    ap.add_argument("--allow-prod-write", action="store_true",
+                    help="Write to data/orders/ (prod path). Scheduled-task only; "
+                         "ad-hoc/replay invocations write to data/_scratch/.")
     args = ap.parse_args()
 
     asof = None
     if args.asof:
         asof = datetime.strptime(args.asof, "%Y%m%d").date()
-    return run(asof_date=asof, skip_sleep=args.skip_sleep)
+    return run(asof_date=asof, skip_sleep=args.skip_sleep,
+               allow_prod_write=args.allow_prod_write)
 
 
 if __name__ == "__main__":

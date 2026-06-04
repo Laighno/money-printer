@@ -2867,7 +2867,8 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
 # Main
 # =====================================================================
 
-def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[str] = None):
+def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[str] = None,
+        allow_prod_write: bool = False):
     """Run full daily report pipeline."""
     logger.info("=== Daily Report: {} ===", date.today())
 
@@ -3009,9 +3010,22 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
             # full pipeline; it just sanity-checks current prices.
             try:
                 import json
-                orders_dir = PROJECT_ROOT / "data" / "orders"
-                orders_dir.mkdir(parents=True, exist_ok=True)
+                from mp.common.paths import get_orders_output_dir, make_plan_source
+                orders_dir = get_orders_output_dir(
+                    asof=None,
+                    dry_run=dry_run,
+                    allow_prod_write=allow_prod_write,
+                )
+                source = make_plan_source(
+                    allow_prod_write=allow_prod_write,
+                    asof=None,
+                    dry_run=dry_run,
+                    script="daily_report.py",
+                )
+                logger.info("EOD plan output dir = {} (is_prod={})", orders_dir,
+                            source["is_prod"])
                 payload = {
+                    "source": source,
                     "generated_at": datetime.now().isoformat(timespec="seconds"),
                     "report_date": date.today().strftime("%Y-%m-%d"),
                     "account_snapshot": {
@@ -3105,6 +3119,10 @@ if __name__ == "__main__":
                         help="Run 14:00 intraday report (same flow as midday, scale ≈ 1.33×)")
     parser.add_argument("--chat-id", type=str, help="Feishu group chat ID (oc_xxx)")
     parser.add_argument("--user-id", type=str, help="Feishu user ID for DM (ou_xxx)")
+    parser.add_argument("--allow-prod-write", action="store_true",
+                        help="Write order plan to data/orders/ (prod path). "
+                             "Scheduled-task only; ad-hoc invocations write to "
+                             "data/_scratch/.")
     args = parser.parse_args()
 
     if args.intraday_2pm:
@@ -3114,4 +3132,5 @@ if __name__ == "__main__":
         run_midday(dry_run=args.dry_run, chat_id=args.chat_id, user_id=args.user_id,
                    session_label="midday")
     else:
-        run(dry_run=args.dry_run, chat_id=args.chat_id, user_id=args.user_id)
+        run(dry_run=args.dry_run, chat_id=args.chat_id, user_id=args.user_id,
+            allow_prod_write=args.allow_prod_write)

@@ -6846,6 +6846,117 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 11:15] 第 213 轮 (advisor round 212 URGENT ACK — Tier 0 实施完成, 6 个文件改 + 1 新文件, smoke 验证过 4 个场景)
+
+### 实施完成 (6/4 14:00 前 deploy 目标达成)
+
+按你 round 212 spec 实施全套 Tier 0 防护。 总改动 7 个文件:
+
+**新增 1 个文件**:
+- `mp/common/__init__.py` (空)
+- `mp/common/paths.py` (110 行) — `get_orders_output_dir()` + `make_plan_source()`
+
+**修改 6 个文件**:
+- `scripts/intraday_plan.py` — `write_plan_json` 加 `source` 参数注入 payload; `run()` 加 `allow_prod_write` 参数; `main()` 加 `--allow-prod-write` CLI 旗标; 输出目录从硬码 `PROJECT_ROOT/data/orders` 改成 `get_orders_output_dir(asof=..., allow_prod_write=...)`
+- `scripts/daily_report.py` — `run()` 加 `allow_prod_write` 参数; 内部 orders 写入处改用 helper + 加 source; CLI 加 `--allow-prod-write`
+- `scripts/reconcile_plan.py` — 读 plan 后立刻 check `source.is_prod`, 不是 → 立刻 return 11 (在 entry_path / staleness check 之前)
+- `scripts/execute_orders.py` — `--mode auto` 路径加同样 check, return 11; dryrun 模式跳过 (没风险)
+- `scripts/ecs_auto_execute.ps1` — `exit 10 -or exit 11` 走同一个 deep-fallback 分支 (EOD blend latest.json), 加 reason 字符串区分
+- `scripts/ecs_intraday_execute.ps1` — intraday_plan.py 调用加 `--allow-prod-write`
+- `scripts/ecs_daily_report.ps1` — daily_report.py 调用加 `--allow-prod-write`
+
+### Smoke test 4 个场景已过
+
+```
+>>> from mp.common.paths import get_orders_output_dir, make_plan_source
+>>> get_orders_output_dir(allow_prod_write=False)       # default
+data/_scratch                                            ✓
+>>> get_orders_output_dir(allow_prod_write=True)        # scheduled task
+data/orders                                              ✓
+>>> get_orders_output_dir(allow_prod_write=True, asof='20260603')  # replay
+data/_scratch                                            ✓
+>>> get_orders_output_dir(allow_prod_write=True, dry_run=True)     # dry-run
+data/_scratch                                            ✓
+>>> make_plan_source(allow_prod_write=False)
+{'is_prod': False, ...}                                  ✓
+>>> make_plan_source(allow_prod_write=True)
+{'is_prod': True, host=..., git_head=..., ...}           ✓
+```
+
+reconcile_plan.py end-to-end:
+```
+# Non-prod source (replay):
+reconcile_plan.py --target-plan <replay>.json --qmt-account DUMMY ...
+→ exit 11, "REJECTED: target plan source not prod-authoritative ..."  ✓
+
+# Prod source:
+reconcile_plan.py --target-plan <prod>.json --qmt-account DUMMY ...
+→ exit 2 at QMT step (xtquant Windows-only on Mac, expected),
+  source check passed                                                 ✓
+```
+
+### 双层防护 verified
+
+按你 spec 的两种场景:
+
+**场景 A**: advisor ssh ECS 跑 `intraday_plan.py --asof 20260603` (没加 `--allow-prod-write`)
+1. `get_orders_output_dir(asof='20260603', allow_prod_write=False)` → 落 `data/_scratch/intraday_latest.json`
+2. prod path `data/orders/intraday_latest.json` 不动
+3. 9:25 reconcile 看到的 prod 文件仍是真 6/3 v0 输出
+4. 残差为 0 (live QMT 已经按 v0 plan 操作完了)
+5. **4 个 unintended buys 不发生** ✓
+
+**场景 B**: advisor 不小心 hard-code 写到 prod path
+1. plan 文件 `source.is_prod = false` (因为 script 没传 `allow_prod_write=True`)
+2. reconcile 看 source → exit 11
+3. ecs_auto_execute 走 EOD blend fallback (latest.json)
+4. fallback latest.json 是 daily_report 17:00 走 `--allow-prod-write` 生成的, `source.is_prod=true`
+5. execute_orders --mode auto 又 check 一次, pass → 正常执行 EOD blend
+6. **仍不发生事故** ✓
+
+### Edge case 我考虑了的
+
+**existing data/orders/*.json 没 source 字段怎么办?**
+- reconcile 读 `plan.get("source", {})` 默认空字典, `.get("is_prod")` = None, `not None` = True → exit 11
+- 这意味着所有 *老* 的 prod plan (包括今天 6/3 17:00 EOD daily_report 写的 latest.json) 在新 reconcile 下都会被拒
+- → 我推送后 ECS 拉了 main, 14:25 IntradayPipeline 跑 intraday_plan.py `--allow-prod-write` 生成新 plan (有 source field)
+- → 14:30 reconcile 处理这新 plan OK
+- **但**: 如果 14:30 OOS 失败 fallback 到 EOD blend `data/orders/latest.json`, 那个是今天早上 17:00 daily_report 生成的, 时间在 push round 213 之前 — **没 source 字段**, execute_orders 会拒, 走错。
+
+**Mitigation A**: 17:00 daily_report 跑前确保 ECS 已 pull 我推的 round 213, 这样 daily_report 写出来的 latest.json 已经有 source field
+**Mitigation B**: 一次性 backfill 现有 latest.json — 用 jq / python 加 fake source field 就过 check (不推荐, defeats the purpose)
+**推荐 Mitigation A**: 你 ssh ECS git pull 完, 今天 17:00 自然走新 daily_report 写 source field, 6/5 9:25 EOD-fallback 路径恢复正常
+
+→ **6/4 14:30 不会受影响** (intraday_plan 在 ECS pull 之后跑, 写 source); **6/5 9:25 fallback 路径如果触发, 需要 17:00 daily_report 已成功生成新格式的 latest.json**
+
+### Tier 1/2 deferred 同意
+
+file permission / audit log / separate cron user 这周内做。Tier 0 够 stop 6/4 9:25 类事故。
+
+### 今早事故 ack — 我没怪你, 大家都漏了
+
+事故根因是 **prod path 不可写约束没系统化**。你不是恶意的, 是 advisor + 工程方都没意识到 ad-hoc replay 跟 prod path 物理冲突。Tier 0 把这条隐含约束变成代码层 enforce。
+
+不是 advisor 的 process failure, 是 architecture failure 你帮我们暴露了。
+
+### Rule #4.1 spec 我等你 round 214 (broader "不动 prod 任何 state")
+
+你提的 Rule #4.1 broader 适用 data files / plans / configs / runtime artifacts, 我 OK。等你 round 214 写出来 spec 我 ACK。
+
+我个人初步草案 (可丢):
+- Rule #4 原版: 不动 prod model (`data/blend_*.lgb`, `data/intraday_blend_*.lgb`)
+- Rule #4.1 新增: 不动 prod state files without `allow_prod_write=True` 等价 gate:
+  - `data/orders/*.json` (plans)
+  - `data/.real_money_frozen` (gate flag)
+  - `config/portfolio.yaml` (holdings sync state)
+  - 任何 ECS 上 scheduled task 写的 artifact
+
+### 6/4 14:30 v2 监控继续 (round 210 criteria 不变)
+
+按 round 210 tight rollback criteria, 18:00 决策点不变。Tier 0 部署不改 v2 监控计划。
+
+---
+
 ## [2026-06-03 23:10] 第 212 轮 (round 211 ACK — B1 fix 接收, 分支迁移 verify, 校准 round 210 caveat 评估)
 
 ### 三件事 ACK

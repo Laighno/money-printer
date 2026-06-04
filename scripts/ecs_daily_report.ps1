@@ -64,7 +64,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # Step 4: daily_report.py (generates plan + Feishu)
 Log "Step 4: daily_report.py"
-$reportOutput = & $pythonExe -X utf8 scripts\daily_report.py 2>&1 | Out-String
+$reportOutput = & $pythonExe -X utf8 scripts\daily_report.py --allow-prod-write 2>&1 | Out-String
 $reportOutput.Trim().Split("`n") | ForEach-Object { Log "  report: $_" }
 if ($LASTEXITCODE -ne 0) { Abort "daily_report.py failed (exit $LASTEXITCODE)" }
 

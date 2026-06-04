@@ -274,6 +274,23 @@ def main() -> int:
         logger.error("Failed to read target plan: {}", e)
         return 3
 
+    # Round 213 Tier 0: refuse to act on plans not stamped as prod-authoritative.
+    # Defends against the 6/4 9:25 incident where an ad-hoc replay overwrote
+    # data/orders/intraday_latest.json and reconcile diffed against it, sending
+    # 4 unintended buys.
+    src = plan.get("source", {}) or {}
+    if not src.get("is_prod"):
+        logger.error(
+            "REJECTED: target plan source not prod-authoritative "
+            "(host={host}, user={user}, script={script}, asof={asof}, "
+            "allow_prod_write={apw}). Refusing to reconcile — deep fallback "
+            "to EOD blend (exit 11).",
+            host=src.get("host"), user=src.get("user"),
+            script=src.get("script"), asof=src.get("asof"),
+            apw=src.get("allow_prod_write"),
+        )
+        return 11
+
     if plan.get("entry_path") != "intraday_14_30":
         logger.warning("Target plan entry_path={!r} != 'intraday_14_30' — deep fallback (exit 10)",
                        plan.get("entry_path"))

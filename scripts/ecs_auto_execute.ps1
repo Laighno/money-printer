@@ -112,11 +112,17 @@ Log "Step 4: reconcile exit = $reconExit"
 if ($reconExit -eq 0) {
     $planPath = "data\orders\reconcile_latest.json"
     Log "Step 4: using reconcile plan (residual补 of 14:30 target)"
-} elseif ($reconExit -eq 10) {
-    # Deep fallback: 14:30 target missing or stale ≥2 trading days.
-    # Execute the EOD blend plan (daily_report 17:00 still regenerates it).
+} elseif ($reconExit -eq 10 -or $reconExit -eq 11) {
+    # Deep fallback:
+    #   exit 10 = 14:30 target missing or stale ≥2 trading days
+    #   exit 11 = 14:30 target source not prod-authoritative (round 213 Tier 0)
+    # In both cases execute the EOD blend plan (daily_report 17:00 still
+    # regenerates it). Exit 11 specifically defends against ad-hoc replay
+    # overwriting intraday_latest.json — the 6/4 9:25 incident root cause.
     $planPath = "data\orders\latest.json"
-    Log "Step 4: reconcile signalled deep-fallback → EOD blend latest.json"
+    $fbReason = if ($reconExit -eq 10) { "target missing/stale" }
+                else { "target source non-authoritative (replay/ad-hoc)" }
+    Log "Step 4: reconcile signalled deep-fallback ($fbReason) -> EOD blend latest.json"
     if (-not (Test-Path "$REPO\$planPath")) { Abort "fallback plan missing: $planPath" }
     $planAge = ((Get-Date) - (Get-Item "$REPO\$planPath").LastWriteTime).TotalHours
     Log "Step 4: fallback plan age = $([math]::Round($planAge,1))h"

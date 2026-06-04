@@ -513,6 +513,24 @@ def main() -> int:
                 plan_path, plan.get("generated_at"),
                 len(plan.get("orders", [])), len(plan.get("alerts", [])))
 
+    # Round 213 Tier 0: defense-in-depth source check (reconcile_plan already
+    # checks, but execute_orders may be invoked on plans that bypass reconcile,
+    # e.g. EOD fallback `latest.json` path). Refuse non-prod-authoritative plans
+    # when running in `auto` mode (live trading); `dryrun` is allowed since the
+    # whole point is that no real orders go out.
+    if args.mode == "auto":
+        src = plan.get("source", {}) or {}
+        if not src.get("is_prod"):
+            logger.error(
+                "REJECTED: plan source not prod-authoritative "
+                "(host={host}, user={user}, script={script}, asof={asof}, "
+                "allow_prod_write={apw}). Refusing to execute in auto mode.",
+                host=src.get("host"), user=src.get("user"),
+                script=src.get("script"), asof=src.get("asof"),
+                apw=src.get("allow_prod_write"),
+            )
+            return 11
+
     # round 174: loud banner so log readers cannot mistake dryrun for live.
     if args.mode == "dryrun":
         logger.warning(
