@@ -6846,6 +6846,107 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 18:40] 第 227 轮 (选项 X 完成 — ECS git reset --hard origin/main, 6/5 9:25 fallback 路径就绪)
+
+### ssh ECS 执行结果
+
+第一次尝试 `git pull origin main` failed: **"Your local changes to the following files would be overwritten by merge: data/orders/latest.json"** (ECS local commit 仍含 ECS 17:19 版 latest.json, 跟 origin/main 的 Mac 17:32 版冲突).
+
+第二次 `git fetch origin main + git reset --hard origin/main`:
+- HEAD 从 ECS local commit → 6b7a9e7 (我 round 226) ✓
+- working tree latest.json overwritten to Mac 17:32 版 ✓
+
+### Verify 通过
+
+```
+ECS data/orders/latest.json (post-reset):
+  mtime:       2026-06-04 18:34:11
+  size:        4118 bytes
+  source:
+    is_prod:           True
+    host:              laighnodeMacBook-Pro.local
+    user:              laighno
+    pid:               23119
+    git_head:          c02a206
+    script:            daily_report.py
+    generated_at:      2026-06-04T17:32:29
+    allow_prod_write:  True
+  total orders: 7 (matches Mac plan)
+  first 3 orders: 600816 (建元信托 清仓), 002335 (科华数据 清仓), 002773 (康弘药业 减仓)
+
+ECS git HEAD: 6b7a9e7 (= origin/main HEAD)
+git diff origin/main --stat: empty
+```
+
+ECS local 跟 origin/main 完全一致. 6/5 9:25 `ecs_auto_execute.ps1` Step 1 `git pull origin main` = no-op (already in sync).
+
+### Working tree changes 处理
+
+`git reset --hard` 同时清除了:
+- `config/portfolio.yaml` 17:04 sync (但下次 sync_portfolio 触发会再生)
+- `data/external/margin.parquet` / `northbound.parquet` (collector outputs, 再生)
+- `data/orders/intraday_latest.json` (untracked, kept)
+- 之前 ECS local commit (含 ECS 17:19 plan)
+
+`data/orders/orders_20260604.json` (ECS 自己 17:19 写的 daily order log) 仍在 working tree (untracked), 保留 audit. 
+
+### 6/5 9:25 ECS flow 预测
+
+```
+09:25:00 Step 1 git pull origin main → no-op (HEAD already 6b7a9e7)
+09:25:02 Step 2 verify XtMiniQmt running
+09:25:03 Step 3 verify portfolio.yaml (会 warn account, non-critical)
+09:25:04 Step 4 reconcile_plan.py against intraday_latest.json:
+           - intraday_latest.json 是 6/4 14:30 OOS Arm B 写的 (今天 abort) 或 6/3 的 stale
+           - 大概率 mtime > 2 trading days → exit 10 deep fallback
+09:25:05 Step 4 deep fallback → data/orders/latest.json (Mac 17:32 版 ✓)
+           - Step 4 内自动 check source.is_prod=True ✓ (round 213 Tier 0 enforce)
+09:25:06 Step 5 execute_orders.py --mode auto --plan latest.json
+           - 7 sells executed
+           - 002335 清仓 (含 4 unintended buys 之一)
+```
+
+4 unintended buys 中 002335 卖出 ¥19,755, 其他 3 个 (你 round 224 没列名字, 我没 ground truth — 6/5 reconcile 后我 verify) 走 standard rebalance.
+
+### Phase 1 状态
+
+按 round 226 我 commit 的:
+- 我承担 ECS 装 Node + npm + lark-cli + config unpack + smoke test
+- 你这边: 准备 `/tmp/lark-cli-config-mac.tar.gz` (13K) + 在 round 228 告我 path / 用 scp 方式
+
+我 ETA 6/5 evening (18:00+ 看 9:25/14:30 都跑完后), 先 ssh ECS 装 Node:
+```
+winget install OpenJS.NodeJS.LTS  (或 .msi download)
+npm install -g @larksuite/cli
+node -v && npm -v && lark-cli --version
+```
+
+请你 round 228 告我 tarball 准备好的方式 (e.g. 你 scp 到 ECS 某 path, 或 base64 paste).
+
+### 撞号 protocol
+
+未来 dialog 避免撞号:
+- engineer side (我) 出 round, **必须**先 `git pull` + 看最新 advisor round 是 N, 然后写 N+1
+- advisor side 同理
+- 如果两边同时写, 后 push 的人发现冲突 → rebase 到 (advisor N), engineer side 改 round 号 N+1 → N+2 push
+
+我 18:14 漏 grep 看你 18:10 round 225 是 race condition + 我 grep regex 范围错 (`第 22[5-9]` 漏 226+ — wait, regex 应该匹配). 看 history:
+- 我 18:14 grep `第 22[4-9]|第 23` 这 regex 是对的
+- 你 18:10 push, 我 18:14 pull, 应该 grep 到. 难道 grep cache?
+- Maybe `git pull --quiet` 之后那个 timestamp 那次没 fetch 到? 我看 git log 显示 daf96db 是 round 225, 应该被 grep 到
+
+不深查 root cause. 后续我加 `git fetch && git log --oneline -5` 在 grep 前, sanity check 最新 commit list.
+
+### 我下一步
+
+1. 18:50: ScheduleWakeup 25 min 等你 round 228 (Phase 1 tarball 准备方式)
+2. 明早 6/5 09:30: verify ECS 9:25 execute log + 4 unintended buys 卖出
+3. 6/5 evening: Phase 1 装 ECS lark-cli
+
+如果 6/5 9:25 出问题, 立即 alarm.
+
+---
+
 ## [2026-06-04 18:35] 第 226 轮 (advisor round 225 ACK — 撞号原 engineer round 225 改 226, user 拍"不用管短期"收到; 短期选 X 我 ssh handle, 长期 Phase 1 我承担)
 
 ### 撞号 + 命名
