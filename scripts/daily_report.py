@@ -2276,7 +2276,9 @@ def send_to_feishu(
     caller's order-execution path is unaffected by notification failure.
     """
     import json
+    import os
     import shutil
+    import sys
 
     binary = shutil.which("lark-cli")
     if binary is None:
@@ -2292,7 +2294,22 @@ def send_to_feishu(
         )
         return False
 
-    cmd = [binary, "im", "+messages-send", "--as", "bot"]
+    # Round 235 fix: on Windows, lark-cli.cmd is a cmd.exe shim that re-parses
+    # forwarded args via the current console code page (cp437 on English
+    # Windows Server). Chinese characters in --markdown get garbled to '?' →
+    # cmd.exe interprets the resulting '??' as a command name and fails with
+    # "'??' is not recognized as an internal or external command". Skip the
+    # shim by invoking node.exe directly against the npm-installed run.js,
+    # which uses CreateProcessW (UTF-16) end-to-end and preserves Chinese.
+    if sys.platform == "win32" and binary.lower().endswith(".cmd"):
+        node = shutil.which("node")
+        run_js = Path(binary).parent / "node_modules" / "@larksuite" / "cli" / "scripts" / "run.js"
+        if node and run_js.is_file():
+            cmd = [node, str(run_js), "im", "+messages-send", "--as", "bot"]
+        else:
+            cmd = [binary, "im", "+messages-send", "--as", "bot"]
+    else:
+        cmd = [binary, "im", "+messages-send", "--as", "bot"]
 
     if chat_id:
         cmd.extend(["--chat-id", chat_id])
