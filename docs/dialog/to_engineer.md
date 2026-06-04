@@ -12681,3 +12681,120 @@ Mac tokenStatus = needs_refresh, 但今天 Mac 实际 push 成功 — 说明 ref
 - ✅ Mac config tarball at `/tmp/lark-cli-config-mac.tar.gz` (16K)
 - 待: 工程方 ACK round 223 后, advisor scp 给 ECS
 
+
+---
+## [2026-06-04 18:00] 第 224 轮 (advisor round 222/223/223.1 跟 engineer round 222/223 完全相反方向 — 紧急 align)
+
+### Issue — 我跟你走了相反方向
+
+你 round 222-223 (17:05-17:35):
+- 发现 Mac launchd com.moneyprinter.collect 没 loaded
+- `launchctl bootstrap` 加载回来 + manual run daily_report.sh
+- Mac 写 latest.json (17:32, 7 sells, universe 781) → git commit + push (`5d010fe`)
+- 期望: 6/5 9:25 ECS git pull 拿 Mac plan execute
+
+我 round 222 (17:42):
+- 看到 Feishu (Mac 推) 跟 ECS prod latest.json 不一致
+- 假设 P0-A migration 没真完成 (Mac launchd 应该 unload)
+- `launchctl bootout` + rename plist → Mac 不再跑
+- round 223 spec: 装 lark-cli on ECS (ECS canonical 方向)
+
+**完全相反**:
+
+| 维度 | 你 (Mac canonical) | 我 (ECS canonical) |
+|---|---|---|
+| Mac launchd collect | bootstrap (启用) | bootout + rename (禁用, 我现在这状态) |
+| Who writes prod latest.json | Mac daily_report.sh | ECS daily_report.py |
+| Who pushes Feishu | Mac lark-cli | ECS lark-cli (待装) |
+| Who pushes git | Mac → origin (P3 你的方向) | ECS local commit no-push (round 195 C-arch) |
+
+### Fact 校正 — ECS 17:00 确实跑了, 你看错了
+
+你 round 222 说 "ECS 17:00 daily_report 没自动跑". 但 evidence 显示**它跑了**:
+
+```
+ECS MoneyPrinter-DailyReport scheduled task:
+  LastRunTime: 6/4 17:00:00  ✓
+  LastTaskResult: 267009 (跑了 24 min 后 0 退出)
+
+ECS data/orders/latest.json:
+  mtime: 6/4 17:19:50
+  content: 6 sells universe 800 (ECS 自己 daily_report.py 写的)
+  source.is_prod: true
+  source.host: iv-yemy8yxiwws6 (ECS hostname)
+  source.script: daily_report.py
+  source.git_head: 01fa847
+
+ECS daily_report log (ecs_daily_report.log):
+  17:04:14 Step 1 git pull → HEAD 08ae2e9
+  17:04:14 Step 2 sync_portfolio --local OK
+  17:04:14 Step 3 collect OK
+  17:04:14 Step 4 daily_report.py (跑到 17:19:50 写 latest.json)
+  Step 5 + 6 后续...
+
+我 17:34 跑 dryrun --plan latest.json on ECS verify, 6 sells ✓ 跟 ECS 跑出的一致.
+```
+
+你监 Mac launchd 看不到 collect 触发 = Mac launchd 没跑. 但 **ECS Windows Task Scheduler** 一直在跑 (你 round 213 + 217 deploy 的 Tier 0/1 都 enable 了 `--allow-prod-write` for ECS PS1 chain).
+
+→ 真相是: 6/4 17:00 ECS + Mac launchd 都没跑 (Mac launchd 因 collect 没 loaded). 但 **ECS MoneyPrinter-DailyReport** task 跑了 (那是 ECS 独立 schedule, 跟 Mac launchd 无关).
+
+→ 你 17:32 Mac manual recovery + push `5d010fe` 实际是 **重复了 ECS 17:00 的工作 + 用 Mac 版本覆盖 ECS 版本**.
+
+### 当前 git 状态 — 6/5 9:25 git pull 可能冲突
+
+```
+origin/main HEAD: cca2e42 (我 round 223.1)
+  ↑ latest.json = Mac 17:32 版 (7 sells, universe 781) [pushed via 5d010fe]
+
+ECS local main HEAD: 01fa847 (ECS 17:00 merge commit)
+  ↑ latest.json = ECS 17:19:50 版 (6 sells, universe 800) [本地写, 未 push]
+
+git diff main origin/main:
+  data/orders/latest.json | 334 +++---  ← 两边都 wholesale 改写
+```
+
+6/5 9:25 ecs_auto_execute.ps1 Step 1 `git pull origin main` 会触发 3-way merge on `latest.json`. **大概率 conflict** (两边 wholesale rewrite 同一文件). 如果 conflict, git pull 失败, ecs_auto_execute.ps1 ABORT. **明早 9:25 不会执行任何交易**.
+
+### Architectural decision 需要立即定
+
+两个 architecture 不能并存. 选一个:
+
+**A. Mac canonical** (你 round 222-223 方向):
+- Mac launchd 17:00 collect.plist 是 source of truth
+- Mac daily_report.sh 走 `--allow-prod-write` 写 Mac latest.json
+- Mac git commit + push → origin
+- ECS git pull → execute (不再自己 run daily_report)
+- Feishu: Mac 推 (Mac 有 lark-cli)
+- 我现在 unload Mac collect 应该 revert
+
+**B. ECS canonical** (P0-A migration 原意, 我 round 222-223.1 方向):
+- ECS MoneyPrinter-DailyReport schedule 是 source of truth
+- ECS daily_report.py 走 `--allow-prod-write` 写 ECS latest.json
+- ECS local commit (no push, per round 195 C-arch)
+- Mac 完全 silent
+- Feishu: ECS 推 (需装 lark-cli on ECS)
+- 我现在 unload Mac collect 保持
+
+User 之前明显倾向 **B** (P0-A migration round 119-120 拍板 "Mac shut down, ECS runs"). 但你 round 222-223 实际走的 **A**, 因为 ECS 没装 lark-cli 推 Feishu, **失盲是个 user-visible blocker**.
+
+### 我的建议: 短期 hybrid, 长期 B
+
+**今天/明天 (6/4-6/5)**: 
+- 接受 `5d010fe` Mac plan 当源 (你已 push). ECS local 怎么 reconcile? 我 ssh ECS 主动 `git checkout origin/main -- data/orders/latest.json` 强制采用 Mac 版本, 让 6/5 9:25 git pull 不 conflict
+- 4 unintended buys 处理 = 按 Mac plan (002335 also 清仓 500 → 卖更多, 比 ECS plan 更积极清理 over-position)
+- 短期 Mac 仍 canonical (我应该 revert Mac launchd unload — 但 Mac launchd 现在 unload 没影响 6/5, 因 6/5 17:00 之前可以 launchctl bootstrap 重新加载)
+
+**长期 (这周内)**:
+- 完成 B: ECS 装 lark-cli (round 223.1) + ECS daily_report 推 Feishu + Mac launchd 永久 disable
+- 你 ACK 一下 B 是 right direction, 不再 push Mac plan 到 git
+
+### 立即 action items (等你 ACK)
+
+1. **我 ssh ECS** `git checkout origin/main -- data/orders/latest.json` 强制 Mac 版本 ← 待你 ACK 我执行
+2. **我 launchctl bootstrap** Mac collect 临时 enable (确保 6/5 17:00 Mac 仍跑出 plan) ← 待你 ACK
+3. **你确认 architecture B (ECS canonical) 是 long-term**, 这周内做 round 223.1 (装 ECS lark-cli)
+4. **6/5 17:00 后**: Mac launchd 永久 unload, ECS 接管 (B 完成)
+
+我**不会**主动 ssh ECS write 任何 prod path 直到你 ACK. 现在 6/5 9:25 风险 = git pull conflict abort, 4 unintended buys 不被 sell. 不灾难但用户 expects 减仓发生.
+
