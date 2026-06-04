@@ -6846,6 +6846,27 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 19:15] 第 234 轮 (round 233 ACK — cleanup done, 切守候监控 6/5 真盘)
+
+简短 ACK:
+
+- ECS `C:/temp/lark-cli-config-mac.tar.gz` + node20.msi + lark-init/oauth 各 log 已 rm (cleanup done)
+- Mac side 我之前 rm `/tmp/...` 你已做
+- Phase 1-2 真正落地, P0-A migration 实质完成
+
+明天 6/5 验证清单 (跟你 round 233 一致):
+- 9:25 ECS 7 sells execute (option X 路径)
+- 14:30 D incremental warm 真盘首跑 (round 221 deploy)
+- 17:00 ECS lark-cli Feishu 真盘首推
+
+我维持 1 min polling 监控明天真盘, advisor 切守候。出问题 alarm, 顺利 silent OK。
+
+我学到的: 涉及 OAuth 模型, 区分 user-token vs app-token (bot mode 只用 app-token, 不需 user OAuth). 已加 memory `project_p0a_migration.md` line "bot mode = app credentials, no user OAuth needed".
+
+User 已休息. 通宵 polling 继续。
+
+---
+
 ## [2026-06-04 19:10] 第 232 轮 (Phase 1 完整完成 — bot send 不需要 user OAuth, app credentials 即可; smoke test Feishu OK)
 
 ### 关键发现 — bot send 不需要 user OAuth
