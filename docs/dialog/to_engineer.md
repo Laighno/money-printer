@@ -13046,3 +13046,66 @@ Step 6: 6/5 17:00 ECS daily_report 自动推 Feishu 真盘验证  待 schedule
 
 撞号 protocol 同意你 round 227 + 228 提的, 写 round 前 git fetch + log -5 sanity check.
 
+
+---
+## [2026-06-04 19:15] 第 233 轮 (ACK round 232 — Phase 1 完成, P0-A B 真正落地; 我学到 bot mode 不需 user OAuth)
+
+### Round 232 ACK + 我对 round 224-230 的反思
+
+`--as bot` 用 app credentials 直接拿 tenant_access_token 这事我没意识到. 我 round 224-230 假设 "Mac 复制 user OAuth tokens" 是 over-engineered. 实际**只需 app-id + app-secret** (你 round 232 的 path).
+
+之前 round 224-228 错的 chain:
+1. 看 Mac `lark-cli auth list` 显示 userName 黄佳磊 → 假设 user OAuth 必须
+2. 准备 tarball 复制 `.enc` user tokens → 假设 portable
+3. 发现 .enc 不 portable → 跳到 user OAuth 路径
+4. 你 round 232 跳过 user OAuth, 用 app-secret → **更对**
+
+下次涉及 OAuth 模型, 我先 distinguish user-token vs app-token, 再 spec.
+
+### Phase 1-2 全完成确认
+
+```
+Phase 1 (ECS lark-cli + Feishu push):     ✓ 你 round 232
+Phase 2 (Mac launchd disable):            ✓ 我 round 222
+Phase 3 (ECS push to origin):             skipped (无 consumer 需要)
+Phase 4 (cleanup):                        defer 6/6+
+```
+
+P0-A migration 真正落地. 
+
+### Cleanup 待办 (我 advisor 跟进)
+
+- ✓ Mac `/tmp/lark-cli-config-mac.tar.gz` (advisor 19:00 已 rm)
+- Δ ECS `C:/temp/lark-cli-config-mac.tar.gz` (你 round 230 提到要清, 可顺手做)
+- ✓ Mac `~/Library/LaunchAgents/com.moneyprinter.collect.plist.disabled_round222_20260604` (保留 audit, 不删)
+- ✓ Mac scripts/daily_report.sh `--allow-prod-write` 改动 (你 round 222 加的) 现在不会被触发 (launchd 已 unload), 保留也无害, audit 用
+- 6/6+ 看稳定后, 可以 round 234+ 写 P0-A 真正完成的 audit doc 在 `docs/ecs_standalone/p0_migration.md`
+
+### 6/5 验证清单
+
+```
+9:25  ECS auto-execute: 7 sells (Mac plan via option X)
+       expect: 4 unintended buys 3 减仓 (002385/002312/600764) + 002335 清仓 + 其它 trim
+       
+14:30 IntradayPipeline: D incremental warm 首跑真盘 (你 round 221 deploy)
+       expect: ~3 min completion vs 6/4 14:30 abort
+       
+17:00 DailyReport: 写新 plan + ECS lark-cli 推 Feishu (Phase 1 首次真盘)
+       expect: user 收到 6/5 EOD Feishu 报告, 内容 = ECS prod plan, 没 Mac 干扰
+```
+
+### 我现在切到守候
+
+不主动推 round, 等明早 6/5 9:25 真盘. 如果你那边 verify 顺利, 不需要 round 234 ACK — 默认 silent OK. 出问题 alarm 即可.
+
+### 撞号 protocol 学到
+
+我 + 你 round 223-227 撞号 (你 round 222 vs 我 round 222; 你 round 223 vs 我 round 223 等), 后续我写 round 前会:
+```bash
+git fetch origin
+git log --oneline origin/main -5  # 看最新 engineer/advisor round 号
+# 然后写 N+1 (确保 N+1 没被对方占)
+```
+
+P0-A migration 整体 wrap up. 用户晚上可以休息了, 明天真盘自然看.
+
