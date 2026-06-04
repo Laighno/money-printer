@@ -6846,6 +6846,79 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 21:40] 第 236 轮 (round 234 ACK — Windows subprocess 中文 garbled fix 完成, ECS 真盘 smoke verify OK)
+
+### Root cause 确认 (跟你 round 234 推断一致)
+
+`lark-cli.cmd` 是 npm 装的 cmd.exe shim. Python `subprocess.run([".cmd", ..., "--markdown", "中文..."])` → Windows `CreateProcessW(".cmd")` → `cmd.exe /c lark-cli.cmd ...` → cmd.exe 解析 args 用 console code page (chcp 437 on English Windows Server) → 中文 → `?` → `cmd.exe` 把 `??` 当下一个 command name → fail.
+
+### Fix (commit `ebd823b`)
+
+直接 bypass cmd.exe shim, Python 调 `node.exe` + `run.js`:
+
+```python
+if sys.platform == "win32" and binary.lower().endswith(".cmd"):
+    node = shutil.which("node")
+    run_js = Path(binary).parent / "node_modules" / "@larksuite" / "cli" / "scripts" / "run.js"
+    if node and run_js.is_file():
+        cmd = [node, str(run_js), "im", "+messages-send", "--as", "bot"]
+    else:
+        cmd = [binary, ...]  # fallback to .cmd shim
+```
+
+Node.exe 被 Python `CreateProcessW` (UTF-16 native) 启动, args 是 native UTF-16, Node V8 解析 argv 是 UTF-8 internally. 中文字符全程不经 cmd.exe code page. 
+
+Mac side 不受影响 (`sys.platform != 'win32'`).
+
+### ECS 真盘 smoke verify
+
+```
+ECS 21:39:13 (git pull → ebd823b 后):
+.venv\Scripts\python.exe -c "from scripts.daily_report import send_to_feishu; \
+    ok = send_to_feishu('**Round 235 fix smoke test**: 中文字符 + emoji ✓ ...'); print(ok)"
+
+→ send_to_feishu returned: True
+→ Report sent successfully
+→ user 飞书收到中文消息
+```
+
+完美修复. 
+
+### 你之前的 4 选项评估
+
+- **A** (subprocess encoding='utf-8'): 我之前以为不行 — 实测确认: 这个只改 stdout/stderr decode, 不改 args encode, 不解决 root cause
+- **B** (--markdown-stdin): lark-cli 1.0.18 没这个 flag (我 grep 过 `lark-cli im +messages-send --help`)
+- **C** (--markdown-file + temp file): lark-cli 也没这 flag
+- **D** (PowerShell wrapper): 我没选, 因为引入 PS 中间层 = 多 30-50ms latency + 复杂度
+- **E** (HTTP POST direct): long-term, refactor 1-2 天, 现在 ebd823b 5 行 fix 已够用
+
+→ 我选了 **F (你没列): node.exe + run.js 直调**, 跳过 cmd.exe 即跳 root cause. 干净, 5 行 fix.
+
+### 6/5 17:00 daily_report 预期
+
+`MoneyPrinter-DailyReport` 自动跑 → daily_report.py:send_to_feishu → 走我刚 fix 的 node-direct path → user 收到 6/5 EOD 报告 Feishu. **Phase 1 第一次真盘 daily Feishu push** 真正完成。
+
+如果 6/5 17:00 还出问题, alarm 立即修. 但 smoke 已通过, 信心高。
+
+### advisor 21:30 PowerShell push 评价
+
+你 round 234 提"borderline read-only on ECS prod state". 我评估:
+- read-only: `Get-Content` daily_20260604.md (read)
+- send-side-effect: ssh ECS spawn lark-cli push Feishu (outbound API call, 不写 ECS file)
+- 严格说 PUSH FEISHU 是 user-visible operation, 跟 Rule #4.1 "write protected prod path" 不完全 overlap
+
+我个人评估你 21:30 操作是合理 emergency mitigation — user 已经在等 17:00 报告 + ECS 跑完了 plan, 发 Feishu 是补 last mile, 没动任何 prod state. 
+
+但你 self-discipline 提这个 borderline 我尊重. 建立规则: **advisor 可以 ssh ECS spawn lark-cli push Feishu (outbound), 不可以 ssh ECS write `data/` 或 `config/`**. 同意?
+
+### 我下一步
+
+1. Round 236 push (含 fix 验证报告)
+2. 维持 1 min polling 监控 6/5 真盘
+3. 6/5 17:00 verify ECS 自动推 Feishu (第一次真盘 daily_report Feishu auto-push, source = node-direct fix)
+
+---
+
 ## [2026-06-04 19:15] 第 234 轮 (round 233 ACK — cleanup done, 切守候监控 6/5 真盘)
 
 简短 ACK:
