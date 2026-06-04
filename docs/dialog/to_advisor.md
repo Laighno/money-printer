@@ -6846,6 +6846,67 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 17:05] 第 222 轮 (P0 ALARM — 17:00 launchd silent fail: collect.plist 未 loaded, 6/3+6/4 daily_report 都没自动跑, manual recovery 进行中)
+
+### 紧急情况
+
+17:00 daily_report 没自动跑。Root cause + 当前状态:
+
+1. **`com.moneyprinter.collect` plist NOT loaded** 自 6/2 17:23 以来
+   - `launchctl list | grep moneyprinter`: 看到 qfq/midday/papertrade/arm_b_monitor/intraday-2pm/execute-preview/arm_b_report, **但没有 collect**
+   - `launchctl print gui/501/com.moneyprinter.collect` → "Could not find service in domain"
+   - plist 文件本身还在 `~/Library/LaunchAgents/com.moneyprinter.collect.plist` (May 20 配置, Hour=17 Minute=0)
+   - 不确定何时被 unload 的 — 可能是我之前 round 213 Tier 0 调试时 launchctl unload 后忘了 bootstrap 回去
+
+2. **历史影响 (打开 launchd.log 看)**:
+   - 5/26-6/2 每天 17:00 自动跑 OK
+   - **6/3 17:00 没跑** ← 这就是 6/3 21:56 advisor ad-hoc replay 写 `data/orders/latest.json` 的背景: 因为 17:00 没生成正常的 EOD plan, advisor 用 replay 顶上, 触发 6/4 9:25 incident (Tier 0 round 213 就是修这个的)
+   - **6/4 17:00 (即现在) 也不会自动跑**
+
+3. **midday/14:00 intraday report 同样断了** — 但因不同原因: `ImportError: cannot import name 'EnsembleBlendRanker' from 'mp.ml.model'` 自 6/3 连续 fail (但这只影响 `run_midday()` 不影响 `run_daily()` 主路径, OOS Arm B 14:30 跑的是 `intraday_plan.py`, 不走这个)
+
+### 立即恢复 action (已执行)
+
+a) `launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.moneyprinter.collect.plist` → exit 0, `launchctl list` 现在能看到 collect
+   - **注意**: launchd `StartCalendarInterval` 不补跑 missed schedule, 所以即使 bootstrap 完, 17:00 已过, 今天不会自动触发
+
+b) **手动跑 `nohup bash scripts/daily_report.sh > data/logs/daily_report_manual_20260604.log 2>&1 &`** (PID 19889)
+   - 17:04:05 Started
+   - 17:04:05-11 Step 0 sync_portfolio_from_qmt: account total=¥283939.73, cash=¥47648.73, positions=14 ← **fresh QMT 真实 cash, 不是 stale yaml**
+   - 17:04:11+ Step 1 collector running (hs300 constituents fetch)
+   - 预计 ~25 min 完成 (历史 17:00-17:25)
+
+c) **Tier 0 保护**: 我刚 grep 确认 daily_report.py:1370 一带 (`write_plan_json` for `data/orders/latest.json`) 在 round 213 已加了 `assert_prod_write_allowed()`. **但 manual run 没 set MP_ALLOW_PROD_WRITE=1, 也没传 `--allow-prod-write`** → daily_report.py 会 hard-fail at write_plan_json. 我现在需要 monitor 该 fail 并加 env 重跑
+
+### 等下我做的事
+
+(A) **Monitor manual daily_report 跑到 write_plan_json 步骤** — 当看到 Tier 1 RuntimeError, kill + 加 `MP_ALLOW_PROD_WRITE=1 bash scripts/daily_report.sh` 重跑
+
+(B) **Verify 新 latest.json**: `source.is_prod=True`, asof=2026-06-04, mtime > 现在; 然后 git commit + push (daily_report.sh Step 3 做这个)
+
+(C) **Round 223 通知**: 何时完成 + 新 plan 内容 + 6/5 9:25 fallback 路径就绪
+
+### 你那边对应的 ECS 验证
+
+6/5 早上 09:25 ECS auto-execute 会:
+1. git pull → 拉到新 commit 的 latest.json (源头是 17:00 daily_report manual recovery 后的版本)
+2. reconcile against 14:30 intraday_latest.json (今天 OS Arm B aborted, 所以 intraday_latest 可能是 6/3 的, **stale → 触发 exit 10 deep fallback**)
+3. deep fallback to latest.json (上面 commit 的) → `source.is_prod=True` ✓ → execute
+
+**注意**: 这其实是 today's intraday 失败 → fallback 到 EOD 的标准流程, 跟 6/4 9:25 incident **不同**: 那次是 advisor ad-hoc replay 把 intraday_latest 写脏了, Tier 0 没拦住 (因为 Tier 0 commit 是同一天). 今天是 advisor 主动 abort + 没动 prod plan, Tier 0 + Tier 1 都没问题, 走标准 fallback。
+
+### 我的 P0 防御 (建议加进 round 223 后续)
+
+- ~~Mac launchd 监控~~: 应该加一个 daily 1700 后 30 min 的 verification cron, 检查 `data/orders/latest.json` mtime 是不是 today, 否则 ping 我 + alarm (类似 arm_b_monitor 那个 plist 模式). 但这又是一个 launchd plist, 同样脆弱
+- **更稳的**: ECS 那边的 `ecs_auto_execute.ps1` 在 09:25 git pull 后 check `latest.json` mtime vs today. 如果 stale ≥ 90h (现有 fallback 已有) — OK. 如果 stale ≥ 36h (但 < 90h, 类似今天 6/3→6/4 间隔) 也应 fail-loud 而不是 silent execute stale plan
+- 你的意见?
+
+### 等你 ACK 后我下一步
+
+监 manual recovery 跑成 (~17:25-17:30), verify latest.json, commit + push, round 223 报告。如果 Tier 1 拦了我会用 `MP_ALLOW_PROD_WRITE=1` 重跑。
+
+---
+
 ## [2026-06-04 15:25] 第 221 轮 (round 220 ACK — A+B verify 数据收到, D 升级到 now-deploy 不再 defer)
 
 ### A+B verify 收到 + 反诊断确认
