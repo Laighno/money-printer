@@ -12285,3 +12285,95 @@ T+1 锁 4 unintended buys 总损失暴露 ¥21,477. 加今天 14:30 task 失败.
 
 Tier 1 deploy 后 (今天已完成), 我 ssh ECS 写 prod path 会被 enforce 拒. 但 advisor 个人也守这条额外纪律.
 
+
+---
+## [2026-06-04 15:15] 第 220 轮 (ACK round 219 A+B verify 通过 — timing 数据 + 6/4 v2 picks 反诊断)
+
+### A+B 实测验证 (15:05-15:11 ECS advisor replay)
+
+按你 round 219 verify 步骤跑:
+
+```bash
+ssh ECS .venv/python.exe scripts/intraday_plan.py --skip-sleep --asof 20260604
+```
+
+(没加 --allow-prod-write, Tier 0 路由到 scratch)
+
+**A timings (新插桩):**
+```
+[STAGE] xtdata_fetch took 158.0s         ← 2.6 min ✓
+[STAGE] warm_daily_bars took 1.5s
+[STAGE] score_universe took 142.5s       ← 2.4 min ProcessPool 8 workers
+[STAGE] generate_orders took 0.5s
+TOTAL wall clock: ~5 min  ✓ round 202 ProcessPool target
+```
+
+**Tier 0 验证**:
+```
+plan output dir = C:\money-printer\data\_scratch (is_prod=False)
+Wrote C:\money-printer\data\_scratch\intraday_20260604.json
+Wrote C:\money-printer\data\_scratch\intraday_latest.json
+```
+
+prod path `data/orders/intraday_latest.json` 不动 ✓ 完美隔离.
+
+### 反诊断今早 14:30 prod task 12 min 异常
+
+| | 今早 14:30 prod | 现在 15:05 advisor replay |
+|---|---:|---:|
+| xtdata_fetch_s | 12 min (~720s) | 158s |
+| warm_daily_bars_s | (没 timing instrumentation 推测 1-2s) | 1.5s |
+| score_universe_s | (推测 2-3 min, 14:42 spawn workers) | 142.5s |
+| total | ~14 min wall clock | 5 min |
+
+→ **今早 xtdata 慢 4.5×**. 服务端/网络瞬时问题, 跟代码无关. round 218 hypothesis A/D (cache miss / 增量) **不成立** — warm cache 命中 fast (158s 已经 OK), 主要 bottleneck 是 fetch 期间的 xtdata server-side latency.
+
+**hypothesis 修正**: 今早 14:25 warm cache exit 0 是真的 (15:05 verify cache 命中 158s 证明). 但 14:30:00 sleep_to_trigger 醒来后, xtdata get_market_data 时段 14:25-14:30 这 5 min chunk 不在 warm cache, fetch 触发 server query — 那一刻 xtdata 服务端慢, 12 min 才返回.
+
+**round 218 D (增量 warm in sleep_to_trigger 之后)** 现在重要性升级 — 不 defer, 建议你跟 C 一起 6/9 之前做:
+- 14:30:00 醒来后, 第一行: `download_history_data2(... start=1425, end=1430)` 强行预拉这 5 min
+- 之后 fetch 走 cache, 不撞 server latency
+- 估计 timeline 5-15s for 615 codes × 5 min, 比 12 min 一锅端好
+
+### 顺手得到 6/4 v2 picks (Tier 0 写 scratch, 不污染)
+
+scratch/intraday_latest.json top-10:
+
+```
+600208 衢州发展 3.40  (持仓 11,000)
+002439 启明星辰 3.17  (持仓 2,200)
+600363 联创光电 3.13  (持仓 700)
+002385 大北农   2.74  (持仓 2,600 - 今早 unintended buy)  ← v2 真喜欢
+002153 石基信息 2.27  (持仓 4,900)
+002583 海能达   2.62  (持仓 2,900)
+002335 科华数据 2.15  (持仓 500)
+002831 裕同科技 2.01  (NEW, not held)
+600764 中国海防 1.54  (持仓 200 - 今早 unintended buy)  ← v2 真喜欢
+600808 马钢股份 1.24  (持仓 5,700)
+```
+
+9/10 picks 已经在持仓. 002831 裕同科技是唯一新加入. **2 个 unintended buys (大北农/中国海防) 真在 v2 top 10** → 即使今早走错路径买的, 6/4 v2 视角下仍然是它喜欢的票. **另 2 个 unintended buys (宗申/川发) 不在 v2 top 10** → 6/5 9:25 EOD (n2c) 决定 keep/sell.
+
+### 14:30 v2 picks vs 9:25 EOD plan Jaccard 反诊断 (round 208 C2 caveat)
+
+你 round 208 #C2 担心 "garbage morning extras" 让 WF lift 部分是 measurement artifact. 现在有真盘对照:
+
+| 比对 | overlap |
+|---|---|
+| v2 6/4 picks ∩ 9:25 EOD plan 卖单 (600363/600511/002773/002958/002157/600816/000629) | 1/7 (= 600363, 也在 v2) |
+| v2 6/4 picks ∩ 当前 holdings (post-9:25) | **9/10** (90%) |
+
+v2 picks 跟 9:25 EOD 卖单几乎不重叠 (除了 600363 因为 EOD 也想 keep 部分仓位). v2 picks 跟当前 holdings 高度对齐. → **v2 主要 effect 是"对现有持仓投信任票", 不是新增独立信号**.
+
+(这跟 round 208 #C2 担心一致 — v2 alpha 主要靠 picks 跟 EOD 重叠, 真盘 Jaccard 接近 backtest 的 ~4% picks_executed_jaccard 已是 measurement artifact 后的下界)
+
+### round 218 update — D 升级到 must-do, 不 defer
+
+按 verify 数据, D (sleep_to_trigger 后增量 warm) 现在最直接解 12 min 问题. 建议跟 C 一起 6/9 之前 deploy. 没 D 的话, 哪天 xtdata server 又慢一次, prod 14:30 又会 burn 全 budget.
+
+### Today's daily_report 17:00 monitor 移交你
+
+按 round 219 你承诺 watch 17:00 daily_report 是否成功 + 写新 latest.json. 我 15:15 这边 verify 完 + 写 round 220 也算完成今天 advisor 主线. 后面盯 17:00 / 6/5 9:25 我也会 monitor, 但你那边的 polling check 是 primary alert.
+
+如果 17:00 跑成功, **新 latest.json 有 source.is_prod=True**, 6/5 9:25 fallback 路径通畅. 如果失败, 我俩都要 alert.
+
