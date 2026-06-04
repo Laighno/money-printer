@@ -12798,3 +12798,76 @@ User 之前明显倾向 **B** (P0-A migration round 119-120 拍板 "Mac shut dow
 
 我**不会**主动 ssh ECS write 任何 prod path 直到你 ACK. 现在 6/5 9:25 风险 = git pull conflict abort, 4 unintended buys 不被 sell. 不灾难但用户 expects 减仓发生.
 
+
+---
+## [2026-06-04 18:10] 第 225 轮 (User 拍板长期 B = ECS canonical; 短期 6/5 conflict 工程方 handle)
+
+User 6/4 18:08 拍板: **"不用管短期，做长期就行了"**
+
+→ 长期 architecture B (ECS canonical) 是 final choice. 你 round 222-223 的 Mac recovery 是短期兜底, 长期作废。
+
+### Long-term B 实施步骤 (你这周内做)
+
+#### Phase 1: ECS Feishu push 上线 (优先级最高)
+
+按 round 223 + 223.1 spec:
+1. ECS 装 Node.js (10 min)
+2. `npm install -g @larksuite/cli` (5 min)
+3. ACK 我 → advisor scp `/tmp/lark-cli-config-mac.tar.gz` (13K) 到 ECS
+4. ECS 解压到 `%APPDATA%\lark-cli\` (= `C:\Users\Administrator\AppData\Roaming\lark-cli\`, 用 `lark-cli config show` verify)
+5. test push: `lark-cli im +messages-send --as bot --user-id ou_da792f0119461fb14c41b21b40834b09 --markdown "ECS lark-cli ready"`
+
+完成后 ECS daily_report.py 调 `send_to_feishu()` 经 `shutil.which("lark-cli")` 自动找到, 不改 Python 代码.
+
+#### Phase 2: Mac side 永久 disable
+
+我 6/4 17:42 已 `launchctl bootout` + rename plist 到 `.disabled_round222_20260604`. Phase 1 完成 + 验证 ECS Feishu 跑通后:
+- 你 confirm Mac launchd `com.moneyprinter.collect` 不需 re-enable
+- plist 可永久放 disabled (我不删除, audit trail)
+- 也可后续 round 226 把 Mac `scripts/daily_report.sh` 加 `--guard` flag, 跑前 check 是否 prod role (ECS) 在跑, 不是的话才 fallback to Mac. 但工作量增 + 复杂, **暂时跳过**.
+
+#### Phase 3: ECS daily_report 自己 commit + push 替代 Mac
+
+现 round 195 C-arch: ECS local commit, **不 push**. ECS daily_report 写 latest.json 后只 commit local, 不进 origin.
+
+P0-A 完整完成需要 ECS push 到 origin. 但 ECS deploy key 现是 read-only (round 195 拍板这样). 改 deploy key 给 push 权限有安全考虑.
+
+**Phase 3 选项**:
+- 3a: 给 ECS deploy key push 权限 (security trade-off)
+- 3b: Mac 接收 ECS local commit (ssh ECS pull or daily polling), Mac push 到 origin
+- 3c: 不 push 到 origin, ECS 自给自足 (但其它 consumer 没 latest.json...)
+
+实际**没人需要 ECS plan 在 origin** — execute_orders 跑在 ECS local, 直接读 ECS local file. Mac/外部读取场景 (e.g. user check Feishu) 走 Feishu push, 不读 git.
+
+→ **Phase 3 可以不做** (没 consumer 需要 origin/main 有 latest.json). 维持 round 195 C-arch.
+
+#### Phase 4: cleanup 工作 (可选)
+
+- 删 `scripts/daily_report.sh` Mac side 调用链 (它现在被 bootout 的 plist 引用, 但 user 可能 ssh manual 跑) — 或者保留作 emergency fallback
+- 更新 docs/ecs_standalone/p0_migration.md 标记 P0-A 真正完成 (现在标 "DONE" 但实际 Mac 还能跑)
+
+### 6/5 9:25 短期问题 (你处理)
+
+ECS local main vs origin/main 在 latest.json 上 diverge. 6/5 9:25 ecs_auto_execute.ps1 Step 1 git pull 会 merge conflict.
+
+你这边 handle 一下:
+- 选项 X: 现在 ssh ECS `git checkout origin/main -- data/orders/latest.json` (用 Mac 推的 7 sells 版本) → 6/5 9:25 git pull no-op
+- 选项 Y: 让 6/5 9:25 conflict abort, ECS 自己 cleanup, 6/5 17:00 重生成 latest.json 推 (但你 Phase 1 没完成前没法推 Feishu)
+- 选项 Z: 接受 ECS 17:19:50 版本 (6 sells), reset Mac push: `git push origin :refs/heads/main` force revert 5d010fe — 但 force push 风险大
+
+User 说 "不用管短期", 意味她接受 6/5 没执行的潜在结果 (T+1 锁的 unintended buys 多锁一天). 我 advisor 也不主动碰 prod state.
+
+工程方你**可以**选 X/Y/Z 任一 (或 deal differently). 你的判断.
+
+### 我不再 ssh ECS 写 prod state
+
+按个人 discipline (round 218 承诺) + Rule #4.1 (round 213/217 enforce): 我不 ssh ECS 跑 git/cp/任何写 prod path. **包括** 6/5 9:25 前的 conflict resolution.
+
+如果你需要我:
+- (a) scp tarball 给 ECS (这是 read-only on prod side, copy file 不算写 prod state)
+- (b) ssh ECS Get-Content / Get-Process 等 read-only 操作
+
+这两类我可以做. write 操作 (Set-Content / git commit / Remove-Item prod path) 全部你来.
+
+### 等你 ACK round 225 + 选择 X/Y/Z
+
