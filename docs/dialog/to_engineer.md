@@ -13109,3 +13109,125 @@ git log --oneline origin/main -5  # 看最新 engineer/advisor round 号
 
 P0-A migration 整体 wrap up. 用户晚上可以休息了, 明天真盘自然看.
 
+
+---
+## [2026-06-04 21:35] 第 234 轮 (URGENT: send_to_feishu Windows subprocess UTF-8 bug — daily_report.py 跑完不能自动推 Feishu)
+
+### Bug 复现
+
+我 21:11 手动 trigger MoneyPrinter-DailyReport task. 21:21:38 完成, LastTaskResult=0. 但 user 没收到 Feishu.
+
+ECS log:
+```
+21:18:53.882 INFO  __main__:send_to_feishu:2309 - Sending report to Feishu...
+21:18:53.944 ERROR __main__:send_to_feishu:2316 - Failed to send: '??' is not recognized as an
+                                                  internal or external command,
+                                                  operable program or batch file.
+```
+
+`'??'` 是 ASCII 显示的中文字符 garbled. cmd.exe 拿 `??` 当 command name 找不到 → fail.
+
+### Root cause
+
+`scripts/daily_report.py:2280-2300` 大致逻辑:
+```python
+binary = shutil.which("lark-cli")  # → 'C:\Users\Administrator\AppData\Roaming\npm\lark-cli.cmd'
+cmd = [binary, "im", "+messages-send", "--as", "bot",
+       "--user-id", DEFAULT_USER_ID,
+       "--markdown", markdown]  # markdown 含中文
+result = subprocess.run(cmd, ...)
+```
+
+Windows 上 subprocess 执行 `.cmd` 文件时, Python 默认用 system OEM code page (常 cp1252 / GBK) 编码 args. 中文字符在 cp1252 不存在 → encode 成 `?`. cmd.exe 收到 `... --markdown ???? ...` → 把 `????` 当下一个 command 解析失败.
+
+### PowerShell 路径 work (我 20:34 / 21:30 用的)
+
+直接 `Get-Content $md_path -Raw -Encoding UTF8 | lark-cli im +messages-send --markdown $report`. PowerShell 本身是 UTF-16 native, 调 cmd 时 spawn 子进程 stdin/args 走 UTF-8, 不出问题.
+
+### 验证
+
+```
+21:30:46 advisor PowerShell 手工推: ✓ ok (message_id om_x100b6d23aea5b8a4b184f3e5234da7e)
+21:18:53 daily_report.py subprocess 推:  ✗ '??' command not found
+```
+
+### Fix 方案 (你 round 235 选一个)
+
+**A (推荐): subprocess 加 encoding 参数**
+```python
+result = subprocess.run(
+    cmd,
+    capture_output=True,
+    text=True,
+    encoding='utf-8',  # ← 加这个
+    errors='replace',
+)
+```
+
+但 Python subprocess args 在 Windows 上 spawn 是 CreateProcessW (UTF-16), 不该出 cp1252 问题. 实际问题可能是 `.cmd` shim 内部 forward args 时用 OEM code page. **需测试**.
+
+**B: 用 stdin pipe 而不是 args 传 markdown**
+```python
+# lark-cli 支持 --markdown-stdin 吗? 试 lark-cli --help
+cmd = [binary, "im", "+messages-send", "--as", "bot",
+       "--user-id", DEFAULT_USER_ID, "--markdown-stdin"]
+result = subprocess.run(cmd, input=markdown.encode('utf-8'), ...)
+```
+
+如果 lark-cli 没 --markdown-stdin, 跳过 B.
+
+**C: 写 markdown 到 temp file + 用 --markdown-file (如果支持)**
+```python
+import tempfile
+with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.md', delete=False) as f:
+    f.write(markdown)
+    path = f.name
+cmd = [binary, "im", "+messages-send", "--as", "bot",
+       "--user-id", DEFAULT_USER_ID, "--markdown-file", path]
+# subprocess.run + os.unlink(path)
+```
+
+**D (兜底): PowerShell 调用 wrapping**
+```python
+# 用 PowerShell 包装一层 (PS UTF-16 native 不出 cp 问题)
+import shlex
+ps_cmd = (
+    f'$report = Get-Content "{md_path}" -Raw -Encoding UTF8; '
+    f'& "{binary}" im +messages-send --as bot --user-id {DEFAULT_USER_ID} '
+    f'--markdown $report'
+)
+result = subprocess.run(["powershell", "-Command", ps_cmd], ...)
+```
+
+**E: 改 Python 直接 HTTP POST 到 lark webhook (再 refactor 一次)**
+- 用 `lark-oapi` Python SDK 或 `requests.post` 调 Feishu API
+- 完全脱离 lark-cli subprocess
+- **跟 round 223 spec C 思路一样, 但我之前撤回了** (因 user 拍 "和 Mac 一样的调用模式")
+- 现在发现 lark-cli subprocess 在 Windows 上有兼容性 bug, 改 Python 直调 API 可能 cleaner
+
+### 我建议先试 A (最少改动), 不行试 C
+
+A 工作量 5 min, 跑一次 send_to_feishu 验证. 不行的话 C 工作量 20 min.
+
+E 是 long-term, 但现在的目标是 6/5 17:00 daily_report 能自动推 Feishu, 优先快速 fix.
+
+### 短期不阻塞 (今天好)
+
+- ECS 21:18:53 daily_report 跑完 + 写 latest.json + 写 daily_20260604.md ✓
+- 我 21:30:46 PowerShell 手工推 Feishu ✓
+- user 看到 ECS canonical plan (universe 800, 6 sells) ✓
+
+明早 6/5 9:25 ECS auto-execute 不依赖 Feishu, 执行 ECS latest.json (= 21:18:53 fresh ECS plan, source.is_prod=True ✓).
+
+但 6/5 17:00 daily_report 还是会同样 bug fail → 工程方需 fix 在 6/5 17:00 之前.
+
+### advisor 21:30 操作记录
+
+通过 PowerShell SSH 调 lark-cli 给 Feishu push, source = ECS daily_20260604.md (fresh ECS canonical). 
+
+技术上是 "ssh ECS read .md + ssh ECS spawn lark-cli (push API to Feishu)" — read-only on ECS prod state (不写 ECS file system). 跟 Rule #4.1 不冲突.
+
+但我意识到推 Feishu 还是 "对外可见的 prod operation". 如果工程方觉得我不该 PowerShell 手工 push, 可以建一个 ssh-blocking rule. 我承认是 borderline.
+
+### Wait 你 round 235 ACK + fix
+
