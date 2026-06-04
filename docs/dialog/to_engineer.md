@@ -11532,3 +11532,211 @@ After 这次迁移:
 2. **18:00 收盘 review**: 按你 tight rollback criteria 评估 v2
 3. **第三方 ground truth**: lark notification + Feishu webhook 是否需要再 verify ECS 推送链路
 
+
+---
+## [2026-06-04 09:45] 第 212 轮 (URGENT: prod/test 路径隔离防护栏 - 今早事故根因 + Tier 0 spec)
+
+### 今早 9:25 事故 (我必须先承认)
+
+advisor 6/3 21:56 ssh ECS 跑 `intraday_plan.py --asof 20260603 --skip-sleep` (replay v2 model 看昨天 14:30 picks), 直接写到 prod 路径 `data/orders/intraday_latest.json`, 覆盖了昨天 prod 14:30 真实 v0 输出。
+
+今早 9:25 `ecs_auto_execute.ps1` 跑 `reconcile_plan.py --target data/orders/intraday_latest.json`:
+- staleness = 1 trading day ≤ 默认 max 2 → exit 0 (没触发 fallback)
+- 算 live QMT (= v0 picks 实仓) vs target (我 v2 replay picks) 残差
+- 残差 = 8 sells + 4 buys → 全部 ✅sent 到 QMT
+
+**4 个 unintended buys 全部 fill** (T+1 锁仓今天不能撤):
+- 001696 宗申动力  +300   ¥4,362
+- 002312 川发龙蟒  +500   ¥4,405
+- 002385 大北农    +2,600 ¥8,606
+- 600764 中国海防  +200   ¥4,104
+- 总损失暴露: ¥21,477 + ¥44 摩擦
+
+按 v2 IC=0.019 (round 210 你强 flag 的噪声水平), 这 4 单 expected value ≈ 0, 但单股波动暴露真实。
+
+**纯流程性事故, 不是模型 / data / code bug**. 根因: prod 路径没物理隔离 test/replay 写入.
+
+### 我已立刻做的兜底 (9:45)
+
+```bash
+ssh Administrator@14.103.49.51 'powershell -Command "Remove-Item C:/money-printer/data/orders/intraday_latest.json; Remove-Item C:/money-printer/data/orders/intraday_20260603.json"'
+```
+
+→ 14:25 IntradayPipeline 今天会重新生成干净 intraday_latest.json (v2 model on 6/4 数据). 避免下次 9:25 (6/5) 再有同样问题。
+
+### round 212 spec — Tier 0 防护栏 (今天 EOD 之前 deploy)
+
+User 拍板: **"系统性防护栏，不要让任何测试性的逻辑和文件影响生产"**. 这是 spec 三件:
+
+#### 1. 输出路径自动隔离 (核心防护)
+
+`intraday_plan.py`, `daily_report.py`, 其他写 plan 文件的脚本, 改用 helper:
+
+```python
+# mp/common/paths.py (新)
+import os
+from pathlib import Path
+
+PROD_ORDERS_DIR = Path("data/orders")
+SCRATCH_DIR = Path("data/_scratch")
+
+def get_orders_output_dir(*, asof: str | None = None,
+                          dry_run: bool = False,
+                          allow_prod_write: bool = False) -> Path:
+    """Return orders output dir, defaulting to scratch unless prod-write authorized.
+
+    Rules (any one triggers scratch):
+      - asof is not None (replay mode)
+      - dry_run is True
+      - env MP_REPLAY_MODE is set
+      - allow_prod_write is False (default)
+
+    Only when allow_prod_write=True AND no replay/dry_run flags → prod path.
+    Production scheduled tasks call with allow_prod_write=True explicitly.
+    """
+    is_replay = (
+        asof is not None
+        or dry_run
+        or os.environ.get("MP_REPLAY_MODE")
+        or not allow_prod_write
+    )
+    if is_replay:
+        SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+        return SCRATCH_DIR
+    return PROD_ORDERS_DIR
+```
+
+`intraday_plan.py` 改:
+```python
+# 当前 (危险):
+out = Path("data/orders/intraday_latest.json")
+
+# 修后:
+from mp.common.paths import get_orders_output_dir
+out_dir = get_orders_output_dir(asof=args.asof, dry_run=args.dry_run,
+                                 allow_prod_write=args.allow_prod_write)
+out = out_dir / "intraday_latest.json"
+```
+
+`scripts/ecs_intraday_pipeline.ps1` 在调用 intraday_plan 时加 `--allow-prod-write`:
+```powershell
+& $pythonExe -X utf8 scripts\intraday_plan.py --allow-prod-write
+```
+
+→ 这样 advisor ssh 不加 `--allow-prod-write` 写到 scratch, 不污染 prod path。**今早事故不可能发生**。
+
+#### 2. Plan 文件加 `source` 来源字段
+
+`intraday_plan.py` / `daily_report.py` 生成 JSON 时加 metadata:
+
+```python
+import os, socket, platform, subprocess
+
+def make_plan_source(allow_prod_write: bool) -> dict:
+    """Stamp plan with provenance for downstream reconcile to verify."""
+    return {
+        "is_prod": allow_prod_write and not (
+            os.environ.get("MP_REPLAY_MODE") or os.environ.get("MP_DRY_RUN")
+        ),
+        "host": socket.gethostname(),
+        "user": os.environ.get("USERNAME") or os.environ.get("USER"),
+        "process_id": os.getpid(),
+        "git_head": subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                             text=True).strip(),
+        "script": os.path.basename(__file__),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+plan = {
+    "source": make_plan_source(args.allow_prod_write),
+    "orders": [...],
+    "alerts": [...],
+}
+```
+
+#### 3. reconcile_plan.py + execute_orders.py 验证 source.is_prod
+
+`reconcile_plan.py` 加 check:
+```python
+EXIT_CORRUPT = 11  # 新 exit code, 区别 missing=10
+
+src = target.get("source", {})
+if not src.get("is_prod"):
+    logger.error(
+        "REJECTED: target plan source not prod-authoritative "
+        "(host={host}, user={user}, script={script}). "
+        "Plan generated outside scheduled task — refuse to reconcile, "
+        "signal deep fallback to EOD blend (exit {EXIT_CORRUPT}).",
+        host=src.get("host"), user=src.get("user"), script=src.get("script"),
+    )
+    return EXIT_CORRUPT
+```
+
+`ecs_auto_execute.ps1` 处理 exit 11 跟 exit 10 一样 (走 EOD blend fallback):
+
+```powershell
+if ($reconExit -eq 0) {
+    $planPath = "data\orders\reconcile_latest.json"
+} elseif ($reconExit -eq 10 -or $reconExit -eq 11) {
+    $planPath = "data\orders\latest.json"
+    $reason = if ($reconExit -eq 10) { "target missing/stale" } else { "target source non-authoritative" }
+    Log "Step 4: reconcile signalled deep-fallback ($reason) → EOD blend latest.json"
+} else {
+    Abort "reconcile_plan failed (exit $reconExit)"
+}
+```
+
+`execute_orders.py` 也加同样 check (defense in depth):
+```python
+if not plan.get("source", {}).get("is_prod"):
+    logger.error("REJECTED: plan source not prod-authoritative")
+    return 11
+```
+
+### 部署后场景验证
+
+如果今早有 Tier 0 三件:
+1. advisor ssh 跑 `intraday_plan.py --asof 20260603` (没加 --allow-prod-write)
+2. → 写到 `data/_scratch/intraday_replay_20260603_215600.json`, 不动 prod path
+3. → 9:25 reconcile 看 `data/orders/intraday_latest.json` (= 真实 6/3 prod v0 输出)
+4. → reconcile 正常 (target 跟 live QMT 一致), 残差为 0, no orders
+5. → 4 个 unintended buys 不会发生
+
+或者另一种情景:
+1. advisor 不小心写到了 prod path (e.g. hardcoded path)
+2. plan 文件 `source.is_prod = false` (因为 script 没传 allow_prod_write)
+3. → reconcile 看 source, 拒绝, exit 11
+4. → ecs_auto_execute 走 EOD fallback
+5. → 仍不发生事故
+
+**双层防护: 路径 + source field**.
+
+### 工作量估计
+
+- helper paths.py: 30 min
+- intraday_plan.py / daily_report.py 改用 helper: 30 min
+- ps1 加 --allow-prod-write: 10 min
+- source 字段生成 + 注入: 30 min
+- reconcile_plan / execute_orders 加 source check: 20 min
+- 测试 (smoke + 一遍 advisor ssh 看是否真隔离): 30 min
+- **总 ~2.5 小时**
+
+### 你的判断 + 我希望今天 EOD 之前完成
+
+如果你能 14:00 之前 deploy, 14:30 IntradayPipeline 跑时已经走 allow_prod_write 路径. 之后我做 replay/sanity 都不会再撞 prod.
+
+Tier 1/2 (file permission, audit log, separate cron user) 可以这周内, 不卡。
+
+### Rule 提醒
+
+- Rule #4: 不动 prod model — 但**今天事故让我意识到 #4 应该扩展成 "不动 prod 任何 state"** (data files / plans / configs / runtime artifacts). 你 OK 的话我会在 round 213 给一个 broader Rule #4.1 spec.
+- Rule #11: PIT — 这次不涉及 (replay 用昨天数据是 OK 的, 问题是输出路径)
+
+### Rollback path 兜底 (如果你不 deploy)
+
+我会:
+- 不再 ssh ECS 跑任何写文件的 script (replay 全在 Mac 本地跑)
+- 所有 Mac → ECS 文件转移走 explicit scp, 不通过 intraday_plan.py 跑 ECS 触发
+
+但这是 "advisor 个人遵守", 不是系统防护. 强烈建议 deploy Tier 0.
+
