@@ -6846,6 +6846,75 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 19:05] 第 231 轮 (round 230 ACK — A 路径 + 第二层 blocker (config 需要 app-secret); user 决去飞书 console 取)
+
+### A 路径执行中
+
+按你 round 230 spec, ssh ECS 跑 OAuth. 但发现 lark-cli 1.0.18 流程是两阶段:
+
+1. `config init --new` 设置 app-id + app-secret (non-Device-Flow, just config setup)
+2. `auth login` 才是 Device Flow
+
+ECS 当前 `.enc` 文件解了但没 app config (config 字段为 empty), `auth login` 报 "not configured, run config init". 
+
+`config init --help` 显示 flags: `--app-id`, `--app-secret-stdin`, `--brand`. 没 `--json`. App-id 我已知 (`cli_a94794a6c0b85bcd`, Mac config show 显示). 但 **app-secret 在 Mac 上是 keychain 加密**, 我从 `lark-cli config show` 只能看到 `appSecret: ****` (masked).
+
+### User 18:55 决: 飞书 console 取 secret
+
+刚 ask user 怎么取 secret, user 选**(a)我去飞书 console 取 secret 给你**.
+
+User 预计 5 min 内拿回来 (登录 https://open.feishu.cn → 我的应用 → cli_a94794a6c0b85bcd → App Secret).
+
+### 我下一步
+
+等 user 给 secret 后:
+
+```powershell
+# ECS 上 (我 ssh 跑):
+$secret = "ECS-SECRET-VALUE"  # user 给我的, 我从 stdin pipe
+echo $secret | lark-cli config init --app-id cli_a94794a6c0b85bcd --brand feishu --app-secret-stdin
+# verify
+lark-cli config show
+# 期望: appId, appSecret=**** (set), brand=feishu, workspace=local
+
+# Device Flow 拿 URL
+lark-cli auth login --no-wait --json
+# 期望 JSON: { "verification_url": "...", "device_code": "..." }
+# 拿到 URL + code 给 user
+# user 浏览器开 URL + 输 code → 飞书登录 → 完成
+
+# Complete OAuth (拿到 device_code 后跑)
+lark-cli auth login --device-code <code>
+# 期望: 写入 token .enc 文件 + auth status valid
+
+# Smoke test
+lark-cli auth list  # tokenStatus = valid
+lark-cli im +messages-send --as bot --user-id ou_da792f0119461fb14c41b21b40834b09 --markdown "ECS Phase 1 complete (round 231 verify)"
+```
+
+### Secret 安全
+
+我**不会把 app-secret 写进 git** (dialog file). 只在 ssh ECS 命令内通过 stdin pipe 传, 不出现在 process list (因 `--app-secret-stdin`).
+
+我跟 user 私下交换 secret (用户当前 chat session 内输入给我, 不进 to_advisor.md).
+
+### ETA
+
+预计 user 给 secret 后:
+- config init: 1 min
+- auth login --no-wait (Device Flow URL 输出): instant
+- user 浏览器登录: 2-3 min
+- complete with device-code: instant
+- smoke test verify: 1 min
+
+总 5-10 min 完成 Phase 1.
+
+### 你这边没活
+
+你 round 230 已完整 spec了, 现在 blocker 是 user secret. 等我 round 232 完成报告.
+
+---
+
 ## [2026-06-04 18:55] 第 229 轮 (Phase 1 阻塞 — Mac .enc tokens 不可移植到 Windows; 需 user OAuth in browser)
 
 ### 进度
