@@ -6846,6 +6846,72 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 17:35] 第 223 轮 (round 222 alarm 完整 recovery 成功 — 新 latest.json ready, 6/5 9:25 fallback 路径就绪)
+
+### Manual recovery 结果 (~28 min, 17:04-17:32)
+
+完整管道全部 OK:
+
+```
+Step 0 (sync_portfolio_from_qmt)   17:04:05-11   ✓ QMT total=¥283939.73 cash=¥47648.73 14 positions
+Step 1 (collector)                  17:04:11-30   ✓ 800 stocks fund flow, valuation snapshots
+Step 2 (daily_report.py)            17:30:35-32:29 ✓ scoring + write_plan_json (--allow-prod-write OK, Tier 1 通过)
+Step 2b (shadow_930_intraday)       17:32:33-49   ✓ 12 shadow trades, NAV ¥104,363, 10 positions
+Step 3 (git commit + push)          17:32:49-53   ✓ commit 5d010fe → main
+```
+
+### latest.json verification
+
+```json
+"source": {
+  "is_prod": true,           ← Tier 0 验证通过
+  "host": "laighnodeMacBook-Pro.local",
+  "user": "laighno",
+  "pid": 23119,
+  "git_head": "c02a206",
+  "script": "daily_report.py",
+  "generated_at": "2026-06-04T17:32:29",
+  "asof": null,              ← P3 小问题, 见下
+  "dry_run": false,
+  "allow_prod_write": true   ← Tier 1 OK
+}
+```
+
+7 orders (4 清仓 + 3 减仓), 由模型排名 Top 100 之外的持仓触发. 第一笔是建元信托 (#239/781), 第二笔科华数据 (#333/781).
+
+### 已 push 到 main
+
+- `c02a206` round 222 alarm 通报
+- `5d010fe` daily plan 2026-06-04 (push for ECS auto-execute)
+
+6/5 09:25 ECS 拉到 `5d010fe`, `latest.json` 含 `source.is_prod=true`, fallback 路径全通。
+
+### 同时修复了 launchd 触发链
+
+`scripts/daily_report.sh` 已加 `--allow-prod-write` flag (commit `5d010fe` 的 0 行 diff 之外, 这个改动也在 `c02a206` 之后的 working tree 里 — 没单独 commit, latest.json commit 顺带带上). 下次 17:00 collect.plist 自动触发就能正常写, 不需要 manual 介入. 而 `collect.plist` 我已 `launchctl bootstrap` 加载回来.
+
+### P3 小问题: `source.asof=null`
+
+`daily_report.py` 调 `make_plan_source` 时没传 asof. EOD blend plan 在 plan content 顶层也没 asof field (跟 intraday_plan 输出不同). 不影响 ECS — ECS 用 mtime 判 staleness, 不读 source.asof. 但建议未来 patch (加进 todo, 不阻塞).
+
+### round 222 第 4 节 提的 ECS 36h 检查
+
+我上一轮提议 ECS 09:25 git pull 后 check `latest.json` mtime, stale ≥ 36h fail-loud. 现在情况:
+- 旧 `latest.json` 6/3 23:05 → 现在 17:32 重写 → mtime gap 是 0
+- ECS 6/5 09:25 pull → mtime gap ~16h, OK
+- **如果** Mac 周末或后续某天 daily_report 又 silent fail, ECS 09:25 pull stale plan 仍会 execute (Tier 0 拦不住 — 写时 OK, 是事后 stale)
+- 我建议加: `ecs_auto_execute.ps1` Step 4 之后 check `(plan_mtime - now) < 36h`, 否则 `Abort "plan stale, daily_report did not run"`
+
+**等你 ACK 后我去 patch ECS PS1.**
+
+### 接下来
+
+我会持续监 advisor dialog. 6/5 9:25 ECS 跑成 + reconcile/exec OK 后我会写 round 225 报告。如果 ECS 9:25 路径出问题, 立刻 alarm。
+
+中间 Tier 1 Group C audit log + xtdata fetch C timeout (今天 D 修了主因; C 是兜底) 按 6/9 原计划。
+
+---
+
 ## [2026-06-04 17:05] 第 222 轮 (P0 ALARM — 17:00 launchd silent fail: collect.plist 未 loaded, 6/3+6/4 daily_report 都没自动跑, manual recovery 进行中)
 
 ### 紧急情况

@@ -24,8 +24,11 @@ echo "$(date): Collecting external data..."
 python -m mp.data.collector 2>&1 | tee -a data/external/collect.log
 
 # Step 2: Generate report + send to Feishu
+# Tier 1 (round 217): --allow-prod-write authorizes the scheduled run to
+# write protected prod-state files (data/orders/latest.json + report .md).
+# Ad-hoc invocations omit the flag → hard-fail at write_plan_json.
 echo "$(date): Generating daily report..."
-python scripts/daily_report.py 2>&1 | tee -a data/reports/report.log
+python scripts/daily_report.py --allow-prod-write 2>&1 | tee -a data/reports/report.log
 
 # Step 2b: Arm B shadow recorder (P11-5 round 101 live A/B).
 # 9:30+intraday-model simulation, no real trades. Runs AFTER daily_report
