@@ -825,8 +825,15 @@ def run(
     if asof_date is None:
         asof_date = date.today()
 
+    # Round 219: per-stage timing (advisor 218 spec A). Insurance for next time
+    # we hit a multi-minute stall — log says exactly which stage took the time,
+    # and the source.timings_s field on the plan lets reconcile/audit reconstruct.
+    timings: dict[str, float] = {}
+
     if not skip_sleep:
+        t = time.time()
         actual, aborted = sleep_to_trigger()
+        timings["sleep_to_trigger_s"] = round(time.time() - t, 1)
         if aborted:
             return 2
 
@@ -853,7 +860,10 @@ def run(
 
     codes = load_universe()
 
+    t = time.time()
     today_1m, eod_hist = fetch_today_1m_and_eod_history(codes, asof_date)
+    timings["xtdata_fetch_s"] = round(time.time() - t, 1)
+    logger.info("[STAGE] xtdata_fetch took {:.1f}s", timings["xtdata_fetch_s"])
     intraday_bars = aggregate_morning_bars(today_1m, asof_date)
     if not intraday_bars:
         logger.error("No morning bars for any code — abort (data fetch failed?)")
@@ -876,11 +886,14 @@ def run(
     try:
         warm_stats = warm_daily_bars_via_xtdata(scoring_codes, asof_date,
                                                 asof_eod=asof_eod)
-        logger.info("warm done in {:.1f}s: {}", time.time() - t_warm, warm_stats)
+        timings["warm_daily_bars_s"] = round(time.time() - t_warm, 1)
+        logger.info("warm done in {:.1f}s: {}", timings["warm_daily_bars_s"], warm_stats)
     except Exception as e:
+        timings["warm_daily_bars_s"] = round(time.time() - t_warm, 1)
         logger.warning("warm_daily_bars_via_xtdata failed ({}) — scoring will "
                        "use slow per-stock fetch path", e)
 
+    t = time.time()
     full_scored = score_universe(
         codes=scoring_codes,
         asof_date=asof_date,
@@ -888,6 +901,9 @@ def run(
         eod_history_map=eod_hist,
         asof_eod=asof_eod,
     )
+    timings["score_universe_s"] = round(time.time() - t, 1)
+    logger.info("[STAGE] score_universe took {:.1f}s (build_features + predict)",
+                timings["score_universe_s"])
 
     # Build code→price map from 14:29 morning bars so apply_top_k_filters
     # can enforce the Arm B ≤¥50 price cap (round 161 guardrail (b)).
@@ -904,9 +920,12 @@ def run(
     logger.info("Top-{}:\n{}", TOP_K,
                 top_k_df[["code", "name", "predicted_excess", "_rank"]].to_string(index=False))
 
+    t = time.time()
     orders, alerts = generate_orders(holdings, account, top_k_df, full_scored,
                                       intraday_bars=intraday_bars)
-    logger.info("Generated {} orders, {} alerts", len(orders), len(alerts))
+    timings["generate_orders_s"] = round(time.time() - t, 1)
+    logger.info("Generated {} orders, {} alerts (generate_orders {:.1f}s)",
+                len(orders), len(alerts), timings["generate_orders_s"])
 
     from mp.common.paths import get_orders_output_dir, make_plan_source
     asof_arg = asof_date.strftime("%Y%m%d") if asof_date != date.today() else None
@@ -921,6 +940,9 @@ def run(
         dry_run=False,
         script="intraday_plan.py",
     )
+    # Round 219: stamp stage timings into source for forensic reconstruct
+    source["timings_s"] = timings
+    logger.info("[STAGE] all timings: {}", timings)
     logger.info("plan output dir = {} (is_prod={})", out_dir, source["is_prod"])
     dated, latest = write_plan_json(
         asof_date=asof_date,

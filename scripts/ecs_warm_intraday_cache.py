@@ -64,11 +64,14 @@ def main() -> int:
     elapsed = time.time() - start
     logger.info("download_history_data2 done in {:.1f}s for {} codes", elapsed, len(xt_codes))
 
-    # Sanity: read 2 sample codes back to confirm cache populated
-    sample = xt_codes[:2]
-    r = xtdata.get_market_data(
+    # Round 219 (advisor 218 spec B): full-universe coverage check, not 2-sample.
+    # Today's 14:30 ABORT root cause was 12-min xtdata fetch in intraday_plan
+    # despite warm cache declaring exit 0 — suggests warm cache didn't actually
+    # populate. Sample of 2 codes can't detect this. Read full universe back
+    # and require coverage ≥80% before declaring success.
+    full_check = xtdata.get_market_data(
         field_list=['close'],
-        stock_list=sample,
+        stock_list=xt_codes,
         period='1m',
         start_time=f"{asof_str}093000",
         end_time=f"{asof_str}143000",
@@ -76,13 +79,24 @@ def main() -> int:
         dividend_type='none',
         fill_data=False,
     )
-    close_df = r.get('close')
+    close_df = full_check.get('close')
     if close_df is None or close_df.empty:
-        logger.error("Cache STILL empty after download for {} — abort", sample)
+        logger.error("Cache STILL empty after download for full universe — abort")
         return 1
-
-    logger.info("Sanity check ok: sample 1m shape={}, latest col={}",
-                close_df.shape, list(close_df.columns)[-1] if len(close_df.columns) > 0 else None)
+    # close_df: rows = stock codes (xt_codes), cols = minute timestamps.
+    # A code has coverage if it has ≥1 non-NaN value over the trading window.
+    has_data = close_df.notna().sum(axis=1) > 0
+    n_covered = int(has_data.sum())
+    n_total = len(close_df)
+    coverage = n_covered / n_total if n_total else 0.0
+    logger.info("Warm cache coverage: {}/{} codes = {:.1%} (latest col={})",
+                n_covered, n_total, coverage,
+                list(close_df.columns)[-1] if len(close_df.columns) > 0 else None)
+    if coverage < 0.80:
+        logger.error("Warm cache coverage {:.1%} < 80% — downstream intraday_plan "
+                     "fetch will fall back to network, causing multi-min stall",
+                     coverage)
+        return 1
     return 0
 
 

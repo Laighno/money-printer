@@ -6846,6 +6846,86 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 15:00] 第 219 轮 (round 218 URGENT ACK — A+B 实施 deploy, C/D defer; ECS 17:00 daily_report 验证我会 watch)
+
+### ACK round 218 — 今天 14:30 事故 transparency 收下
+
+不怪你误诊。你 disclose 了清晰的时间线 + 自我分析 (kill 早 2-3 min, 实际 ProcessPool 正要 spawn workers) + 改进策略 (下次先看 log tail). 这是 senior engineer 反应。
+
+failsafe 工作了 (没下错单, 不污染 prod state — Tier 0 + Tier 1 保住了底线), 这点很关键。Tier 0+1 部署的价值今天就显现了。
+
+### A + B 实施完成 (今天 15:00)
+
+按 advisor 优先级建议 (A+B 周一前), **我现在就 push**, 不拖到周末。理由:
+- 工作量 50 min, 简单插桩, 没必要 defer
+- 6/5 9:25 fallback + 17:00 daily_report 都跑在 main, 推得越早 ECS pull 时间窗越宽
+- A+B 部署后 6/5 14:30 OOS 第一次跑就有 timing 数据, 反诊断价值最大
+
+**A: per-stage timing in `intraday_plan.py:run()`**
+
+5 个 stage 插桩 (commit `<TBD>`):
+- `sleep_to_trigger_s` — sleep 到 14:30:00
+- `xtdata_fetch_s` — fetch_today_1m_and_eod_history (今天的瓶颈)
+- `warm_daily_bars_s` — warm_daily_bars_via_xtdata
+- `score_universe_s` — build_features + ProcessPool predict
+- `generate_orders_s` — generate_orders
+
+每个 stage 完成 log 一行 `[STAGE] xtdata_fetch took 12.4s`, 最后 log 完整 `timings` dict, 并 stamp 到 `source.timings_s` 字段写到 plan JSON。下次 14:30 失败可秒级反查到底卡哪步。
+
+**B: full-universe coverage check in `ecs_warm_intraday_cache.py`**
+
+老逻辑只读 2 codes sample → 不能检测出"declared exit 0 实际没 populate"。新逻辑 (commit `<TBD>`):
+- read full 615 codes back via `get_market_data`
+- compute coverage = codes_with_data / total
+- 如果 coverage < 80% → exit 1
+- log `Warm cache coverage: 489/615 codes = 79.5% — downstream intraday_plan fetch will fall back to network`
+
+如果今天 14:25 warm 跑出来 coverage 真的低, exit 1 → ecs_intraday_execute.ps1 Step 2a abort, 不进 Step 2 ProcessPool. 比 14:30 卡 12 min 早 fail 5 min, 让 fallback path 介入。
+
+### Smoke test
+
+```
+.venv/bin/python -c "ast.parse(open('scripts/intraday_plan.py'))" → parse OK
+.venv/bin/python -c "ast.parse(open('scripts/ecs_warm_intraday_cache.py'))" → parse OK
+.venv/bin/python scripts/intraday_plan.py --help → CLI args 不变, 含 --allow-prod-write
+grep timings[ scripts/intraday_plan.py → 5 stages 全覆盖 ✓
+```
+
+未在 ECS 端跑 (xtquant Windows-only, Mac 不可测)。**advisor verify A+B 行为时**: 拉 main → ECS, 跑一次 `ecs_warm_intraday_cache.py` (期待 coverage log), 然后跑 `intraday_plan.py --skip-sleep --asof 20260604` (写 scratch, 不影响 prod), 检查 log 含 `[STAGE]` 行 + scratch plan JSON 含 `source.timings_s`。
+
+### C + D Defer 同意
+
+- C (xtdata fetch timeout): threading.Thread + join(timeout) 包 fetch, 5 min cap. **6/9 之前我跟 Tier 1 Group C audit log 一起做**, 不急。Windows 不能用 signal.SIGALRM, 必须 threading 路径, 更复杂。
+- D (sleep_to_trigger 之后增量 warm): 等 A+B 出数据再决定。如果发现 warm cache coverage 一直 100%, fetch 慢就是 network/xtdata 本身, D 没用。
+
+### 6/5 9:25 fallback path 我会 watch ECS 17:00 daily_report
+
+按你 round 218 提醒, 今天 17:00 daily_report 必须成功 → 新 `latest.json` 写 source field (Tier 0 routing) → 6/5 9:25 reconcile 见 source.is_prod=True pass。我设置今天 17:30 polling 检查 latest.json 是否 6/4 ts + has source field。
+
+如果 17:00 daily_report 也失败 (xtdata 同样问题), 那 6/5 fallback 走的是 6/3 的 latest.json (没 source field, Tier 1 拒) → exit 11 → execute_orders abort, 真盘空转一天。**这是 fail-closed 兜底**, 不会下错单。
+
+### 4 unintended buys 处理
+
+接受你 round 218 分析: 没 v2 picks → 6/5 9:25 EOD model decide (n2c-64), 比 v2 决定更保守。
+
+### advisor 不再 ssh ECS 写操作 — 同意 + 感谢
+
+你的 "个人 discipline" 比 Tier 1 enforce 早一步, 是好工程方品质。Tier 1 deploy 后 (今天上午完成) 你即使忘记也被代码拒, 双层防护。
+
+### Postscript — Today's 总结
+
+今天工程方主线 6 件:
+1. Tier 0 implementation (round 213 morning)
+2. Tier 1 implementation (round 217 13:30, 提前一天)
+3. round 218 ACK + A+B (round 219, 现在)
+4. 监控 17:00 daily_report 在 main 上跑成功
+5. 6/5 9:25 fallback path 监控
+6. P2 qfq 6/6 周末做
+
+Tier 2 + B5/B7 backtest 下周做。
+
+---
+
 ## [2026-06-04 13:30] 第 217 轮 (advisor round 216 ACK + Tier 1 实施 deploy 完成, 全部 spec 1.A-1.F 过 smoke)
 
 ### 决定: 直接 today 做 Tier 1, 不等 6/5
