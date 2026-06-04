@@ -6846,6 +6846,76 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 18:55] 第 229 轮 (Phase 1 阻塞 — Mac .enc tokens 不可移植到 Windows; 需 user OAuth in browser)
+
+### 进度
+
+成功:
+- ECS Node.js v20.18.1 装 (MSI 静默装 OK, 因 ECS 无 winget 需 MSI 下载)
+- npm install -g @larksuite/cli@1.0.47 装 (默认 latest 装 1.0.47)
+- 你 scp 的 tarball `C:/temp/lark-cli-config-mac.tar.gz` (13K) 解到 `%APPDATA%\lark-cli\`, 4 files 都 OK
+- 怀疑 1.0.47 vs Mac 1.0.18 schema 不兼容, **downgrade** to 1.0.18 重试
+
+阻塞:
+- 即使 ECS 装跟 Mac 完全一致的 1.0.18, `lark-cli config show` 仍报 "not configured"
+- 4 个 `.enc` files 完整解压 (`appsecret_cli_a94794a6c0b85bcd.enc` 60B + `cli_a94794a6c0b85bcd_ou_...enc` 12208B + macOS resource fork 副本)
+- 但 ECS Windows 端解不出来
+
+### Root cause 推测
+
+`.enc` files 是经 **macOS Keychain wrap** 加密的. Windows 没 macOS Keychain, 无法 unwrap. 这是 cross-platform 不可移植性 — `lark-cli` config 不是简单的 plaintext token JSON, 是 platform-specific keystore wrapped.
+
+跟你 round 224-228 假设 "copy auth tokens" 是 portable 的不一致. 你 Mac tarball OK 但 ECS 解不出来。
+
+### 解决路径 (需要 user 拍板)
+
+**A. ECS 端 OAuth login (推荐)**:
+- `lark-cli auth login` (Device Flow) 在 ECS 上跑
+- 输出 URL, user 在浏览器打开 → 登录 → ECS 完成 OAuth
+- ECS 端 `.enc` 由 ECS 本地 keystore 重新 wrap
+- 不需要 Mac tokens, 完全 self-sufficient
+- **需要 user 5 min 参与**: 在 ECS 跑 → 拿到 URL → 用浏览器登录
+
+**B. 找 lark-cli source 看是否能 export raw tokens (不推荐)**:
+- 看 `node_modules/@larksuite/cli/...` 源码, 找 wrap 算法 + 是否 Mac→Windows portable 的 raw token 接口
+- 30-60 min 调查, 可能无果
+
+**C. 暂停 Phase 1, 走 Mac side Feishu push (短期 hybrid)**:
+- 6/5 evening 不装 ECS lark-cli
+- Mac 继续推 Feishu, 但 Mac launchd collect.plist 已 bootout (我现在状态)
+- 那就改 Mac 推 Feishu mode: 6/5 17:00 后 ssh ECS 拉 ECS-written latest.json → Mac local lark-cli 推
+- 不 elegant 但 unblock
+
+### 我建议 A (ECS OAuth)
+
+理由:
+- B 调查投入产出比差
+- C 是 hybrid 永久, 跟 user 长期 B 方向矛盾
+- A 一次 5 min user 参与, 之后永久 self-sufficient
+
+### Action item 等 user 决定
+
+如果选 A:
+- user 决定 5 min 的 OAuth login 啥时跑
+- 我 ssh ECS 跑 `lark-cli auth login`, 拿 URL 给 user (可能需要 SSH backed by interactive terminal, 或我 powershell capture URL output)
+- user 浏览器开 URL 登录
+- 我 verify `lark-cli config show` OK + smoke test push 一条 Feishu
+
+如果选 B/C 给 spec, 我执行。
+
+### 短期影响 (6/5 9:25 不受影响)
+
+- 6/5 9:25 ECS execute: 跟 Phase 1 无关, 继续按选项 X 走 (latest.json 已 align, reconcile 后 fallback execute Mac plan)
+- 6/5 17:00 ECS daily_report: 跑 + 写 plan, 但**不能推 Feishu** (因为 lark-cli 没 config)
+- user 看不到 17:00 Feishu push, 需 manual check ECS log 或 git log
+- 7/5+ 装好 Phase 1 后恢复
+
+### 等 advisor + user
+
+我在 1 min polling 等回复 + 监控 6/5 9:25 ECS execute. ECS lark-cli 现在 config not configured but binary 装好 (lark-cli --version OK). 等 user 决定方向。
+
+---
+
 ## [2026-06-04 18:40] 第 227 轮 (选项 X 完成 — ECS git reset --hard origin/main, 6/5 9:25 fallback 路径就绪)
 
 ### ssh ECS 执行结果
