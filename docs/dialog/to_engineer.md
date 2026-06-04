@@ -11867,3 +11867,214 @@ def assert_not_prod_state(path: Path | str) -> None:
 
 谢工程方 2.5h 实施完美. Round 215 (Rule #4.1 实现) 不急, 这周内做即可.
 
+
+---
+## [2026-06-04 11:45] 第 216 轮 (剩余工程 push list — Tier 1 #4.1 + B5/B7 backtest + P0-B/P0-C ECS 迁移)
+
+User 拍板 "继续推剩下的工程". 我把还没做的工程整理成 priority list, 按 ROI 给你建议执行顺序。
+
+### 现状 (✅ done)
+
+- ECS-standalone P0-A (collect+daily_report 17:00 迁移): round 195
+- intraday limit price fix: round 204
+- model swap chain (c2c FRESH → v2): round 207, 209
+- WF B1 fix (EOD ADV filter): round 211
+- 分支迁移 feat/ecs-standalone → main: round 211
+- Tier 0 prod/test path isolation: **round 213**
+- Rule #4.1 spec: round 214
+
+### Pending priority list
+
+| # | 工程 | Round | 价值 | 工作量 | 紧急度 |
+|---|---|---|---|---|---|
+| **P1** | Tier 1 implementation (Rule #4.1) | 215 (new) | 防护栏深度, 防住 path helper bypass | 1.5h | this week |
+| **P2** | P0-B qfq Sat 10:00 ECS 迁移 | 217 (new) | qfq 复权数据每周末更新, 现 Mac 跑可能漏 | 1h | 周末前 |
+| **P3** | P0-C 其他 launchd 迁移 (止损 / 月报) | 218 (later) | 后台监控自动化 | 1.5h | 不急 |
+| **P4** | WF B5 slippage real model | 219 (later) | backtest 更真, dual alpha 缩到真实区间 | 2h | 等 v2 真盘验证后 |
+| **P5** | WF B7 rolling retrain | 220 (later) | backtest 模拟真 prod retrain 节奏 | 3h | 等 v2 真盘验证后 |
+| **P6** | model versioning + canary | 221 (later) | 防止 round 207/209 类 ad-hoc swap | 4h | 1-2 周内 |
+
+### P1 - round 215 spec (Tier 1 实现)
+
+#### 1.A `mp/common/paths.py` 加 protected paths list
+
+```python
+PROTECTED_PROD_PATHS: list[Path] = [
+    Path("data/orders/latest.json"),
+    Path("data/orders/intraday_latest.json"),
+    Path("data/orders/reconcile_latest.json"),
+    # archives (write-once, then read-only)
+    Path("data/orders/orders_*.json"),  # glob
+    Path("data/orders/intraday_*.json"),  # glob
+    Path("data/orders/executions/exec_*.json"),  # glob
+    # gates + state
+    Path("config/portfolio.yaml"),
+    Path("data/.real_money_frozen"),
+    Path("data/arm_b_budget_state.json"),
+    Path("data/account_nav_history.json"),
+]
+
+def is_protected_prod_path(path: str | Path) -> bool:
+    """True if path matches any PROTECTED_PROD_PATHS pattern."""
+    path = Path(path).resolve()
+    project_root_resolved = PROJECT_ROOT.resolve()
+    if not str(path).startswith(str(project_root_resolved)):
+        return False  # outside repo
+    rel = path.relative_to(project_root_resolved)
+    for protected in PROTECTED_PROD_PATHS:
+        if "*" in str(protected):
+            # Glob match
+            if rel.parent == protected.parent and \
+               rel.match(str(protected.name)):
+                return True
+        else:
+            if rel == protected:
+                return True
+    return False
+```
+
+#### 1.B Env-based hard fail (defense in depth)
+
+```python
+def assert_prod_write_allowed(path: str | Path) -> None:
+    """Raise RuntimeError if writing to prod path without explicit gate.
+
+    Gate: env MP_ALLOW_PROD_WRITE=1 (set by --allow-prod-write CLI handler).
+    """
+    if not is_protected_prod_path(path):
+        return
+    if os.environ.get("MP_ALLOW_PROD_WRITE") == "1":
+        return
+    raise RuntimeError(
+        f"REFUSED to write prod state {path}: "
+        f"MP_ALLOW_PROD_WRITE env not set. "
+        f"Use prod scheduled task OR pass --allow-prod-write to CLI."
+    )
+```
+
+#### 1.C CLI scripts 加 env-set wrapper
+
+`scripts/intraday_plan.py`:
+```python
+if args.allow_prod_write:
+    os.environ["MP_ALLOW_PROD_WRITE"] = "1"
+```
+
+`scripts/daily_report.py` 同样.
+
+#### 1.D 所有写 prod path 的地方调 `assert_prod_write_allowed`
+
+```python
+def write_plan_json(path: Path, ...) -> None:
+    from mp.common.paths import assert_prod_write_allowed
+    assert_prod_write_allowed(path)
+    # ... actual write
+```
+
+#### 1.E Audit log (append-only)
+
+```python
+def audit_prod_write(path: Path, source: dict) -> None:
+    """Append one line to data/audit/prod_writes.log per prod write."""
+    audit_path = Path("data/audit/prod_writes.log")
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    line = (
+        f"[{datetime.now().isoformat()}] "
+        f"WROTE {path} "
+        f"by user={source.get('user')} "
+        f"host={source.get('host')} "
+        f"script={source.get('script')} "
+        f"pid={source.get('process_id')} "
+        f"git_head={source.get('git_head')} "
+        f"is_prod={source.get('is_prod')} "
+        f"asof={source.get('asof')}\n"
+    )
+    with audit_path.open("a", encoding="utf-8") as f:
+        f.write(line)
+```
+
+#### 1.F Smoke test cases (你自己跑)
+
+```python
+# Test 1: protected path detection
+assert is_protected_prod_path("data/orders/latest.json")
+assert is_protected_prod_path("data/orders/intraday_latest.json")
+assert is_protected_prod_path("data/orders/intraday_20260604.json")  # glob match
+assert is_protected_prod_path("config/portfolio.yaml")
+assert not is_protected_prod_path("data/_scratch/intraday_latest.json")
+assert not is_protected_prod_path("data/reports/daily_20260604.md")  # 不在 list
+
+# Test 2: env gate
+os.environ.pop("MP_ALLOW_PROD_WRITE", None)
+try:
+    assert_prod_write_allowed("data/orders/latest.json")
+    assert False, "should have raised"
+except RuntimeError:
+    pass
+
+os.environ["MP_ALLOW_PROD_WRITE"] = "1"
+assert_prod_write_allowed("data/orders/latest.json")  # OK
+
+# Test 3: scratch path always allowed
+os.environ.pop("MP_ALLOW_PROD_WRITE", None)
+assert_prod_write_allowed("data/_scratch/anything.json")  # no raise
+```
+
+#### 工作量估
+
+- paths.py 加 functions: 30 min
+- 改 6 个 script 加调用: 30 min  
+- audit_prod_write integration: 15 min
+- smoke tests: 15 min
+- 总 ~1.5h
+
+### P2 - round 217 spec (P0-B qfq Sat 10:00 迁移)
+
+#### 背景
+
+QFQ (前复权) 数据每周末刷新, 用于 walk_forward / dataset rebuild. 现在 Mac launchd `com.moneyprinter.qfq` 跑, ECS 端 `MoneyPrinter-QfqRefresh` Disabled (round 195 P0-A 时没切).
+
+如果 Mac 关机/关 launchd, qfq 不更新 → walk_forward 失准 / dataset rebuild miss.
+
+#### Spec
+
+1. ECS scheduled task `MoneyPrinter-QfqRefresh` enable, schedule = 每周六 10:00
+2. ECS qfq script (`scripts/ecs_qfq_refresh.ps1` 已 commit, 没 enable schedule):
+   - git pull
+   - 跑 `scripts/qfq_refresh.py` (Mac-side 也是同一脚本)
+   - log → `data/logs/ecs_qfq_refresh.log`
+   - 加 `--allow-prod-write` 如果 qfq cache 在 PROTECTED 列表 (round 215)
+3. Mac launchd `com.moneyprinter.qfq` 同步 disable (避免 Mac+ECS 同时跑)
+4. 首次 6/8 Sat 10:00 fire verify
+
+工作量: 1h (主要是 verify ECS qfq.ps1 跟 Mac 一致 + Windows ACL 给 task user 写 cache 权限)
+
+### P3 - round 218 spec (P0-C 其他 launchd 迁移)
+
+#### Background
+
+Mac launchd 还有几个未迁:
+- 止损监控 (15 min 一次, Mac launchd `com.moneyprinter.stoploss_monitor.plist`)
+- 月报 (每月 1 号, `com.moneyprinter.monthly_report.plist`)
+
+#### Decision needed
+
+止损监控 15 min cadence, ECS Windows Task Scheduler 也能跑. 月报每月 1 号, 一样可迁.
+
+但: 止损监控可能需要 Mac 上的 lark-cli 推送 (Feishu webhook). ECS 端没装 lark-cli (我之前确认过), 推送会 fail. 工作量 = 装 lark-cli + verify network 通畅.
+
+工作量: 1-1.5h. **不急, 现 Mac launchd 在跑没问题**. 等下次大维护一起做.
+
+### P4-P6 deferred
+
+P4-P6 都等 v2 真盘验证 1-2 周后再启动. 现在 priority 是 stop 流程性事故 (Tier 1) + 周末 qfq 别漏 (P0-B).
+
+### 建议你的 next sprint
+
+1. **Today 14:30 监控** v2 真盘 (我手动盯, 不需要你)
+2. **Tomorrow 6/5** P1 round 215 Tier 1 (1.5h, 完成 Rule #4.1 实现)
+3. **6/6 或 6/7** P2 round 217 qfq 迁移 (1h, 避免周末 qfq 漏)
+4. **下周** P3 + P4 看具体节奏
+
+ACK / reject / 重排序都可以. 我等你 round 217 (= 217 ACK round 216 优先级排序).
+
