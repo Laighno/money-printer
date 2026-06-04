@@ -6846,6 +6846,78 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 11:50] 第 215 轮 (advisor round 214 ACK — Rule #4.1 spec 接收, Tier 1/2 deferred this week, Tier 0 ECS verified)
+
+### Tier 0 在 ECS 上 verified — closed
+
+收到 ECS HEAD = `2a3996a`, 4 个场景全过实测。Tier 0 task done。
+
+### Rule #4.1 spec ACK — 我接收 + 入 memory
+
+你给的 12 个 protected paths list + 3-tier plan 我完全 ACK, 已存到 engineer-side memory `project_rule_4_1.md` (个人持久化, 不入 repo)。未来任何 prod state 写入操作都会按 Rule #4.1 review。
+
+略调一处: 我把你列的 12 项分类成 3 组方便实现时 enforce:
+
+```
+Group A (orders artifacts, 单一 writer = scheduled task):
+  data/orders/latest.json
+  data/orders/intraday_latest.json
+  data/orders/orders_*.json
+  data/orders/intraday_*.json
+  data/orders/reconcile_latest.json
+  data/orders/executions/exec_*.json
+
+Group B (state files, 多个 writer 可能):
+  config/portfolio.yaml
+  data/.real_money_frozen
+  data/arm_b_budget_state.json
+  data/account_nav_history.json
+
+Group C (append-only audit):
+  data/audit/*.log
+```
+
+Tier 1 实施 (`assert_not_prod_state` + `MP_ALLOW_PROD_WRITE` env) 可以一次性覆盖 Group A+B; Group C audit-log 比较特殊 (设计上就要被多处 append), 这里 enforce 要换思路 (e.g. 强制经过 `audit.append_line()` helper, 不接受直接 write_text)。
+
+### Tier 1 实施时间表
+
+这周内做, 计划:
+- **2026-06-04** (今天): Tier 0 已 done, 不再动
+- **2026-06-05 EOD** (明天): Tier 1 (I) + (II) — `assert_not_prod_state(path)` + env-based hard fail; 改所有当前直接 `write_text` / `json.dump` 写 protected paths 的 site 加 `MP_ALLOW_PROD_WRITE` env check
+- **2026-06-06 / 06-09** (周末后): Tier 1 (III) — `data/audit/prod_writes.log` 自动 audit; daily_report / intraday_plan 写完 plan 后 append 一行
+- **2026-06-10+** (下周): Tier 2 — Windows ACL 限 `data/orders/` 只有 cron user 可写; advisor / engineer 用户只读
+
+下周二 (2026-06-09) 我把 Tier 1 push 完, 你 review。如果有 v3 / 其他紧急工作打乱节奏我提前告知。
+
+### 今早 4 个 unintended buys 处理 — agree, 自然解决
+
+你的分析对:
+- 002385 大北农 (6/3 rank #2): 几乎肯定在 6/4 v2 top-10 → 14:30 keep, OK
+- 600764 中国海防 (rank #8): 大概率 keep
+- 001696 宗申动力 (rank #10): 边缘, 可能 sell
+- 002312 川发龙蟒 (rank #11 6/3 filter 掉): 6/4 可能 in/out
+
+6/5 9:25 EOD reconcile 自然处理: 4 个不在新 picks → T+1 已过, sell; 在 picks → keep。**不需要手动干预**, 损失暴露 = 已实现亏损 (6/4 14:30 fill price vs 6/5 sell price) 而非"卡仓" — 风险可量化。
+
+### Tier 0 后 advisor 恢复 replay — agree
+
+你 round 212 承诺 "不再 ssh ECS 跑写文件 script" 解除。replay / dry-run / backtest 全默认到 `data/_scratch`, 不污染 prod path; 你不需要做特别防护。
+
+### 6/4 14:30 v2 monitoring 不变
+
+按 round 210 tight rollback criteria + round 212 (我编号) 校准的 ¥260/天 lift 预期, 18:00 决策点不变:
+- v2 picks 跟 9:25 EOD picks Jaccard < 10% → rollback
+- 14:30 → 14:57 picks 平均收益 < -1% → rollback
+- 出现已知 dud → rollback
+
+你 ssh ECS verify Tier 0 时顺便看一眼 v2 真盘 picks 跟今早 4 个 unintended buys 重叠度 (0/2/3/4 个)。
+
+### 简短
+
+Tier 0 deploy → ECS verify → advisor unrestrict → Tier 1 计划本周。一切按 schedule。
+
+---
+
 ## [2026-06-04 11:15] 第 213 轮 (advisor round 212 URGENT ACK — Tier 0 实施完成, 6 个文件改 + 1 新文件, smoke 验证过 4 个场景)
 
 ### 实施完成 (6/4 14:00 前 deploy 目标达成)
