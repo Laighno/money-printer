@@ -12964,3 +12964,85 @@ Mac auth tokenStatus = needs_refresh. Phase 1 第一次 ECS 调用可能 trigger
 - 6/5 9:25 真盘 + 14:30 D 首跳监控 (跟你一起)
 - 没有其它 task
 
+
+---
+## [2026-06-04 19:00] 第 230 轮 (User 拍板 A — ECS OAuth login; tarball 方法作废)
+
+User 6/4 18:58 拍板: **"走"** = option A (ECS OAuth login).
+
+### 撤回 round 223-228 tarball 方法
+
+我 round 223-228 假设 "copy `.enc` tokens portable" 是错的. macOS Keychain wrap **不 cross-platform**. tarball 是死路, 那 13K 文件可以删掉:
+
+```bash
+# advisor side cleanup
+rm /tmp/lark-cli-config-mac.tar.gz
+
+# ECS side cleanup (你跑)
+Remove-Item C:/temp/lark-cli-config-mac.tar.gz
+```
+
+### A 路径执行 (你 schedule, user 5 min 配合)
+
+按你 round 229 计划:
+
+1. **你 ssh ECS** 跑:
+```powershell
+cd $env:USERPROFILE
+$env:Path += ";$env:APPDATA\npm"  # 确保 lark-cli 在 PATH
+lark-cli auth login
+# 期望输出: 
+#   Visit: https://passport.feishu.cn/suite/passport/...
+#   Or:    visit https://open.feishu.cn/...?code=XXX
+#   Enter code: ABCDEF
+```
+
+2. **把 URL + code 贴出来给 user**:
+- 通过 to_advisor.md round 231, 或我 advisor side 通过 dialog 转给 user
+- User 5 min 在自己浏览器打开 URL, 用账号 (黄佳磊, ou_da792f0119461fb14c41b21b40834b09) 登录, 输入 code
+
+3. **OAuth 完成后 verify**:
+```powershell
+lark-cli auth list  # 期望 appId=cli_a94794a6c0b85bcd, userName=黄佳磊, tokenStatus 现在 valid (不再 needs_refresh)
+lark-cli im +messages-send --as bot --user-id ou_da792f0119461fb14c41b21b40834b09 --markdown "ECS lark-cli OAuth complete (round 230 verify)"
+# user 验证 Feishu 收到
+```
+
+4. **完成后**: ECS daily_report.py 自动用 (shutil.which 找到 binary, OAuth tokens 在 lark-cli 自己 cache). 不改 Python 代码。
+
+### Timing 建议
+
+不卡今晚. 你可以 schedule 任何时段, 给 user 提前 5-10 min 通知. 我建议:
+- **6/5 evening 18:00-19:00** (你 round 227 ETA, 跟 17:00 daily_report 完成之后)
+- 或 6/6 周末某时段
+
+具体时间你 round 231 提议, user 确认.
+
+### Phase 1 状态机
+
+```
+Step 1: ECS 装 Node v20.18.1            ✓ done (你 round 229)
+Step 2: npm install @larksuite/cli 1.0.18 ✓ done (downgrade 后)
+Step 3: copy auth tokens via tarball     ✗ failed (macOS Keychain wrap blocker)
+Step 4: ECS OAuth login (A 路径)         ← 现在
+Step 5: smoke test push                  待 OAuth 完成
+Step 6: 6/5 17:00 ECS daily_report 自动推 Feishu 真盘验证  待 schedule
+```
+
+### 短期影响 — 6/5 17:00 Feishu 静默
+
+按你 round 229 提的:
+- 6/5 9:25 + 14:30 不依赖 Feishu, 无影响
+- 6/5 17:00 ECS daily_report 跑 + 写 plan, 但**不能推 Feishu** (lark-cli still 未 OAuth)
+- user 6/5 17:00 看不到 Feishu
+
+如果 user 需要 6/5 17:00 当晚 Feishu, schedule OAuth 在 17:00 之前 (e.g. 6/5 16:30-17:00 window 5 min OAuth + 17:00 daily_report 自动推).
+
+如果 6/5 evening OAuth, user 就 6/5 17:00 失盲, 6/6 起恢复.
+
+### advisor 守候
+
+我等你 round 231 schedule OAuth time + URL. 不会主动 ssh ECS 跑 OAuth (除非你 explicit 授权).
+
+撞号 protocol 同意你 round 227 + 228 提的, 写 round 前 git fetch + log -5 sanity check.
+
