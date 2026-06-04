@@ -1,10 +1,22 @@
 {
-  "generated_at": "2026-06-02T17:38:49",
-  "report_date": "2026-06-02",
+  "source": {
+    "is_prod": true,
+    "host": "laighnodeMacBook-Pro.local",
+    "user": "laighno",
+    "pid": 23119,
+    "git_head": "c02a206",
+    "script": "daily_report.py",
+    "generated_at": "2026-06-04T17:32:29",
+    "asof": null,
+    "dry_run": false,
+    "allow_prod_write": true
+  },
+  "generated_at": "2026-06-04T17:32:29",
+  "report_date": "2026-06-04",
   "account_snapshot": {
-    "total_assets": 286292.25,
-    "cash_available": 53069.25,
-    "market_value": 233223.0
+    "total_assets": 283939.73,
+    "cash_available": 47648.73,
+    "market_value": 236291.0
   },
   "holdings_at_plan_time": [
     {
@@ -16,14 +28,8 @@
     {
       "code": "600363",
       "name": "联创光电",
-      "shares": 1700,
-      "avg_cost": 35.764
-    },
-    {
-      "code": "600511",
-      "name": "国药股份",
-      "shares": 200,
-      "avg_cost": 26.204
+      "shares": 1300,
+      "avg_cost": 35.36
     },
     {
       "code": "600808",
@@ -32,10 +38,22 @@
       "avg_cost": 3.119
     },
     {
+      "code": "600816",
+      "name": "建元信托",
+      "shares": 100,
+      "avg_cost": 3.05
+    },
+    {
       "code": "002153",
       "name": "石基信息",
       "shares": 4900,
       "avg_cost": 8.288
+    },
+    {
+      "code": "002335",
+      "name": "科华数据",
+      "shares": 500,
+      "avg_cost": 41.445
     },
     {
       "code": "002439",
@@ -46,68 +64,114 @@
     {
       "code": "002583",
       "name": "海能达",
-      "shares": 3700,
-      "avg_cost": 8.381
+      "shares": 2900,
+      "avg_cost": 8.426
     },
     {
       "code": "002773",
       "name": "康弘药业",
-      "shares": 600,
-      "avg_cost": 21.188
+      "shares": 200,
+      "avg_cost": 20.849
     },
     {
       "code": "002958",
       "name": "青农商行",
-      "shares": 1200,
-      "avg_cost": 2.817
+      "shares": 600,
+      "avg_cost": 2.723
+    },
+    {
+      "code": "001696",
+      "name": "宗申动力",
+      "shares": 300,
+      "avg_cost": 14.558
+    },
+    {
+      "code": "002385",
+      "name": "大北农",
+      "shares": 2600,
+      "avg_cost": 3.312
+    },
+    {
+      "code": "002312",
+      "name": "川发龙蟒",
+      "shares": 500,
+      "avg_cost": 8.821
+    },
+    {
+      "code": "600764",
+      "name": "中国海防",
+      "shares": 200,
+      "avg_cost": 20.548
     }
   ],
   "orders": [
     {
-      "code": "600511",
-      "name": "国药股份",
-      "action": "减仓",
+      "code": "600816",
+      "name": "建元信托",
+      "action": "清仓",
       "shares": 100,
-      "limit_price": 27.15,
-      "cost": -2715.0,
-      "reason": "模型排名 #56/781（跌出 Top 30，减半仓）"
+      "limit_price": 2.87,
+      "cost": -287.0,
+      "reason": "模型排名 #239/781（已不在 Top 100）"
+    },
+    {
+      "code": "002335",
+      "name": "科华数据",
+      "action": "清仓",
+      "shares": 500,
+      "limit_price": 39.51,
+      "cost": -19755.0,
+      "reason": "模型排名 #333/781（已不在 Top 100）"
     },
     {
       "code": "002773",
       "name": "康弘药业",
       "action": "减仓",
-      "shares": 300,
-      "limit_price": 21.12,
-      "cost": -6336.0,
-      "reason": "模型排名 #36/781（跌出 Top 30，减半仓）"
+      "shares": 100,
+      "limit_price": 21.42,
+      "cost": -2142.0,
+      "reason": "模型排名 #54/781（跌出 Top 30，减半仓）"
     },
     {
       "code": "002958",
       "name": "青农商行",
       "action": "减仓",
-      "shares": 600,
-      "limit_price": 2.9,
-      "cost": -1740.0,
-      "reason": "模型排名 #51/781（跌出 Top 30，减半仓）"
+      "shares": 300,
+      "limit_price": 2.87,
+      "cost": -861.0,
+      "reason": "模型排名 #66/781（跌出 Top 30，减半仓）"
     },
     {
-      "code": "603737",
-      "name": "三棵树",
-      "action": "买入",
+      "code": "002385",
+      "name": "大北农",
+      "action": "减仓",
       "shares": 1300,
-      "limit_price": 30.9,
-      "cost": 40170.0,
-      "reason": "模型 #3/781, 超额 +6.14%，目标仓位 15.1% (现 0.0%)"
+      "limit_price": 3.27,
+      "cost": -4251.0,
+      "reason": "模型排名 #52/781（跌出 Top 30，减半仓）"
     },
     {
-      "code": "600808",
-      "name": "马钢股份",
-      "action": "加仓",
-      "shares": 3500,
-      "limit_price": 2.91,
-      "cost": 10185.0,
-      "reason": "模型 #11/781, 超额 +3.60%，目标仓位 9.3% (现 5.7%)"
+      "code": "002312",
+      "name": "川发龙蟒",
+      "action": "减仓",
+      "shares": 200,
+      "limit_price": 8.57,
+      "cost": -1714.0,
+      "reason": "模型排名 #45/781（跌出 Top 30，减半仓）"
+    },
+    {
+      "code": "600764",
+      "name": "中国海防",
+      "action": "减仓",
+      "shares": 100,
+      "limit_price": 20.5,
+      "cost": -2050.0,
+      "reason": "模型排名 #78/781（跌出 Top 30，减半仓）"
     }
   ],
-  "alerts": []
+  "alerts": [
+    "⚠️ 联创光电 (600363) 受总仓位上限约束，跳过本笔加仓 （当前总仓 90.4% > 上限 70%）。",
+    "⚠️ 海能达 (002583) 受总仓位上限约束，跳过本笔加仓 （当前总仓 90.4% > 上限 70%）。",
+    "⚠️ 三棵树 (603737) 受总仓位上限约束，跳过本笔加仓 （当前总仓 90.4% > 上限 70%）。"
+  ]
 }
