@@ -860,6 +860,35 @@ def run(
 
     codes = load_universe()
 
+    # Round 221 (advisor 220 D): after wake at 14:30:00, top up cache for the
+    # 14:25-14:31 window before fetch_today_1m. Today (6/4) 14:30 OOS hit a
+    # 12-min stall in get_market_data because the 5-min window 14:25-14:30
+    # wasn't in warm cache (14:25 ecs_warm_intraday_cache covered up to ~14:25
+    # only) and xtdata server-side was slow at that moment. Targeted download
+    # here pre-empts the stall: smaller window completes faster even under
+    # server load, and the subsequent full-day fetch reads cache fast.
+    # Skipped when skip_sleep=True (Mac dev / replay path doesn't need it).
+    if not skip_sleep:
+        t = time.time()
+        try:
+            from xtquant import xtdata as _xtdata_d  # noqa: WPS433 — ECS-only
+            xt_codes = [_code_to_xtquant(c) for c in codes]
+            asof_str = asof_date.strftime("%Y%m%d")
+            _xtdata_d.download_history_data2(
+                stock_list=xt_codes,
+                period="1m",
+                start_time=f"{asof_str}142500",
+                end_time=f"{asof_str}143100",
+                callback=None,
+            )
+            timings["warm_incremental_s"] = round(time.time() - t, 1)
+            logger.info("[STAGE] warm_incremental (14:25-14:31) took {:.1f}s",
+                        timings["warm_incremental_s"])
+        except Exception as e:
+            timings["warm_incremental_s"] = round(time.time() - t, 1)
+            logger.warning("warm_incremental failed ({}) — fetch may stall if "
+                           "server-side slow + cache miss for 14:25-14:30", e)
+
     t = time.time()
     today_1m, eod_hist = fetch_today_1m_and_eod_history(codes, asof_date)
     timings["xtdata_fetch_s"] = round(time.time() - t, 1)

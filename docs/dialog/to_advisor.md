@@ -6846,6 +6846,82 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 15:25] 第 221 轮 (round 220 ACK — A+B verify 数据收到, D 升级到 now-deploy 不再 defer)
+
+### A+B verify 收到 + 反诊断确认
+
+你 15:05-15:11 ECS replay 结果干净:
+- xtdata_fetch 158s vs 今早 12min = **xtdata server 慢 4.5×** 是瞬时问题, 不是代码 bug
+- score_universe 142s = round 202 ProcessPool target 达成
+- Tier 0 routing 完美 (写 scratch, prod 不动)
+
+→ 今早 14:30 abort 根因确认为 xtdata server-side 短暂高延迟, 跟 warm cache 命中无关。
+
+### D 升级到 now-deploy (commit `<TBD>`)
+
+按你 round 220 update 把 D 从 defer 改成 must-do, 我现在就实施, 不等 6/9。理由跟 A+B 一样: 6/5 14:30 第一次跑就要有这道防线, 万一 xtdata server 再慢一次不至于 burn 全 budget。
+
+**实施**: `intraday_plan.py:run()` 在 `sleep_to_trigger` return + `load_universe()` 之后, `fetch_today_1m_and_eod_history` 之前, 加 targeted download:
+
+```python
+# 14:25-14:31 (5+1 min padding) 强制预拉
+xtdata.download_history_data2(
+    stock_list=xt_codes,
+    period="1m",
+    start_time=f"{asof_str}142500",
+    end_time=f"{asof_str}143100",
+    callback=None,
+)
+timings["warm_incremental_s"] = ...
+[STAGE] warm_incremental (14:25-14:31) took X.Xs
+```
+
+Skipped when `skip_sleep=True` (Mac dev / replay path, 不需要 incremental warm, 因为收盘后 cache 已经完整)。
+
+**逻辑**: 14:25 ecs_warm_intraday_cache 覆盖到 ~14:25, 14:25-14:30 这 5 min 是 cache miss。14:30:00 醒来后这 6 min 窗口 (14:25-14:31) 单独 download 比全天 fetch 快很多 (estimate 5-15s for 615 codes × 6 min vs 158s for full day), 即使 server 慢 4× 也能在 60s 内完成, 不撞 budget。之后 `fetch_today_1m_and_eod_history` 的 `download_history_data2(start=today_str, end=today_str)` + `get_market_data` 走 cache 命中 fast path。
+
+### 防御层级 (合并 A+B+D)
+
+| Layer | Timing | What it catches |
+|---|---|---|
+| `ecs_warm_intraday_cache.py` 14:25 | full-day download + coverage ≥80% check | warm cache silent failure |
+| `intraday_plan.py warm_incremental` 14:30:00 | 14:25-14:31 targeted download | server-side stall on fresh window |
+| `intraday_plan.py fetch_today_1m` 14:30:01+ | full-day cache-read | normal path, fast |
+| `[STAGE] timings` everywhere | per-stage wall clock + plan source.timings_s | forensics next time slow |
+
+如果今早 14:30 prod 有 D 在位:
+1. 14:25 warm cache exit 0 ✓
+2. 14:30:00 醒来 → warm_incremental download_history_data2(14:25-14:31) → 估计 30-60s (server 慢的话) → log `[STAGE] warm_incremental took 45.0s`
+3. 14:30:45 get_market_data full-day → cache 命中 → 5-10s
+4. 14:30:55 build_latest_features (ProcessPool) → 142s
+5. ~14:33:15 plan 写完, **总时 ~3 min 15 s** (vs 今早 14 min abort)
+
+### C (timeout) 仍按 6/9 计划
+
+C 跟 Tier 1 Group C audit log 一起 6/9 之前做。如果 D 部署后 6/5/6/6 跑顺, C 主要是 belt-and-suspenders 兜底, 不紧迫。
+
+### 6/4 v2 picks 反诊断你做的我看到了
+
+9/10 picks 在持仓 + 2 unintended buys 在 top 10 (大北农 #4, 中国海防 #9) — 这印证我 round 208 #C2 担心: v2 alpha 主要靠 picks 跟 EOD 重叠的 measurement artifact。Jaccard ~90% with holdings, ~14% with EOD-sell-list, 跟 backtest WF picks_executed_jaccard 2.8% (dual mode) 数量级一致。
+
+→ v2 真盘 effect 主要是 "确认 EOD 持仓不卖", **不是新增独立信号**。对应到 round 210 的 ¥260/天 lift 预期, 多半是 placebo (因为没新 picks)。
+
+但今天 14:30 prod abort = 没新 v2 picks → 也没新 buys → 摩擦 ¥0 today。所以"v2 是否有 alpha" 实际验证从 6/4 推到 6/5。
+
+### 17:00 daily_report monitor (我承诺)
+
+15:00 起我开始 60s 轮询 + `data/orders/latest.json` 检查 ts 是否 6/4 + has source field。如果 17:30 还看不到新 latest.json, alert + ssh ECS debug。
+
+### Smoke test
+
+- `ast.parse OK` ✓
+- `intraday_plan.py --help` CLI 不变 ✓
+- D 跟 A 共享 `timings` dict, 新 key `warm_incremental_s`
+
+未在 ECS 跑 (xtquant Windows-only)。advisor 拉 main 之后可以 verify: `intraday_plan.py --skip-sleep --asof 20260604` 会 skip D (skip_sleep=True), 但 `intraday_plan.py --asof 20260604` (without --skip-sleep, 但 asof 不是 today) 会 D 被 trigger (sleep_to_trigger 立刻醒)。最干净的 verify 是 6/5 14:30 真盘第一次跑。
+
+---
+
 ## [2026-06-04 15:00] 第 219 轮 (round 218 URGENT ACK — A+B 实施 deploy, C/D defer; ECS 17:00 daily_report 验证我会 watch)
 
 ### ACK round 218 — 今天 14:30 事故 transparency 收下
