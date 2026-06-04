@@ -12498,3 +12498,118 @@ P0-A 真正完成意味着:
 
 希望 6/5 17:00 之前 ECS Feishu push 装好. 如果来不及, advisor 临时手工 ssh ECS 读 latest.json 推一份 Feishu, 不让 user 失盲.
 
+
+---
+## [2026-06-04 17:50] 第 223 轮 (round 222 修正 — User 拍 "和 Mac 一样的调用模式" = 装 @larksuite/cli npm package on ECS + copy auth tokens)
+
+### 我 round 222 的简化错了
+
+User 6/4 17:50 拍板: **"和现在 mac 一样的调用模式"**
+
+意思是: ECS 也装 lark-cli, 同样 subprocess 调用, 不重写 send_to_feishu. 把 Mac 的 OAuth tokens 同步到 ECS 即可.
+
+### lark-cli 真相
+
+它是 **@larksuite/cli npm package** (Node.js, 不是 Go binary):
+```
+Mac: /opt/homebrew/bin/lark-cli -> ../lib/node_modules/@larksuite/cli/scripts/run.js
+Version: 1.0.18
+Auth: OAuth user token (cli_a94794a6c0b85bcd app, user 黄佳磊)
+Config: ~/.config/lark-cli/  (config + cache + logs)
+```
+
+### 实际 spec (修订)
+
+#### 1. ECS Windows 装 Node.js (如果还没)
+
+```powershell
+# 用 Chocolatey 装
+choco install nodejs -y
+
+# Or 下载 MSI: https://nodejs.org/dist/latest-v20.x/node-v20.X.X-x64.msi
+
+# verify
+node --version
+npm --version
+```
+
+#### 2. 全局装 @larksuite/cli
+
+```powershell
+npm install -g @larksuite/cli
+
+# verify
+lark-cli --version
+# 期望 1.0.18 (跟 Mac 一致)
+```
+
+#### 3. Copy Mac auth tokens 到 ECS
+
+Mac 端 (advisor 跑):
+```bash
+# 压缩 lark-cli config 目录
+cd ~/.config
+tar czf /tmp/lark-cli-config.tar.gz lark-cli/
+
+# scp 到 ECS
+scp /tmp/lark-cli-config.tar.gz Administrator@14.103.49.51:C:/temp/lark-cli-config.tar.gz
+```
+
+ECS 端 (工程方跑):
+```powershell
+# 解压到 Windows 用户 home 的 .config 目录
+cd C:\Users\Administrator\
+mkdir -Force .config
+
+# 用 7zip 或 tar (Windows 10+ 带 tar)
+tar xzf C:\temp\lark-cli-config.tar.gz -C .config\
+
+# verify
+dir .config\lark-cli\
+# 应看到 config.json (空) + cache (含 token) + locks + logs + update-state.json
+```
+
+#### 4. 测试 lark-cli on ECS
+
+```powershell
+# auth 验证 (期望跟 Mac 同 appId)
+lark-cli auth list
+# 期望输出: appId=cli_a94794a6c0b85bcd, userName=黄佳磊
+
+# 测试推送
+lark-cli im +messages-send --as bot --user-id ou_da792f0119461fb14c41b21b40834b09 --markdown "测试: ECS lark-cli OK"
+# 期望: 飞书收到 "测试: ECS lark-cli OK"
+```
+
+#### 5. ECS daily_report.py 已经能 import lark-cli via shutil.which
+
+`scripts/daily_report.py:2281` 用 `shutil.which("lark-cli")` 找 binary. ECS 装好后 `shutil.which` 会找到, `send_to_feishu()` 自然 work, **不需要改 Python 代码**.
+
+ECS PATH 默认含 npm global bin: `C:\Users\Administrator\AppData\Roaming\npm\`. `lark-cli.cmd` 应该在那里, `shutil.which("lark-cli")` 会找到 (round 174 fix 也加了 `.exe / .cmd / .bat` 后缀 fallback in line 2284).
+
+#### 6. Token refresh 处理 (Mac 上 tokenStatus = needs_refresh)
+
+Mac 的 `lark-cli auth list` 显示 `tokenStatus: needs_refresh`. 但今天 Mac 实际 push 成功 — 说明 refresh 是 lazy 触发的, 调用时自动 refresh.
+
+ECS 装好 + tokens 复制后, 第一次调用会 trigger refresh. 如果失败, 用户在 Mac 手动 `lark-cli auth refresh` 一次, 然后重 copy auth 文件夹到 ECS.
+
+### 工作量估 (修正)
+
+- ECS 装 Node.js: 10 min (含下载 + 安装 + reboot if needed)
+- npm install -g @larksuite/cli: 5 min
+- copy auth: 10 min (Mac 端 advisor 跑, ECS 端工程方解压)
+- test: 5 min
+- 总 ~30 min, 跟 round 222 spec C 接近, 但**不改任何 Python 代码** — 更稳
+
+### 优先级仍然急
+
+按 round 222 priority — 希望 6/5 17:00 之前装好. 6/5 17:00 ECS daily_report 跑完后能自动推送 Feishu, user 就能看到 prod 真实 plan.
+
+Mac launchd `com.moneyprinter.collect` 已 advisor 6/4 17:42 unload (round 222 兜底). Mac 不再推 Feishu, ECS 装好之前**今天 6/4 + 明天 6/5 17:00 user 看不到 Feishu**. 工程方装好后立即恢复.
+
+如果 6/5 17:00 之前装不好, advisor 可以临时 ssh ECS 抓 latest.json 推一份 Feishu (用 Mac 的 lark-cli 调). 不是优雅但能 unblock user.
+
+### advisor side preparation (我立即做的)
+
+我准备 `lark-cli-config.tar.gz` 压缩 Mac auth, **不 commit git** (含 token 敏感), 等工程方 ACK round 223 后, scp 给 ECS. 暂时放 /tmp/ 备用.
+
