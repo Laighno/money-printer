@@ -12377,3 +12377,124 @@ v2 picks 跟 9:25 EOD 卖单几乎不重叠 (除了 600363 因为 EOD 也想 kee
 
 如果 17:00 跑成功, **新 latest.json 有 source.is_prod=True**, 6/5 9:25 fallback 路径通畅. 如果失败, 我俩都要 alert.
 
+
+---
+## [2026-06-04 17:40] 第 222 轮 (URGENT — Mac launchd P0-A 未真正 unload + ECS lark-cli 缺失 = 用户 Feishu 跟 prod 不一致事故)
+
+### 用户 6/4 17:40 反映 — Feishu 报告跟 prod 执行计划不统一
+
+User 看到的 Feishu 报告: **7 单, universe 781** (002335 科华数据 清仓 + 002773 减仓 not 清仓)  
+ECS data/orders/latest.json: **6 单, universe 800** (002335 没在 plan, 002773 清仓)  
+
+→ 用户混乱: "为什么购买决策不一样, 能不能统一"
+
+### Root cause — P0-A migration round 195 没真完成
+
+**两个独立的 daily_report 都在跑**:
+
+1. **ECS scheduled task** MoneyPrinter-DailyReport 17:00 → 跑 ecs_daily_report.ps1 → 调 daily_report.py → 写 ECS data/orders/latest.json (17:19:50, 6 单)
+2. **Mac launchd** `com.moneyprinter.collect` (我刚发现) **仍 active** → 17:00 fire → 跑 `scripts/daily_report.sh` → 调 daily_report.py → 写 **Mac local** data/orders/latest.json (17:32, 7 单) + **Feishu push 成功**
+
+ECS Feishu push 失败 (lark-cli not on PATH, round 195 commit 已 flag 过 "send_to_feishu: lark-cli not found on PATH — notification skipped").
+
+→ 用户**只看到 Mac 的 Feishu**, 但 prod 执行 ECS 的 latest.json。
+
+### 我 advisor 现已立即兜底 (Mac side)
+
+```bash
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.moneyprinter.collect.plist
+mv ~/Library/LaunchAgents/com.moneyprinter.collect.plist \
+   ~/Library/LaunchAgents/com.moneyprinter.collect.plist.disabled_round222_20260604
+```
+
+明天 6/5 17:00 起, Mac 不再跑 daily_report. Feishu 即静默 (没人 push 了).
+
+### round 222 spec — ECS 装 lark-cli + 验证 Feishu push (P0-A 真正完成)
+
+#### 1. ECS Windows 装 lark-cli
+
+**lark-cli 是飞书 webhook 命令行工具**, GitHub: `gainstrong/lark-cli` (Go binary). 不确定 ECS 之前为什么没装. Mac 在 `/opt/homebrew/bin/lark-cli` 用 brew 装的.
+
+**Windows 上的安装**:
+- 选项 A: 编译/下载 Windows binary 放 `C:\money-printer\bin\lark-cli.exe`, 加 PATH
+- 选项 B: 用 Python 等价 (有些 webhook lib 直接用 Python `requests`), 改 send_to_feishu 用 `requests.post` 而不是 subprocess `lark-cli`
+
+我建议 **B** — 用 Python `requests` 直接调 Feishu webhook URL, 更稳, 不依赖外部 binary:
+
+```python
+# scripts/daily_report.py 修 send_to_feishu
+
+def send_to_feishu(card_or_markdown: str, ...) -> bool:
+    """Push to Feishu via webhook URL. Replaces lark-cli subprocess
+    (lark-cli not available on ECS Windows; subprocess fail rate too
+    high cross-platform).
+    """
+    import requests
+    webhook_url = os.environ.get("FEISHU_WEBHOOK_URL") or _load_feishu_url_from_config()
+    if not webhook_url:
+        logger.warning("FEISHU_WEBHOOK_URL not set, skipping Feishu push")
+        return False
+    
+    # 兼容 card (dict) + markdown (str)
+    if isinstance(card_or_markdown, dict):
+        payload = {"msg_type": "interactive", "card": card_or_markdown}
+    else:
+        payload = {"msg_type": "text", "content": {"text": card_or_markdown}}
+    
+    try:
+        r = requests.post(webhook_url, json=payload, timeout=10)
+        r.raise_for_status()
+        logger.info("Feishu push OK: status={}", r.status_code)
+        return True
+    except Exception as e:
+        logger.warning("Feishu push failed: {}", e)
+        return False
+```
+
+#### 2. webhook URL 配置 (从 Mac 提取)
+
+Mac 上现有 lark-cli 配置 webhook URL, 我帮你提取下次提供:
+
+```bash
+# Mac 端 (advisor 跑)
+cat ~/.config/lark-cli/config.yml  # 或者 .lark-cli.yaml
+# 或:
+which lark-cli && lark-cli --help | grep webhook
+```
+
+把 URL 配置到 ECS `config/feishu_webhook.yaml` 或 env `FEISHU_WEBHOOK_URL`. **不要 commit URL 到 git** (sensitive, 一旦 leak 任何人能 spam Feishu).
+
+#### 3. 测试 ECS 飞书 push
+
+```bash
+ssh ECS .venv/python.exe -c "from scripts.daily_report import send_to_feishu; send_to_feishu('test from ECS')"
+# 期望: Feishu 收到 "test from ECS"
+```
+
+#### 4. 同步去 daily_report.sh (Mac 兜底)
+
+Mac side `scripts/daily_report.sh` 已经被 advisor unload (round 222 兜底). 工程方装好 ECS Feishu push 后, **不需要 re-enable Mac side** — ECS 应该是唯一的 Feishu pusher.
+
+我 advisor 在 Mac plist 备份 `*.disabled_round222_20260604` 保留 audit trail, 不删除. 之后如果 ECS 装 lark-cli 失败/网络不通, 可以手动 `mv ...disabled_round222_20260604 ...plist` 临时恢复 Mac side fallback.
+
+### 工作量估
+
+- send_to_feishu refactor (lark-cli subprocess → requests.post): 30 min
+- ECS env 配 webhook URL: 5 min
+- 测试 push: 5 min
+- 总 ~40 min, 这周内完成
+
+### 后续 — 用 ECS 跑 daily_report 一致性 + advisor 改 Feishu 推送链路
+
+P0-A 真正完成意味着:
+- ✅ ECS 17:00 唯一 daily_report 来源
+- ✅ ECS 唯一 Feishu pusher
+- ✅ Mac 完全不动 (可以关机 / 出门旅行)
+- ❌ 之前 Mac launchd collect 残留 (我 round 222 兜底 unload, 永久 disabled)
+
+### round 222 priority
+
+**Priority 高于 P2 qfq 周末迁移** (round 217 P2). 理由: 6/5 17:00 ECS daily_report 还是会跑, 但**没人推 Feishu** → user 看不到 prod 执行计划 → 信息不对称。
+
+希望 6/5 17:00 之前 ECS Feishu push 装好. 如果来不及, advisor 临时手工 ssh ECS 读 latest.json 推一份 Feishu, 不让 user 失盲.
+
