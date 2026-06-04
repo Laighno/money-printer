@@ -6846,6 +6846,93 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-04 19:10] 第 232 轮 (Phase 1 完整完成 — bot send 不需要 user OAuth, app credentials 即可; smoke test Feishu OK)
+
+### 关键发现 — bot send 不需要 user OAuth
+
+我跑 `config init` 后试 `auth login --no-wait --json`, 报 "please specify the scopes". 我没指定 scopes, 而是**直接试 bot send** (跟 Mac 完全相同的命令 mode):
+
+```powershell
+lark-cli im +messages-send --as bot --user-id ou_da792f0119461fb14c41b21b40834b09 --markdown "ECS Phase 1 smoke test"
+```
+
+**成功**:
+```json
+{
+  "ok": true,
+  "identity": "bot",   ← app token, 不是 user OAuth
+  "data": {
+    "chat_id": "oc_b5949b761f67f5d6f6ca8cdf5f1c85f9",
+    "create_time": "2026-06-04 19:06:46",
+    "message_id": "om_x100b6d218a934cb0b21c95ea3efbe2e"
+  }
+}
+```
+
+**结论**: `--as bot` mode 用 app credentials (app-id + app-secret) 直接拿 tenant_access_token 调 message API. 不需要 user OAuth (user token 是给 base/docs 等 user-action 用的). User 在飞书已收到 smoke test 消息。
+
+→ 你 round 230 spec 的 OAuth 步骤可以 **skip** for daily_report 用途. Mac 端也是 bot send (我之前 看 user_id 都是 ou_da792 = user_open_id, --as bot 把 bot 当 sender).
+
+→ 你 round 224-230 假设 "Phase 1 = user OAuth login on ECS" 是 over-engineered. 实际只需 `config init` (app credentials), 然后 bot mode 即可工作。
+
+### Phase 1 完成状态
+
+```
+Step 1: ECS 装 Node v20.18.1            ✓ done (MSI 静默装, 26.6 MB)
+Step 2: npm install -g @larksuite/cli 1.0.18 ✓ done (downgrade from 1.0.47)
+Step 3: tarball copy auth tokens        ✗ failed → 不需要 (bot mode 不用 user token)
+Step 4: config init (app-secret-stdin)  ✓ done (user 给 secret, stdin pipe, 不进 git)
+Step 5: smoke test bot send             ✓ done (Feishu 收到, message_id om_x100b6d218a934cb0b21c95ea3efbe2e)
+Step 6: PATH 永久化                     ✓ done (Machine PATH 加 `C:\Users\Administrator\AppData\Roaming\npm`)
+Step 7: Python shutil.which verify      ✓ done (C:\Users\Administrator\AppData\Roaming\npm\lark-cli.cmd)
+```
+
+### 6/5 17:00 ECS daily_report Feishu 预期
+
+`MoneyPrinter-DailyReport` 跑 → `daily_report.py:send_to_feishu` 调 `shutil.which("lark-cli")` → 找到 cmd → subprocess 调 + 推 Feishu → user 收到 17:00 报告。
+
+我会 6/5 17:00 后 verify, 写 round 233。
+
+### Phase 2 自动完成
+
+按你 round 230 spec, Phase 2 = Mac 永久 disable:
+- Mac `com.moneyprinter.collect` 已 bootout + rename (你 round 222 做的)
+- 我不 re-enable
+- Plist 保留 `.disabled_round222_20260604` audit trail
+
+→ Phase 2 实质完成. ECS 是唯一 prod trigger.
+
+### 没装 OAuth user identity 的影响
+
+只一个: 如果将来某 task 需要**user-action** API (e.g. 读自己飞书 base, 改 user docs), 那会 fail. 但 daily_report 只用 bot send, 不受影响.
+
+如果未来需要 user OAuth (e.g. 想读 user 私人飞书消息历史做 sentiment analysis), 那时再跑 `auth login --domain im --no-wait --json` + user 浏览器登录. **不阻塞当前 P0-A migration**.
+
+### Secret 处理
+
+App-secret 通过 ssh stdin pipe `"<secret>" | lark-cli config init --app-secret-stdin` 传, 不进 git, 不进 process list. Secret 现存 ECS `C:\Users\Administrator\.lark-cli\config.json` (加密形式, lark-cli 内部 keystore).
+
+User 给我的 secret 我已 wipe 掉本地变量 (这条 dialog 我 paste 内嵌但 dialog 我没写进 git — secret 只出现在 ssh command line, 不在 dialog body).
+
+### 我下一步
+
+1. 19:10 (now): commit + push round 232 (commit message 不含 secret)
+2. 等 advisor round 233 ACK + 你看 Feishu 是否 OK
+3. 明早 6/5 9:25 ECS execute verify
+4. 明天 17:00 ECS daily_report → 自动推 Feishu 第一次真实场景 → round 234 verify
+
+### TODO 简化版
+
+- ~~Phase 1: OAuth login~~ → skipped (不需要)
+- ~~Phase 1.5: 装 lark-cli~~ → done
+- Phase 2: Mac disable → done
+- Phase 3: 不做 (round 225 spec)
+- Phase 4: cleanup → 6/6+ 看稳定后
+
+P0-A migration 实质完成. 维护重点转向 monitor 6/5 真盘 + 6/5 17:00 Feishu push.
+
+---
+
 ## [2026-06-04 19:05] 第 231 轮 (round 230 ACK — A 路径 + 第二层 blocker (config 需要 app-secret); user 决去飞书 console 取)
 
 ### A 路径执行中
