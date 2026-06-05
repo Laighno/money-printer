@@ -13276,3 +13276,85 @@ E 是 long-term, 但现在的目标是 6/5 17:00 daily_report 能自动推 Feish
 
 不主动写 round, 等 6/5 自然演化. 出问题 alarm 即可.
 
+
+---
+## [2026-06-05 00:30] 第 238 轮 (策略优化研究 — backtest 验证 TOP_K 10→25 是最大优化空间, 需工程方翻译 prod rank-threshold 逻辑)
+
+### 背景
+
+User 问"交易策略科学吗, 有优化空间吗", 我用现成 `walk_forward_backtest.py` (月度滚动重训, 2022-2026, 4.4yr) 跑了完整策略对比. 报告: `data/reports/strategy_comparison_topk.md` (已 commit ba170b0).
+
+### 核心发现 — TOP_K 是最大优化空间
+
+| TOP_K (conviction) | Total | Sharpe | MaxDD |
+|---:|---:|---:|---:|
+| 10 (回测等价现 prod) | 150% | 0.84 | -30.6% |
+| 15 | 193% | 1.11 | -27% |
+| 20 | 174% | 1.17 | -24.6% |
+| **25** | **186%** | **1.29** | **-20.3%** |
+| 30 | 178% | 1.34 | -17.1% |
+| 40 | 155% | 1.28 | -17.9% (稀释) |
+
+逐年验证: top-25 跑赢 top-10 **4/5 年**, 2022 熊市分散优势最大, 跨 regime robust (非单年运气).
+
+其它 A/B (都 inferior):
+- equal sizing: 收益砍半 (conviction 的信号加权抓真 alpha)
+- inverse_vol / vol_target: ❌ 砍收益一半
+- stop-loss -10/-15: ~无效 (月度 rebalance 已出清亏损)
+- industry-cap 3: 不 binding (model 已分散)
+
+→ **现 prod conviction sizing 正确, 但持仓数严重次优**.
+
+### ⚠️ 关键 — prod 不是简单 TOP_K=10, 需要你翻译
+
+我查了 prod `daily_report.py`:
+- `recommend_stocks(ranker, n_recommend=5)` — 只显示/新买 top-5
+- `generate_order_list` 按 **rank 阈值** 决定持仓:
+  - rank ≤ Top 30: keep / 加仓
+  - Top 30 < rank ≤ Top 100: trim (减半仓)
+  - rank > Top 100: 清仓
+- 现 prod 实际持仓 ~14 只 (今天 6/4 是 14 positions)
+
+→ prod 的"持仓数"是 rank 阈值的隐式产物, 不是单一 TOP_K 参数. backtest 的 TOP_K=25 (每日 rebalance 到恰好 25 只) 跟 prod 的 rank-threshold 逻辑**不直接对应**.
+
+### 需要你做的翻译
+
+把 backtest "TOP_K=25 conviction" 映射到 prod rank-threshold 逻辑. 几个选项:
+
+**Option A (最简, 推荐): 扩 keep 阈值 Top 30 → Top 25, 同时 n_recommend 5 → ~12**
+- 让 prod 实际持仓数稳定在 ~25 (现 ~14)
+- 保持 conviction 加权 (现已是)
+- 改动: `daily_report.py` rank 阈值常数 + n_recommend
+
+**Option B: 显式 TARGET_HOLD_COUNT=25 参数**
+- 重构 generate_order_list 用目标持仓数而不是 rank 阈值
+- 更 clean 但改动大
+
+**Option C: 先验证 prod 现状 (~14 只) 在 backtest 的等价表现**
+- backtest 跑 TOP_K=14 看 prod 现在大概什么 Sharpe (估计 SR ~1.0, 在 top-10 和 top-15 之间)
+- 再决定加到多少
+
+### 我建议先 C 再 A
+
+1. **C**: 你确认 prod 当前 effective 持仓数 (rank 阈值算出来平均几只), 我 backtest 跑那个 K 当真实 baseline
+2. **A**: 然后改阈值让持仓 ~25, 灰度观察
+
+### 不要急着上 prod
+
+这是 backtest 优化, 不是 bug fix. 真钱改持仓数需谨慎:
+- backtest 4.4yr robust, 但跟 prod rank-threshold 逻辑有 gap
+- 建议先 paper-trade / dryrun 对比 ~14 vs ~25 持仓数几周
+- 确认 friction / fill rate 在真盘没问题 (25 只比 14 只多 ~换手)
+
+### Rule 提醒
+
+- backtest 代码改 (env var overlay) 已 commit, 不动 prod model (Rule #4)
+- prod TOP_K 改动 = 业务逻辑, 你做, 我不直接改 daily_report.py
+- OOS Arm B path (14:30 c2c) 有 ¥20k/日 cap, 单独考量, 这次 sweep 只覆盖 EOD n2c path
+
+### 等你
+
+1. 确认 prod 现 effective 持仓数 (rank 阈值平均产出几只)
+2. ACK Option A/B/C 哪个方向
+3. 是否需要我补跑 backtest TOP_K=14 (prod 真实 baseline) 或其它 K
+
