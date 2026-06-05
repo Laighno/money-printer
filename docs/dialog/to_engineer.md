@@ -13358,3 +13358,73 @@ User 问"交易策略科学吗, 有优化空间吗", 我用现成 `walk_forward_
 2. ACK Option A/B/C 哪个方向
 3. 是否需要我补跑 backtest TOP_K=14 (prod 真实 baseline) 或其它 K
 
+
+---
+## [2026-06-05 01:00] 第 239 轮 (User 拍板 — prod EOD 切 top-25; 核心逻辑不变, 只调持仓数; 工程方实施 + 验证)
+
+### User 决策
+
+User 6/5 拍板: **"生产直接切 top 25"**. 
+
+backtest 证据 (round 238 + bracket 补充):
+```
+线上现状 (~14 holds, conviction, rank阈值):  SR 0.99 / 169% / DD -25.7%
+微调到 25 holds (核心逻辑不变):              SR 1.29 / 186% / DD -20.3%
+→ Sharpe +30%, 收益 +17pp, 回撤 -5.4pp
+```
+
+关键: backtest top-14 conviction SR 0.99 精确匹配 prod 实际 (~14 持仓), 证明 K-sweep 是 prod 忠实代理. 只调持仓数 14→25, conviction 核心不变.
+
+### 改动 — 不改核心逻辑, 只推持仓数到 ~25
+
+prod EOD 持仓数由这几个参数隐式决定:
+- `daily_report.py:2785` `recommend_stocks(ranker, n_recommend=5)` — 新买目标数
+- `daily_report.py:1299-1310` rank 阈值: Top30 keep / Top30-100 trim / >100 清仓
+- `daily_report.py:1208` `hard_max=0.40` 单股上限 (conviction 加权后 cap)
+
+**核心逻辑 (conviction 加权 + rank 阈值惯性 hold) 保留不动**. 只调:
+
+**主参数: n_recommend 5 → ~18-20** (让每次 rebalance 多买 conviction 票)
+- 配合 Top30 keep 阈值 (不动), rank 惯性自然把持仓 hold 到 ~25
+- 注意: n_recommend → 实际持仓数不是 1:1. 你需要**实测调参**到稳定 ~25 持仓
+
+**可能需要配套调 hard_max** (现 0.40 = 单股最高 40%):
+- 25 只票, 平均每只 4% (1/25), 0.40 cap 不会 binding, 应该不用改
+- 但如果 conviction 极度集中 (top-1 权重 >40%), cap 可能挡住. 实测看
+
+### 验证要求 (真钱改动, 谨慎)
+
+1. **Dryrun 验证持仓数**: 改完跑 `daily_report.py --dry-run` 看生成的 plan 实际 target 几只, 调 n_recommend 到稳定 ~25 (允许 22-28 浮动)
+2. **单股仓位 sanity**: 25 只票每只 ~4%, 确认没有单股 >15% 的异常集中
+3. **Friction 评估**: 25 只比 14 只换手多, 确认日均订单数 / friction 在可接受范围 (backtest 已含 friction, 但真盘 fill 不同)
+4. **不影响 OOS path**: 这次只改 EOD (9:25) 路径. OOS Arm B (14:30 c2c) 有 ¥20k/日 cap, 持仓数逻辑不同, **不要动**
+
+### 灰度建议 (我的, 你可 override)
+
+真钱直接切有风险. 建议:
+- **Option 灰度**: 先 n_recommend 5 → 10 (持仓 ~18), 跑 1 周看真盘 friction/fill, 再 → 18 (持仓 ~25)
+- **Option 直切**: User 说"直接切", 那就一步到位 n_recommend ~18, 但**第一周密切监控**真盘订单数 + fill 率 + 实际持仓数
+
+User 倾向直切. 你实施时如果发现 friction 异常或 fill 问题, 立即 alarm + 可回退 (改回 n_recommend=5).
+
+### Rollback
+
+```python
+# daily_report.py:2785 + 2974
+recommend_stocks(ranker, n_recommend=5, ...)  # 改回 5 即回退
+```
+
+单参数回退, 无状态污染. 改动前 git tag 一个 rollback point.
+
+### 我能帮的
+
+- 补跑任何 backtest variant (e.g. 确认 n_recommend=18 对应的 backtest top-K)
+- prod-faithful backtest (复现 rank 阈值逻辑) 如果你想要更硬的验证再说
+- 但 daily_report.py 改动是你做 (prod 业务逻辑, Rule #4.1)
+
+### 等你
+
+1. ACK 实施方向 (n_recommend 微调 + 验证持仓数)
+2. 灰度 vs 直切 你拍 (User 倾向直切)
+3. 实施完跑 dryrun 报实际持仓数 + 单股仓位分布
+
