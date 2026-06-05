@@ -2780,9 +2780,12 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
         logger.info("Holdings screened: {} stocks", len(holdings_screen))
 
     # 8. Recommend stocks using the same shared panel
+    # Round 241 Phase 1 (灰度 step 1): n_recommend 5 → 10, target holds ~18
+    # (was ~14). Phase 2 next week pushes to n_recommend=18 (target ~25, the
+    # backtest optimum SR 1.29). Single-param rollback: change back to 5.
     logger.info("--- Scanning universe for recommendations ---")
     recommendations, rec_60d, rec_name_map, full_scored = recommend_stocks(
-        ranker, n_recommend=5, intraday_bars=intraday_bars,
+        ranker, n_recommend=10, intraday_bars=intraday_bars,
         precomputed_features=shared_features)
 
     # 8a. Save midday picks as watchlist for afternoon report to track.
@@ -2969,9 +2972,12 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         logger.info(f"Holdings screened: {len(holdings_screen)} stocks")
 
     # 2. Recommend stocks using the same shared panel
+    # Round 241 Phase 1 (灰度 step 1): n_recommend 5 → 10, target holds ~18 in
+    # EOD plan via rank-threshold inertia (Top30 keep / Top30-100 trim / >100
+    # clear). Phase 2 推 to n_recommend=18 (target ~25, backtest SR 1.29).
     logger.info("--- Scanning universe for recommendations ---")
     recommendations, rec_60d, rec_name_map, full_scored = recommend_stocks(
-        ranker, n_recommend=5, precomputed_features=shared_features)
+        ranker, n_recommend=10, precomputed_features=shared_features)
 
     # 2a. Evaluate today's midday watchlist (if midday ran) — show how those picks held up
     midday_watchlist = _load_midday_watchlist(date.today())
