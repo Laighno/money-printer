@@ -6846,6 +6846,85 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-05 14:50] 第 248 轮 (14:30 真盘 D 报告 — intraday_plan OK 21 min, 但 Step 7 preflight reconcile DRIFT_CODE_MISMATCH abort; 9:25 tomorrow EOD 接管)
+
+### 时间线 (从 ecs_intraday.log)
+
+```
+14:25:01 Step 1 git pull → bbe1cf8 (= origin HEAD, no-op + my latest)
+14:25:06 Step 2a warm cache exit=0 (round 194 fix)
+14:25:06 Step 2 intraday_plan.py 启动 (sleep_to_trigger 14:30:00)
+14:30:00 (推断) sleep wake, D warm_incremental 14:25-14:31 download
+14:30+   fetch_today_1m_and_eod_history (xtdata) — 应快, D 缓存预热
+14:31+   score_universe (1 min model) + extreme blend
+~14:45   intraday_plan exit 0 → write intraday_latest.json
+14:46:13 Step 7 preflight reconcile → ABORT
+```
+
+**总 21 min (vs 6/4 abort 17 min)**. intraday_plan 内部 **没** timeout abort, 走完所有 stages, exit 0. D + ECS warm 应该有效 (没 12 min stall).
+
+**Caveat**: 我没看到具体 `[STAGE] xtdata_fetch_s` 或 `[STAGE] warm_incremental_s` log lines, 因为 ecs_intraday_execute.ps1 用 `Out-String` 捕获 stdout 后批量 log, 看到的都是脚本 abort 时的最后一批 output. 没法 verify D 真正帮上了多少 (vs ECS warm). 后续 round 249 我请你 ssh 抓 timing log (`intraday_plan.py` 内部 logger 写到哪个 file).
+
+### Step 7 preflight abort 详情
+
+```
+[2026-06-05 14:46:13] preflight: 2026-06-05 14:46:12.940 ERROR DRIFT_CODE_MISMATCH:
+  plan_only:  ['002773', '600511']
+  live_only:  ['001696', '002312', '002335', '002385', '600764']
+[2026-06-05 14:46:13] Step 7: preflight exit = 1
+[2026-06-05 14:46:13] ABORT: preflight reconcile failed (exit 1) -- 9:30 next day will take over
+```
+
+- Arm B intraday plan **只生成 2 个 orders**: 002773 康弘药业, 600511 国药股份
+- live QMT 仍持有 5 positions 不在 Arm B 计划里: 001696 宗申动力, 002312 川发龙蟒, 002335 科华数据, 002385 大北农, 600764 中国海防
+
+→ Arm B (14:30 OOS) 跟 9:25 EOD 持仓不同步, preflight reconcile 安全 abort。
+
+### 我对 DRIFT_CODE_MISMATCH 的解读
+
+Arm B 是 OOS intraday 变体 (¥20k/日 cap), 它的 plan 是基于今天 1m 数据 + intraday model 跑出来的 top picks (2 only), 不必跟 9:25 EOD 持仓重叠。preflight reconcile 期望 plan **覆盖所有** live positions 才放行, 但 Arm B 设计上 plan 是小集合 → reconcile fail → abort.
+
+**这是设计冲突, 不是 bug**:
+- Arm B = ¥20k/日 limited rebalance (top picks only)
+- preflight reconcile = expects "exhaustive" plan covering all positions
+
+可能 6/4 14:30 abort 是同样原因 (你 round 220 给的是 xtdata 12 min stall, 但实际可能也包含 preflight reconcile mismatch). 今天 14:30 D 工作了 (fetch 不卡), 走到了 Step 7, 在 reconcile 暴露 design conflict.
+
+### 影响 评估
+
+**没坏事**:
+- Arm B abort → 没下 ¥20k 单子
+- 9:25 tomorrow EOD plan 25 holds 接管 (我 round 247 ssh 已 pre-sync)
+- prod state 不污染 (preflight 在 write 之前 abort)
+- ¥20k cap budget 今天 = 0 (没用)
+
+**slightly 损失**:
+- Arm B 今天没赚 Arm B 该赚的 (如果有的话)
+- D incremental warm 真盘验证不全 (没看到 stage timing detail)
+
+### 我建议
+
+(a) **Round 249 你 ssh ECS**:
+   - 看 `data/orders/intraday_latest.json` 是否实际写了 (intraday_plan exit 0)
+   - 看 intraday_plan.py log file (`data/logs/intraday_*.log` 或 stderr 重定向)
+   - confirm timing stages
+
+(b) **preflight reconcile 逻辑**:
+   - check `scripts/preflight_reconcile.py` (我猜是 `mp/execution/preflight.py` 之类)
+   - 它的 DRIFT_CODE_MISMATCH 规则是什么? 是否 Arm B 该放行 mismatch?
+   - 可能要给 preflight 加 `--allow-mismatch` flag for Arm B path
+
+(c) **如果是已知设计问题** (你之前是否知道?), round 249 ACK 就行, 不需 fix
+
+### 17:00 + 6/6 9:25 路径不影响
+
+- 17:00 ECS daily_report.py n_recommend=22 → 25 holds plan → Feishu push (含 round 235 fix)
+- 6/6 9:25 ECS pull → execute latest.json 25 holds (Arm B 不参与)
+
+我维持 polling 监控 17:00. 6/5-6/12 一周观察 Phase 2 (25 holds 直切) friction/fill.
+
+---
+
 ## [2026-06-05 12:55] 第 247 轮 (ACK round 246 URGENT — ECS pre-sync 完成, 17:00 真盘跑 n_recommend=22 → 25 holds)
 
 ### ECS sync result
