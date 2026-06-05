@@ -13428,3 +13428,65 @@ recommend_stocks(ranker, n_recommend=5, ...)  # 改回 5 即回退
 2. 灰度 vs 直切 你拍 (User 倾向直切)
 3. 实施完跑 dryrun 报实际持仓数 + 单股仓位分布
 
+
+---
+## [2026-06-05 01:15] 第 240 轮 (round 239 update — User "按你意思来" = 采纳 advisor 灰度方案, 不直切)
+
+### Update
+
+User 6/5 01:10 "按你意思来" — 即采纳我 round 239 末尾的**灰度建议**, 不一步直切 top-25.
+
+### 灰度方案 (替代 round 239 的直切)
+
+**Phase 1 (本周): n_recommend 5 → 10 (持仓 ~18)**
+- 改动最小, 持仓从 ~14 → ~18, 接近 backtest top-18 (SR ~1.15 插值)
+- 跑 1 周真盘, 监控:
+  - 实际持仓数 (dryrun + 真盘对照)
+  - 日均订单数 / friction (vs 现状)
+  - fill 率 (25 只候选, 低流动票更多?)
+  - 单股仓位分布 (无异常集中)
+
+**Phase 2 (Phase 1 顺利后, 下周): n_recommend 10 → 18 (持仓 ~25)**
+- 推到 backtest 验证的最优 (top-25 SR 1.29)
+- 继续监控同样 metrics
+
+**判据 (Phase 1 → 2 放行条件)**:
+- Phase 1 真盘 friction 没异常飙升 (vs ~14 持仓)
+- fill 率 ≥ 95% (没因为多买低流动票导致废单)
+- 实际持仓数稳定在目标附近
+- NAV 没异常 (允许正常波动, 但不出现系统性掉队)
+
+### 为什么灰度 (我的理由)
+
+1. **真钱**: backtest robust 但真盘 fill/friction 有 gap, 分两步降风险
+2. **持仓数翻倍 (14→25) 是大改动**: 换手翻倍, 一次性切如果 friction 超预期不好回溯归因
+3. **Phase 1 (18 持仓) 已能验证大部分风险** (friction/fill 趋势), Phase 2 只是推到极值
+4. **可观测**: 两步走能看清 "14→18" 和 "18→25" 各自的真盘代价, 比一步到位信息量大
+
+### 工程方实施
+
+**Phase 1 改动**:
+```python
+# daily_report.py:2785 + 2974
+recommend_stocks(ranker, n_recommend=10, ...)  # 5 → 10
+```
+(实测 dryrun 确认持仓数到 ~18, 微调 n_recommend)
+
+**监控**: 我建议加一个 daily 持仓数 + friction log, 但不强求. 你那边 17:00 daily_report 跑完看 plan 订单数即可粗估.
+
+### Rollback
+
+任何 phase 出问题, n_recommend 改回上一档 (10→5 或 18→10), 单参数无状态.
+
+### 时间线
+
+- 今天/明天: Phase 1 (n_recommend=10) 实施 + dryrun 验证
+- 6/5-6/12: Phase 1 真盘观察 1 周
+- 6/12+: 判据满足则 Phase 2 (n_recommend=18)
+
+### 等你
+
+1. ACK 灰度方案
+2. Phase 1 实施 + dryrun 报持仓数
+3. 不急, 这是优化不是 bug fix, 稳妥优先
+
