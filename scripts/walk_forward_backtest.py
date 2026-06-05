@@ -218,7 +218,10 @@ INTRADAY_HYBRID = os.environ.get("INTRADAY_HYBRID", "0") == "1"
 # proving the model's edge is real, not future-leaked.
 POSITION_SIZING = os.environ.get("POSITION_SIZING", "conviction")
 assert POSITION_SIZING in ("equal", "inverse_vol", "conviction", "vol_target",
-                           "conviction_oracle"), f"Unknown POSITION_SIZING={POSITION_SIZING}"
+                           "conviction_oracle", "rank_decay", "rank_linear",
+                           "conviction_softcap"), f"Unknown POSITION_SIZING={POSITION_SIZING}"
+# Soft per-position cap for conviction_softcap (fraction of portfolio).
+SOFT_CAP = float(os.environ.get("SOFT_CAP", "0.06"))
 # "conviction_oracle" = LEAK-CHECK ONLY.  Uses REALIZED fwd_ret as conviction,
 # which is information the model could not have at decision time.  Result is
 # the upper bound of "perfect-conviction" performance.  If real conviction is
@@ -511,6 +514,54 @@ def _compute_position_weights(
         if s <= 0:
             return {c: 1.0 / n for c in codes}
         return {c: adj[c] / s for c in codes}
+
+    # rank_decay: weight ∝ 1/rank (codes already sorted by score desc, so index
+    # i → rank i+1). Uses only the ORDINAL ranking, not the cardinal predicted
+    # magnitude (avoids over-trusting the model's calibration of +7% vs +2%).
+    if sizing == "rank_decay":
+        adj = {c: 1.0 / (i + 1) for i, c in enumerate(codes)}
+        s = sum(adj.values())
+        return {c: adj[c] / s for c in codes}
+
+    # rank_linear: weight ∝ (N - rank + 1) = linear decay. Smoother than 1/rank
+    # (top doesn't dominate as hard). #1 gets N units, #N gets 1 unit.
+    if sizing == "rank_linear":
+        adj = {c: float(n - i) for i, c in enumerate(codes)}
+        s = sum(adj.values())
+        return {c: adj[c] / s for c in codes}
+
+    # conviction_softcap: conviction magnitude weighting but cap each position at
+    # SOFT_CAP (default 6%), redistribute excess to uncapped names iteratively.
+    if sizing == "conviction_softcap":
+        if not raw_scores:
+            return {c: 1.0 / n for c in codes}
+        epsilon = 0.005
+        adj = {c: max(raw_scores.get(c, 0.0), 0.0) + epsilon for c in codes}
+        s = sum(adj.values())
+        if s <= 0:
+            return {c: 1.0 / n for c in codes}
+        w = {c: adj[c] / s for c in codes}
+        # Iteratively cap + redistribute excess to uncapped names
+        cap = SOFT_CAP
+        for _ in range(20):
+            over = {c: v for c, v in w.items() if v > cap + 1e-9}
+            if not over:
+                break
+            excess = sum(v - cap for v in over.values())
+            for c in over:
+                w[c] = cap
+            uncapped = [c for c in w if w[c] < cap - 1e-9]
+            if not uncapped:
+                break  # everyone at cap, can't redistribute (cap too low for N)
+            unc_sum = sum(w[c] for c in uncapped)
+            if unc_sum <= 0:
+                add = excess / len(uncapped)
+                for c in uncapped:
+                    w[c] += add
+            else:
+                for c in uncapped:
+                    w[c] += excess * (w[c] / unc_sum)
+        return w
 
     if sizing == "vol_target":
         # Estimate portfolio vol assuming average pairwise correlation ρ.
