@@ -13689,3 +13689,68 @@ daily_report.py n_recommend == 22 (3 处: 2789 + 2980, run_daily + run_midday)
 3. 报 round 247 确认 ECS 真部署 top-25
 4. 17:00 daily_report 跑 25 holds (不是老 14)
 
+
+---
+## [2026-06-05 14:48] 第 247 轮 (14:30 OOS D 首跑 — D 没达设计效果 + score_universe 637s 盘中瓶颈 + preflight drift abort)
+
+### 14:30 OOS timing 实测 (D incremental warm 首次真盘)
+
+```
+[STAGE] sleep_to_trigger:    289s  (睡到 14:30:00)
+[STAGE] warm_incremental:    154s  ← D 新增 (round 221), 期望 30-60s, 实测 154s
+[STAGE] xtdata_fetch:        155s  ← 全天 fetch
+[STAGE] score_universe:      637s  ← build_features + predict (10.6 min!)
+总: 14:25 start → 14:45:56 plan 写出 = ~16 min wall (扣 sleep ~11.5 min 实算)
+```
+
+### 问题 1 — D incremental warm 没达设计目的
+
+你 round 221 D 设计: 14:30 醒来预拉 14:25-31 chunk → 后续 fetch 走 cache 秒级.
+
+实测: warm_incremental 154s + xtdata_fetch 仍 155s. **D 没减少 fetch, 反而净增 154s**.
+- 期望: D ~30s + fetch 跳到 ~10s (cache hit) = ~40s
+- 实测: D 154s + fetch 155s = 309s (比不加 D 还慢)
+
+→ D 没生效. 可能 download_history_data2(14:25-31) 跟后续 get_market_data(全天) 的 cache key 不同, 没命中. 或 14:25-31 chunk 本身 download 慢 (盘中 xtdata busy).
+
+### 问题 2 — score_universe 637s 是真瓶颈 (盘中 vs 收盘后 4.4×)
+
+```
+今天 14:30 盘中:  score_universe 637s (10.6 min)
+昨天 15:05 收盘后 replay: score_universe 142s (2.4 min)
+→ 盘中慢 4.4×
+```
+
+原因推测: 14:30 盘中 ECS QMT/xtdata 实时数据流 + ProcessPool workers 抢 CPU. 收盘后没竞争所以快.
+
+→ **盘中 build_features + ProcessPool predict 严重降速**. 这是 14:30 OOS 路径的根本性能问题, 不是 fetch.
+
+### 问题 3 — preflight drift abort (执行没发生)
+
+```
+14:46:13 Step 7 preflight DRIFT_CODE_MISMATCH → ABORT
+  plan_only:  002773, 600511
+  live_only:  001696, 002312, 002335, 002385, 600764
+```
+
+14:30 OOS plan 基于 stale portfolio.yaml 生成, 跟实盘 QMT (今早 9:25 卖单后) 漂移 >5% → preflight fail-safe abort. 没下单. 6/6 9:25 EOD 接管.
+
+### 综合 — 14:30 OOS 路径今天没成交
+
+- ✓ plan 生成了 (D 让它没 stall 到 6/4 那样无限卡, 但仍 16 min 太慢)
+- ✗ 执行被 preflight 拦 (drift) — 安全但意味 OOS 又一天没真盘数据
+
+### 这些都不影响 user 的 top-25 (EOD path)
+
+14:30 OOS = c2c v2 Arm B 实验路径. top-25 是 EOD path (17:00 plan → 6/6 9:25). 完全独立, 17:00 不受盘中性能问题影响 (17:00 收盘后, score 快).
+
+### 建议 (不急, 6/9 跟 C/audit 一起)
+
+1. **D 重新评估**: 实测显示 D 没生效, 可能要么修 cache key 对齐, 要么干脆撤 D (它净增时间). 等你看 download_history_data2 的 cache 机制.
+2. **score_universe 盘中降速**: 14:30 OOS 要可用必须解决盘中 scoring 637s. 选项: (a) 限 ProcessPool workers 数避免抢 QMT 资源 (b) 14:30 OOS 缩 universe (但 round 早期 user 说不准砍 universe) (c) 预算盘中本来就慢, 接受 14:30 plan ~15 min 但要在 14:55 前完成才能 execute
+3. **preflight drift**: OOS plan 用 stale portfolio 是顽疾. 14:30 之前应 re-sync portfolio.yaml from QMT (像 daily_report Step 0). 现在没 sync → 必 drift abort.
+
+### 现在盯 17:00 top-25 EOD
+
+我继续盯 17:00 daily_report (n_recommend=22, 25 holds) + Feishu push (node-direct fix). 17:05 左右 verify, 报 user.
+
