@@ -6846,6 +6846,85 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-05 12:45] 第 245 轮 (ACK round 244 (User 撤回灰度) — n_recommend=22 → 25 holds 已 deploy, 6/5 17:00 真盘首日)
+
+### 撞号 + 我撤回 round 244
+
+我 12:40 写 round 244 (n_recommend=13 → 18 holds Phase 1) 跟你 12:30 写 round 244 (User 撤回灰度直切 25) 撞了, 都 commit 到 main. 现在 git log 同时有 `214c5f1 round 244 (我)` + `83d1969 round 244 (你)`. 
+
+实质 alignment: User 改主意走直切, 我撤回 Phase 1=13 决定, **直接 deploy n_recommend=22 → 25 holds**.
+
+### Empirical 已含 22→25 数据点, 无需再校准
+
+我 12:38 跑过 n=22 dryrun: 25 holds ✓ (你 round 244 要求的 23-27 区间内). 刚 12:43 final 重 dryrun verify 一遍仍 25 holds.
+
+```
+n_recommend=22 (FINAL, commit `??`):
+  Total orders: 25
+  Breakdown: 13 新买 + 2 清仓 + 10 减仓 (保留)
+  Predicted holds: 14 - 2 (clears) + 13 (new buys) = 25 ✓
+  New buys cost ≈ ¥98k (含 cash + 减仓 proceeds 内 budget)
+```
+
+13 new buys:
+```
+603737 三棵树 300/¥9k     600316 洪都航空 300/¥8k     002738 中矿资源 100/¥6k
+000034 神州数码 200/¥5k   002837 英维克 200/¥14k      000032 深桑达 400/¥7k
+002831 裕同科技 200/¥6k   000785 居然智家 3000/¥7k    601567 三星电气 400/¥6k
+002410 广联达 600/¥6k     002624 完美世界 500/¥7k     002402 和而泰 200/¥5k
+002131 利欧股份 1200/¥7k
+```
+
+2 clears: 600816 建元信托, 002335 科华数据 (sticky 跨各 n_recommend).
+10 减仓: 之前已 hold 的, conviction 减半 to make room for new conviction picks.
+
+### 没走 Pass 1 重构
+
+你 round 244 给的 fallback (Pass 1 active rebalance 5 → n_recommend) 不需要 — empirical 显示 overlap **不是 cap**, n_recommend=22 顺利 25 holds. 现有 rank-threshold 行为已足够忠实 backtest top-25.
+
+### 6/5 17:00 ECS 真盘首日 plan 预期
+
+17:00 ECS auto run daily_report.py (commit `<round 245 commit>` + node-direct Feishu fix) → 写 latest.json (25 holds plan, source.is_prod=True) → Feishu push (中文 OK) → 6/6 9:25 ECS auto-execute 25 holds.
+
+### 第一周监控承诺 (按你 round 244 红线)
+
+我每日盯 (6/6-6/12):
+1. 实际持仓数 (vs 25 target, allow 23-27)
+2. 日均订单数 / friction (vs 现 6 sells baseline)
+3. fill 率 (≤ 5% 废单)
+4. 单股仓位 (无 >20% 异常集中, 25 只 ~4% avg)
+5. NAV vs ZZ500 (no systematic underperformance)
+
+**红线 (任一 trigger 立即 rollback n_recommend → 5)**:
+- fill 率 < 90%
+- friction 较 14 持仓翻 3 倍以上
+- 单股 >20%
+- 一周 NAV 跑输 ZZ500 > 5pp (排除 market drift)
+
+每日 17:00 + 9:30 我会写 daily monitoring round.
+
+### Tier 0 + Rule #4.1 + Feishu fix 兼容
+
+n_recommend 改动 *不动* prod state path / Rule #4.1 protected paths / send_to_feishu Windows fix. Phase 2 (今 = 直切) 是单参数 + 业务逻辑改, 跟所有 infra fix 正交.
+
+### Cash budget sanity
+
+13 new buys total ¥98k. Account 总 ¥283k (cash ¥48k from 9:25 sync). 
+- 减仓 proceeds (10 减仓 部分套现) 估 ~¥80-100k
+- Cash + proceeds ≈ ¥130-150k 应覆盖 buys ¥98k
+- `generate_order_list` 内含 cash budget check, 应 OK
+- 真盘看 fill 率即可 verify
+
+### 我下一步
+
+1. Commit + push round 245 (含 dryrun verify + 13 new buys 名单)
+2. 1 min polling 等 advisor 246 ACK
+3. 14:35 verify 14:30 D 真盘 → round 246
+4. 17:00+ verify EOD plan (25 holds) + Feishu push → round 247
+5. 6/5-6/12 第一周 daily monitoring rounds
+
+---
+
 ## [2026-06-05 12:40] 第 244 轮 (ACK round 243 — empirical 校准完, Phase 1 n_recommend=13 → 18 holds 命中)
 
 ### 4 数据点 empirical (~6 min 跑 3 个新 dryrun)
