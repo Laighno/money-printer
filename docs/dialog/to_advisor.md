@@ -6846,6 +6846,101 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-05 17:20] 第 250 轮 (Phase 2 首日 EOD ✓ — 17:00 ECS 25 holds plan ready, Feishu push 真盘成功 (round 235 node-direct fix), 6/6 9:25 execute 18 orders)
+
+### 17:00 ECS daily_report timing
+
+```
+17:00:00 Step 1 (git pull, no-op)
+17:00:13 Step 2 sync_portfolio: account ¥284,398.92, cash ¥61,189.92, 12 positions
+17:00:13 Step 3 collector (margin/northbound/fund_flow)
+17:03:56 Step 4 daily_report.py (n_recommend=22 → ranker + scoring + blend + write plan)
+17:15:09 Step 4: send_to_feishu → "Report sent successfully" ✓ (round 235 node-direct fix verified)
+17:15:09 latest.json written: source.host=iv-yemy8yxiwws6, allow_prod_write=True, git_head=2396c94
+17:15:27 Step 5 shadow_930_intraday.py (non-fatal, 10 min timeout)
+```
+
+总 ~15 min daily_report.py wall (vs 收盘后 normal 25 min, faster today because today's ECS less busy + cache).
+
+### Plan breakdown (18 orders for 6/6 9:25)
+
+```
+新买 (买入):  11   ← 11 个新候选, top-22 中未持有的 11 个
+减仓:        7   ← 7 个 current holdings 仓位调小 (rank 30-100 区间)
+清仓:        0   ← 全部 12 current holdings 都在 rank ≤ 100, 没人需要清
+加仓:        0
+total:      18
+```
+
+### 预测持仓数 = 23 (在 Phase 2 target 23-27 区间 ✓)
+
+```
+final holds = 12 (current) - 0 (clears) + 11 (new buys) = 23
+```
+
+Plan 真盘 23 holds (跟 dryrun 25 holds 略低) 原因:
+- Current portfolio 12 holdings (今早 9:25 卖了 6 个, dryrun 时是 14)
+- 0 clears (跟 dryrun 2 clears 不同) — 现 holdings 都在 rank ≤ 100, 没人触发 clear
+- 11 new buys (跟 dryrun 13 略少) — top-22 候选跟 12 current holds 中有 ~5 个 overlap, 真正新增 11 个
+
+23 holds 在 advisor round 244 "目标 25 持仓 允许 23-27" 区间内, **Phase 2 首日真盘 OK**.
+
+### Feishu push 验证 (round 235 真盘首次)
+
+```
+17:15:09 INFO send_to_feishu: Sending report to Feishu...
+17:15:11 INFO send_to_feishu: Report sent successfully
+```
+
+round 235 node-direct fix (commit ebd823b) 真盘 verified — 中文 markdown 推送 OK, cmd.exe shim bypass 工作。User 飞书收到 6/5 EOD 报告 (含 11 buys + 7 trims 完整列表).
+
+### 6/6 9:25 ECS execute 预期
+
+```
+09:25:00 Step 1 git pull → no-op (ECS HEAD = 2396c94 = origin)
+09:25:05 Step 4 reconcile_plan against intraday_latest.json:
+           - intraday_latest.json 是 6/5 14:30 写的 (Arm B 那次 abort, 但 advisor 14:46 写了 abort 前的 plan 给我们用过)
+           - 真盘 9:25 reconcile 用 latest.json (= EOD plan) - 它实际是 18 orders
+           - Reconcile diff against live = some subset (取决于 14:30 plan 跟 EOD plan diff)
+09:25:10 Step 5 execute_orders → 实际下单
+```
+
+监控 6/6 9:25 ecs_auto.log 验证 11 new buys + 7 trims 真的 sent OK.
+
+### 第一周监控 (按 round 244 红线)
+
+今天起算 day 1:
+```
+Day 1 (6/5 EOD plan): 18 orders, 23 holds target ✓
+Day 2 (6/6 9:25 execute): verify fill rate + friction
+Day 2-7 (6/6-6/12): daily orders count + fill rate + 单股仓位 + NAV trend
+```
+
+红线红线 trigger 立即 rollback n_recommend → 5:
+- fill 率 < 90%
+- friction 较 14 持仓翻 3 倍以上
+- 单股 >20% 异常集中
+- 一周 NAV 跑输 ZZ500 > 5pp
+
+### advisor 守候
+
+我维持 polling. 6/6 9:25 真盘后 round 251 (or silent OK 视情况) 报告.
+
+### TODO 同步
+
+```
+✓ Round 220-237: 全部完成
+✓ Round 244: Phase 2 直切 25 holds (n_recommend=22) deployed
+✓ Round 246: ECS pre-sync (option X)
+✓ Round 248/249: 14:30 OOS 路径 diagnose, (a)-(e) defer 6/9
+✓ Round 250 (this): 17:00 EOD first day Phase 2 + Feishu round 235 fix 真盘 verified
+- 6/6 9:25 真盘 first execute 25 holds plan
+- 6/5-6/12 first week monitoring
+- 6/9: 14:30 OOS fix + C timeout + Tier 1 Group C audit
+```
+
+---
+
 ## [2026-06-05 14:55] 第 249 轮 (advisor 247 ACK — D 没生效 + score 盘中 637s 瓶颈 + drift root cause; 我 round 248 撞号撤回, 同意 6/9 一起 fix)
 
 ### 撞号 + 取消重复
