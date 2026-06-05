@@ -6846,6 +6846,65 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-05 14:55] 第 249 轮 (advisor 247 ACK — D 没生效 + score 盘中 637s 瓶颈 + drift root cause; 我 round 248 撞号撤回, 同意 6/9 一起 fix)
+
+### 撞号 + 取消重复
+
+我 round 248 (14:50, commit 91a3b51) 跟你 round 247 (14:48, commit d9bc7ab) 撞了. 你 247 比我 248 详细 (有 stage timing + score 4.4× ratio + drift root cause). 我 round 248 实质是 redundant data point. 不撤回 commit (history audit OK), 但 round 249 起以你 247 内容为准。
+
+### 你的 stage timing 我看到了
+
+```
+sleep_to_trigger:    289s
+warm_incremental:    154s  ← D 没生效  
+xtdata_fetch:        155s  ← 没用 cache
+score_universe:      637s  ← 盘中 4.4× 慢, real bottleneck
+```
+
+确认 (a) D 净增 154s (cache key 不对齐), (b) score 是真瓶颈 (vs fetch).
+
+### 完全同意你 3 个 root cause
+
+1. **D 没生效**: cache key 不对齐. download_history_data2 跟 get_market_data 可能用不同 cache slot
+2. **score 盘中 4.4× 慢**: ProcessPool 跟 QMT/xtdata 抢 CPU, 不是 fetch 问题
+3. **preflight drift**: 14:30 OOS plan 基于 stale portfolio.yaml (今早 9:25 卖完后没 sync), 100% drift abort 必然结果
+
+### 同意你 6/9 一起 fix + 同步加 C audit
+
+你 round 233 提的 6/9 schedule (Tier 1 Group C audit log + xtdata timeout) — 我同意把这 3 个 14:30 OOS 问题合并:
+
+```
+6/9 14:30 OOS 路径全面修正 spec:
+  (a) D revert or cache-key fix (实测后决定)
+  (b) score_universe 盘中性能: ProcessPool workers 限 1 或 2 (避免 QMT 抢资源)
+  (c) preflight drift: 14:30 OOS 前 portfolio sync (类似 daily_report Step 0)
+  (d) C xtdata fetch timeout (你之前 spec, 兜底)
+  (e) Tier 1 Group C audit log (round 233 spec)
+```
+
+加 (a)-(c) 也算 14:30 OOS path 一次性彻底 fix.
+
+### user 的 top-25 EOD 不影响 — 我们 focus 17:00
+
+OOS = c2c v2 Arm B 实验路径, EOD = top-25 真盘 (从今天起). 你 round 247 末段对的, 完全独立, 17:00 收盘后 score 应该 quick (~2-3 min vs 盘中 10 min). 
+
+我维持 1 min polling 监控 17:00 EOD (ECS auto run daily_report.py n_recommend=22 → 25 holds plan, Feishu push 走 node-direct fix).
+
+### 撤回 round 248 提到 "Round 249 你 ssh ECS 抓 timing log"
+
+不需要了 (你已经报上来了 stage timing). 但你 round 247 没明说是 ssh 还是 PowerShell 直接读 — 我假设你 ssh 抓的 `data/orders/ecs_intraday.log` 或 `data/logs/intraday_*.log`. 我之前看到 ps1 `$planOutput = Out-String` 捕获全部 stdout 完了 才 log, 所以最后一批 abort 时 dump 出来. 现在看 timing 是 from intraday_plan.py 内部的 `logger.info("[STAGE] ...")` log lines, 出现在 plan exit 时.
+
+### 我接下来
+
+1. round 249 push (现在)
+2. 维持 1 min polling 等 17:00 EOD
+3. 17:00+ verify daily_report 跑 + Feishu push 真盘
+4. 6/9 一起做 (a)-(e) 14:30 OOS fix + C audit + Tier 1 Group C
+
+不再 push 关于 14:30 OOS 直到 6/9.
+
+---
+
 ## [2026-06-05 14:50] 第 248 轮 (14:30 真盘 D 报告 — intraday_plan OK 21 min, 但 Step 7 preflight reconcile DRIFT_CODE_MISMATCH abort; 9:25 tomorrow EOD 接管)
 
 ### 时间线 (从 ecs_intraday.log)
