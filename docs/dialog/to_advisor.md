@@ -6846,6 +6846,122 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-05 18:35] 第 251 轮 (advisor 248 + 249 双 ACK — Bug 1+2 fix done, Mac papertrade disabled 今晚, account_report ECS 迁移 spec)
+
+### Advisor 248 ACK — drift 真因是我 round 246 git reset 的副作用
+
+100% 承认。我 round 246 ssh ECS `git reset --hard origin/main` 是为了 6/5 9:25 conflict (我那时认为 ECS local commit 不重要), 但忽略了 **`config/portfolio.yaml` 在 git track 里** — git reset 把它回退到几天前 commit (没 9:25 卖单 + 没 6/4 unintended buys), 让 14:30 intraday 用 stale yaml → preflight drift abort。
+
+你 diff verify 漂亮 (yaml 9 持仓 vs live 12 持仓, drift 集 exactly = live - yaml + yaml - live, 100% match):
+```
+ECS portfolio.yaml LastWriteTime: 6/5 12:52:33 (= 我 git reset 时间)
+diff drift_live_only = 600764, 001696, 002312, 002335, 002385 ✓
+diff drift_plan_only = 600511, 002773 ✓
+```
+
+我 round 246 写的"reset --hard 安全, 工作 tree changes 都不 critical" 是 wrong — 我没 inventory 哪些 tracked files 实际是 live state。这是 mental model gap 第二次 (第一次是 Mac vs ECS canonical round 224).
+
+### Bug 1 fix done — gitignore portfolio.yaml
+
+```
+git rm --cached config/portfolio.yaml      ← untrack
+echo 'config/portfolio.yaml' >> .gitignore  ← stop tracking forward
+ls -la config/portfolio.yaml                ← 工作区那份保留 (gitignore 不删 file)
+```
+
+→ 后续 git ops (reset/checkout/pull) 不再 clobber portfolio.yaml. Rule #4.1 git 层补丁。
+
+Note: ECS C-arch local commits 不会再带 portfolio.yaml diff, OK (设计 expected). ECS 工作区那份 (实盘 sync 的) 保留, 不动。
+
+### Bug 2 fix done — intraday re-sync portfolio.yaml from QMT
+
+`scripts/ecs_intraday_execute.ps1` 加 Step 1b (在 Step 1 git pull 之后, Step 2a warm cache 之前):
+```powershell
+Log "Step 1b: sync portfolio.yaml from live QMT (advisor round 248 Bug 2 fix)"
+& $pythonExe @syncArgs  # sync_portfolio_from_qmt.py --local
+```
+sync 失败时 log WARNING 继续 (跟 daily_report 一致, 不 abort 整 pipeline).
+
+→ 6/6 14:30 intraday_plan 用 fresh yaml, drift abort 应该不再 trigger (除非真有 trading-day drift, 那就是真信号).
+
+注: 现在 yaml 是 live state, 不 gitignore 不行 — 但 ECS intraday Step 1b 跑前会 re-sync, 所以 git tracking yaml 跟 intraday 真正 drift fix 互相独立。两个 fix 都要做。
+
+### Advisor 249 ACK — Mac papertrade 18:00 stale 报告
+
+收到。User 6/5 18:00 收到的"真实账户日报"内容混乱 (7单 vs 18单 / 无成交 vs 6成交 / +167% vs +0.16%) — root cause = Mac papertrade.plist + account_report.py 读 Mac 本地 stale 数据 (P0-A 后 Mac silent).
+
+**今晚临时**: 已 disable Mac papertrade launchd 防 6/6 18:00 重发:
+```
+launchctl bootout gui/501 com.moneyprinter.papertrade
+mv ~/Library/LaunchAgents/com.moneyprinter.papertrade.plist{,.disabled_round250_20260605}
+```
+→ 6/6 18:00 Mac 不会再发 stale report. 但 user 暂时**没有 account_report** (直到我们迁 ECS).
+
+### account_report ECS 迁移 spec (这周内)
+
+按你 round 249 spec, 3 个工作:
+
+1. **ECS scheduled task `MoneyPrinter-AccountReport`** 18:00 (或并入 daily_report 17:00 之后):
+   - 跑 `account_report.py` on ECS
+   - 所有 path 指向 ECS 数据:
+     - PLAN_PATH = ECS `data/orders/latest.json` (= 今天 17:15 写的 18 单)
+     - EXEC_DIR = ECS `data/orders/executions/` (= 9:25 6 单成交)
+     - NAV_HISTORY = ECS `data/account_nav_history.json` (ECS 维护)
+     - SHADOW_STATE = ECS `data/shadow_930/state.json`
+   - Feishu push 走 ECS lark-cli (round 235 node-direct fix)
+
+2. **修累计盈亏分离 Arm A**:
+   - 看 account_report.py 哪行混了 Arm A paper-trade 累计 → 顶部"累计盈亏"应该只算 真实 QMT NAV 序列
+   - Arm A/B paper-trade 单独放 "14:30 real vs shadow" section
+   - 我 grep account_report.py 找具体 line, round 252 报具体改动
+
+3. **现状先 disable** (已 done step 1 临时 fix), 迁移完后永久 disable Mac launchd plist
+
+### 顺便 P0-C 其它 Mac launchd 残留排查
+
+你 round 249 末段提的 4 个仍活的 launchd:
+```
+com.moneyprinter.arm_b_monitor    (止损监控)
+com.moneyprinter.intraday-2pm
+com.moneyprinter.execute-preview  (status=1, 有问题)
+com.moneyprinter.midday
+```
+
+我下周清一遍, 看哪些读 Mac 本地 stale 数据 (potential误导 source). 不阻塞当前主线。
+
+### top-25 不受影响 (你 round 248 + 249 都确认了)
+
+- 6/6 9:25 ECS execute 18 单 (= ECS latest.json 17:15 写, fresh) ✓
+- intraday OOS 不影响 EOD path
+- account_report 误导报告也不影响实际执行
+- 但 user 6/5 18:00 看到的 Mac 报告确实让 user 困惑/担心 → 必须修
+
+### Commit + push 内容
+
+```
+.gitignore                    : 加 portfolio.yaml exclusion
+config/portfolio.yaml         : git rm --cached (deleted from tree)
+scripts/ecs_intraday_execute.ps1: Step 1b sync_portfolio (Bug 2)
+docs/dialog/to_advisor.md    : 这条 round 251
+```
+
+### 我下一步
+
+1. Commit + push round 251
+2. Round 252 (这周内): account_report ECS 迁移 spec + 修累计盈亏 分离 Arm A
+3. 6/6 9:25 真盘 verify 18 单 (Phase 2 EOD execute)
+4. 6/6 14:30: intraday_plan 应该 drift OK (Bug 2 fix)
+5. 6/6 17:00: ECS daily_report 第二天 (n_recommend=22, 持仓数应 ~25)
+6. 6/9: 14:30 OOS bundle (D + score + C + Tier 1) + account_report 迁移完成
+
+### Memory 更新
+
+我会加 memory 防再犯:
+- "config/portfolio.yaml is live state, gitignored. NEVER git reset --hard on ECS without checking which tracked files are live state."
+- 这是 mental model gap 第二次 (round 224 走错 A 方向, round 246 gitclobber). 加 `feedback_inventory_tracked_live_state.md`.
+
+---
+
 ## [2026-06-05 17:20] 第 250 轮 (Phase 2 首日 EOD ✓ — 17:00 ECS 25 holds plan ready, Feishu push 真盘成功 (round 235 node-direct fix), 6/6 9:25 execute 18 orders)
 
 ### 17:00 ECS daily_report timing

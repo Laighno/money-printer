@@ -85,6 +85,29 @@ if ($LASTEXITCODE -ne 0) { Abort "git pull failed (exit $LASTEXITCODE)" }
 $head = (& git rev-parse --short HEAD).Trim()
 Log "Step 1: HEAD = $head"
 
+# Step 1b (round 250 / advisor round 248 Bug 2): re-sync portfolio.yaml from QMT.
+# Background: ecs_daily_report.ps1 Step 2 syncs portfolio.yaml from live QMT
+# before generating EOD plan, but ecs_intraday_execute.ps1 historically did
+# NOT — it trusted whatever portfolio.yaml is on disk. That trust broke 6/5
+# 14:30 when round 246 git reset --hard origin/main reverted portfolio.yaml
+# to a stale commit (9 holdings vs live 12 holdings) → preflight drift abort.
+# Re-sync here keeps intraday on parity with daily_report: always read live
+# QMT state before scoring.
+$pythonExe = "$REPO\.venv\Scripts\python.exe"
+Log "Step 1b: sync portfolio.yaml from live QMT (advisor round 248 Bug 2 fix)"
+$syncArgs = @(
+    "-X", "utf8",
+    "scripts\sync_portfolio_from_qmt.py",
+    "--local"
+)
+$syncOutput = & $pythonExe @syncArgs 2>&1 | Out-String
+$syncOutput.Trim().Split("`n") | ForEach-Object { Log "  sync: $_" }
+$syncExit = $LASTEXITCODE
+Log "Step 1b: sync exit = $syncExit"
+if ($syncExit -ne 0) {
+    Log "Step 1b: WARNING sync failed (exit $syncExit) — falling through to on-disk portfolio.yaml; preflight may drift if it's stale"
+}
+
 # Step 2a (round 194 added): warm 1m cache via download_history_data2.
 # Background: XtMiniQmt 重启后默认只交易, 行情订阅不启动. intraday_plan.py
 # cache-read assumption (line 386-387) broke 6/2 14:30 ("xtdata 1m returned
@@ -111,7 +134,6 @@ if ($warmExit -ne 0) {
 # empty Top-K. Any non-zero → no fill flag → Phase C 9:30 next day
 # fallback takes over.
 Log "Step 2: intraday_plan.py (sleep_to_trigger 14:30:00 + fetch + score)"
-$pythonExe = "$REPO\.venv\Scripts\python.exe"
 $planArgs = @(
     "-X", "utf8",
     "scripts\intraday_plan.py",
