@@ -2785,7 +2785,7 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     # backtest optimum SR 1.29). Single-param rollback: change back to 5.
     logger.info("--- Scanning universe for recommendations ---")
     recommendations, rec_60d, rec_name_map, full_scored = recommend_stocks(
-        ranker, n_recommend=10, intraday_bars=intraday_bars,
+        ranker, n_recommend=13, intraday_bars=intraday_bars,
         precomputed_features=shared_features)
 
     # 8a. Save midday picks as watchlist for afternoon report to track.
@@ -2977,7 +2977,7 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
     # clear). Phase 2 推 to n_recommend=18 (target ~25, backtest SR 1.29).
     logger.info("--- Scanning universe for recommendations ---")
     recommendations, rec_60d, rec_name_map, full_scored = recommend_stocks(
-        ranker, n_recommend=10, precomputed_features=shared_features)
+        ranker, n_recommend=13, precomputed_features=shared_features)
 
     # 2a. Evaluate today's midday watchlist (if midday ran) — show how those picks held up
     midday_watchlist = _load_midday_watchlist(date.today())

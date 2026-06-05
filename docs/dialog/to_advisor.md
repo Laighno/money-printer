@@ -6846,6 +6846,79 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-05 12:40] 第 244 轮 (ACK round 243 — empirical 校准完, Phase 1 n_recommend=13 → 18 holds 命中)
+
+### 4 数据点 empirical (~6 min 跑 3 个新 dryrun)
+
+| n_recommend | total orders | new buys | clears | predicted holds (= 14 - clears + new buys) |
+|---:|---:|---:|---:|---:|
+| 10 (round 242) | 15 | 3 | 2 | **15** (+1) |
+| 13 | 19 | 6 | 2 | **18** ✓ Phase 1 target |
+| 15 | 20 | 8 | 2 | **20** |
+| 22 | 25 | 13 | 2 | **25** ✓ Phase 2 target |
+
+(clears 稳定 = 2: 600816 建元信托 + 002335 科华数据, 不随 n_recommend 变 — 它们 rank 超 100 必清)
+
+### Mapping 不是 overlap 天花板, 直接 linear above n=10
+
+- n=10 → 15: overlap heavy (top-10 中 7 已 hold, 只 3 新)
+- n=11+ 起线性: 每 +1 to n_recommend → +1 hold (overlap 影响减弱因 candidates 进入 hold 池后续 rank 都更高)
+- n=15 (20 holds) → n=22 (25 holds), Δn=7, Δholds=5, ratio 0.71 ← linear with slight overlap drag at high n
+
+**结论**: Phase 1 (target 18) = **n_recommend=13**. Phase 2 (target 25) = **n_recommend=22**. 
+
+无需结构性改 Pass 1/Pass 2 (你 round 243 末 Option Pass 1 直接 target top-n) — 现 overlap-tolerant 行为 + linear mapping 已够.
+
+### Phase 1 已 commit n_recommend=13
+
+```python
+# scripts/daily_report.py:2788 (run_midday) + 2980 (run_daily)
+recommend_stocks(ranker, n_recommend=13, ...)
+```
+
+Dryrun verified: **18 holds** (= advisor target ~18). 6/5 17:00 ECS 自动跑 = Phase 1 真盘首日.
+
+### Phase 2 roadmap (一周后)
+
+如果 6/5-6/12 一周 Phase 1 (18 holds) friction/fill 没异常:
+```python
+recommend_stocks(ranker, n_recommend=22, ...)  # Phase 2: 18 → 25 holds
+```
+单参数改, rollback 改回 13. 
+
+### Dryrun outputs (Tier 0 routing 全 OK)
+
+每次 dryrun 都写到 `data/_scratch/orders_20260605.json` (overwritten 每次). Logs:
+- `data/logs/daily_dryrun_phase1_20260605.log` (n=10)
+- `data/logs/daily_dryrun_n15_20260605.log`
+- `data/logs/daily_dryrun_n22_20260605.log`
+- `data/logs/daily_dryrun_n13_20260605.log` (final Phase 1)
+
+每个 ~2 min (cache hit from 9:25/上午 collector). 没动 prod state.
+
+### 14:30 OOS D 真盘提醒
+
+距 14:30 还 ~1h50m. round 221 D incremental warm 真盘首跑. 我 14:35 verify timing log + 报 round 245.
+
+### 你 round 243 末段 Option Pass 1 重构
+
+我不主张做. 原因:
+- 你的 spec ("Pass 1 直接 target top-n_recommend 全部") 是为 overlap cap 准备的 fallback
+- empirical 显示 overlap **不是 cap**, n_recommend=22 顺利得 25 holds
+- 现 rank-threshold (Top30 keep / 30-100 trim / >100 clear) 行为是 "active 维持 conviction high + 自然 rotate", backtest top-25 SR 1.29 已包含这个行为
+- 重构会改"核心逻辑" (你 round 239 强调不动), 而 n_recommend 调参可达目标, 没必要
+
+如果一周后 Phase 1 真盘显示 average holds 大幅偏离 18 (e.g. 平均 14-15), 那时再 revisit Pass 1 重构.
+
+### Phase 1 commit + push 完成后我下一步
+
+1. Commit + push round 244 (含 dryrun 数据 + n_recommend=13)
+2. ScheduleWakeup 1 min polling 等 14:30
+3. 14:35 verify D 真盘 → round 245
+4. 17:00+ verify EOD plan (18 holds + Feishu push w/ round 235 fix) → round 246
+
+---
+
 ## [2026-06-05 12:00] 第 242 轮 (Phase 1 dryrun 完成 — 实际持仓数 15, 偏 lower edge; 你 decide micro-adjust)
 
 ### Dryrun 结果 (data/_scratch/orders_20260605.json)
