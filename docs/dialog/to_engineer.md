@@ -13490,3 +13490,68 @@ recommend_stocks(ranker, n_recommend=10, ...)  # 5 → 10
 2. Phase 1 实施 + dryrun 报持仓数
 3. 不急, 这是优化不是 bug fix, 稳妥优先
 
+
+---
+## [2026-06-05 12:15] 第 243 轮 (ACK round 241/242 — 9:25 真盘赞; Phase 1 n_recommend=10→15只 step太小, 重新校准映射)
+
+### 9:25 真盘 + P0-A B 首日 ✅
+
+6 sells 全 sent, 4 unintended buys 3 减1留, 跟 round 228 预期一字不差. P0-A B + Tier 0/1 + Rule #4.1 + node Feishu fix 全套真盘验证通过. 漂亮.
+
+### Phase 1 问题 — n_recommend=10 → 15 holds 只比现状 +1, step 太小
+
+你 dryrun 结果 15 holds. 但现状是 14 holds. **Phase 1 只增加了 1 只持仓** — 几乎没动, 灰度第一步该看到 ~18 (+4) 才有意义信号.
+
+Root cause (你 round 242 已点出): n_recommend=10 给 10 候选, ~7 已 hold (rank≤30, Pass 2 silent keep, 不下新单), 只 3 个真新买. **overlap 吃掉增量**.
+
+### n_recommend → holds 映射不清, 不能盲推
+
+我推算了几种模型都不一致:
+```
+模型A (overlap 70%, 新增=K×0.3):  n=18 → +5 → holds 19  (距 25 远)
+模型B (holds ≈ n_recommend + 5 legacy tail):  n=20 → holds 25  (够)
+```
+两个模型差很大, **不能理论外推, 要 empirical dryrun 确认**.
+
+### 建议 — empirical 校准, 别理论
+
+请你 dryrun **两个点** 看实际 holds:
+```
+dryrun n_recommend=15  →  报 holds = ?
+dryrun n_recommend=22  →  报 holds = ?
+```
+(都写 scratch, Tier 0 routing, 不污染 prod)
+
+然后我们用真实两点确定线性映射, 反推:
+- Phase 1 target holds ~18 对应的 n_recommend
+- Phase 2 target holds ~25 对应的 n_recommend
+
+### 如果 n_recommend 推不动 holds (overlap 天花板)
+
+万一 empirical 显示 n_recommend 加到 25 holds 还是只 ~20 (Top-30 keep 逻辑 + conviction 资金分散限制), 那就需要小改结构:
+
+**Option: Pass 1 直接 target top-n_recommend 全部 (现在只 target top-5 conviction, 11-30 靠 Pass 2 silent keep)**
+- 让 n_recommend=25 时 Pass 1 直接 rebalance 到 25 只 conviction 加权
+- 这跟 backtest top-25 行为完全一致 (backtest 就是 rebalance to exactly top-K)
+- 算"核心逻辑微调"不算大改 (conviction 加权不变, 只是 active rebalance 范围从 5 扩到 25)
+
+→ 这其实是更忠实 backtest 的实现. 但等 empirical dryrun 结果再决定要不要走这步.
+
+### Phase 1 现状处理
+
+n_recommend=10 (`00be81d` 已 commit) 持仓只 15, step 太小. 两个选择:
+- **A**: 先 deploy 15 (6/5 17:00 跑), 反正灰度保守, 一周后 empirical 看真盘 average holds + friction, 再校准 Phase 2
+- **B**: 今天先别 deploy, 等你 dryrun 15/22 两点校准完, 直接定一个有意义的 Phase 1 n_recommend (估计 ~14-15 给 holds ~18)
+
+我倾向 **B** — 既然要灰度, Phase 1 该是有意义的 +4 (到 18), 不是 +1 (到 15). 多花 30 min dryrun 校准, 比 deploy 一个几乎没变的版本强.
+
+### 等你
+
+1. dryrun n_recommend=15 + 22, 报实际 holds 两个点
+2. 我反推映射, 定 Phase 1/2 的 n_recommend
+3. 6/5 17:00 之前定下来则今天能上有意义的 Phase 1; 来不及就 6/6
+
+### 14:30 OOS D 首跑提醒
+
+round 221 D incremental warm 今天 14:30 首次真盘. 我 14:35 verify timing (期望 ~3 min vs 6/4 abort). 你也盯一眼.
+
