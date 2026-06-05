@@ -13621,3 +13621,71 @@ deploy 25 holds 后, 第一周 (6/5-6/12) 每日盯:
 2. 定产出 ~25 holds 的方案 (n_recommend 硬调 or Pass 1 扩范围)
 3. deploy + 第一周监控
 
+
+---
+## [2026-06-05 12:50] 第 246 轮 (🔴 URGENT — ECS 还是老 top-5 代码! round 245 n_recommend=22 没到 ECS, 17:00 前必须 pre-sync)
+
+### 问题 — ECS 实际跑老 top-14 策略, 不是 top-25
+
+advisor ssh ECS 实测:
+```
+真 origin/main HEAD:      a899244 (round 245, n_recommend=22)
+ECS 的 origin/main 引用:  31394cb (round 237) ← STALE, 没 fetch 238-245
+ECS 工作目录 daily_report.py: n_recommend=5  ← 老 top-14 策略!
+ECS 本地: ahead of origin/main by 3 commits (你的 auto plan commits, C-arch)
+```
+
+→ **现在生产实际是老策略 (n_recommend=5), round 245 的 top-25 改动没部署到 ECS**.
+
+你 round 245 写"6/5 17:00 ECS auto run = round 245 → 25 holds", 但 ECS 的 git 还没拉到 round 245. 17:00 Step 1 `git pull origin main` 才会拉, 但有风险.
+
+### 17:00 风险
+
+ecs_daily_report.ps1 Step 1 = `git pull origin main`:
+- ECS ahead 3 (local) + origin 新 8 commits (238-245)
+- pull 触发 3-way merge, 如果 latest.json / portfolio.yaml 冲突 (两边都改) → **pull 失败 → daily_report ABORT** (昨天 round 224-227 一模一样的 divergence)
+- 即使 merge 成功, 也得确认 n_recommend=22 真进了工作目录
+
+### 立即 action (你做, ~12:50, 距 17:00 还 4h)
+
+**Pre-sync ECS 现在, 别等 17:00 撞运气**:
+
+```powershell
+ssh ECS:
+cd C:/money-printer
+git fetch origin main
+# 看 working tree 有没有 uncommitted prod state (latest.json 等)
+git status -uno
+# 如果 clean / 只有 auto-commits, reset 到 origin (option X 昨天用过):
+git reset --hard origin/main
+# verify
+git rev-parse --short HEAD   # 应 = a899244
+Select-String -Path scripts/daily_report.py -Pattern "n_recommend=22"  # 应命中
+```
+
+reset --hard 会丢 ECS 的 3 个 local auto-commits (它们没 push, 是 C-arch 设计的 local-only plan commits, 丢了无妨, plan 文件 working tree 会被 origin 覆盖, 下次 17:00 重新生成).
+
+如果 ECS working tree 有今天还没处理的 prod state (e.g. 今早 9:25 后的 latest.json), reset 前先确认那个 plan 已经执行完 (今早 9:25 已 execute, latest.json 可丢).
+
+### Verify after sync
+
+```
+git rev-parse --short HEAD == a899244 (origin round 245)
+daily_report.py n_recommend == 22 (3 处: 2789 + 2980, run_daily + run_midday)
+```
+
+确认后, 17:00 ECS Step 1 git pull = no-op (已 sync), Step 4 daily_report 跑 n_recommend=22 → 25 holds plan.
+
+### 为什么 ECS origin ref stale
+
+昨天 P0-A B migration 后 ECS 是否还在自动 `git fetch`? ecs_daily_report.ps1 Step 1 `git pull` 只在 17:00 跑, 平时不 fetch. 9:25 ecs_auto_execute.ps1 Step 1 也 `git pull` — 但今早 9:25 那次 pull 可能也没成功 fetch 到 238-245 (或者 fetch 了但 ECS origin ref 显示有延迟).
+
+建议: 你 sync 后顺便 verify ECS 9:25 + 17:00 两个 ps1 的 git pull 真的能拉到最新 origin (不被 local divergence 挡住).
+
+### 等你
+
+1. **立即** pre-sync ECS (fetch + reset --hard origin/main)
+2. verify n_recommend=22 在 ECS 工作目录
+3. 报 round 247 确认 ECS 真部署 top-25
+4. 17:00 daily_report 跑 25 holds (不是老 14)
+
