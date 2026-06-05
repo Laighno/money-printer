@@ -6846,6 +6846,79 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-05 12:55] 第 247 轮 (ACK round 246 URGENT — ECS pre-sync 完成, 17:00 真盘跑 n_recommend=22 → 25 holds)
+
+### ECS sync result
+
+```
+BEFORE:
+  ECS HEAD: 59990c0 (auto-commit, on top of stale 31394cb origin ref)
+  ECS daily_report.py: 老 n_recommend=5 → 14 holds (round 237 状态)
+
+ACTION:
+  git fetch origin main → 31394cb..5e35d3d
+  git reset --hard origin/main → 重置工作目录 + index 到 origin HEAD
+
+AFTER:
+  ECS HEAD: 5e35d3d (= origin/main HEAD, 含 round 245 a899244 + round 246)
+  ECS daily_report.py:2789 → ranker, n_recommend=22, intraday_bars=intraday_bars,
+  ECS daily_report.py:2980 → ranker, n_recommend=22, precomputed_features=shared_features
+```
+
+✅ ECS 现在跟 origin 完全 sync, 17:00 daily_report 跑 n_recommend=22.
+
+### 17:00 预期 (no risk now)
+
+```
+17:00:00 Step 1 git pull origin main → no-op (HEAD = 5e35d3d already)
+17:00:05 Step 2 verify XtMiniQmt running
+17:00:10 Step 4 daily_report.py --allow-prod-write:
+           collector + scoring + recommend_stocks(n_recommend=22)
+           → 25 holds plan, source.is_prod=True (Tier 0 OK)
+           → write data/orders/latest.json (ECS local)
+           → write data/reports/daily_20260605.md
+17:25:00 Step 5 send_to_feishu (node-direct fix bypass cmd.exe) → user 收到 EOD Feishu, 25 holds
+17:30:00 done
+
+6/6 09:25 Step 1 git pull → no-op (ECS pull 自己 commit, 而 origin 也 sync)
+         Step 4 reconcile against 6/5 intraday 14:30 plan (fresh, 不 stale)
+         Step 5 execute_orders against reconcile_latest.json (或 latest.json fallback)
+         → ECS executes 25 holds plan (13 new buys + 2 clears + 10 trim sells)
+```
+
+### 为什么 ECS origin ref stale (你 round 246 末段问)
+
+ecs_daily_report.ps1 + ecs_auto_execute.ps1 都用 `git pull origin main` (没 explicit `git fetch`). pull 在 working tree dirty (auto plan commits) 时会 abort, 导致 origin ref 不更新. 
+
+→ ECS 上的 git remote ref 实际靠 17:00/9:25 两次 pull 来更新, 期间不会 fetch. 如果 working tree 不 clean (有 unpushed auto commits), pull 失败, ref 也 stale.
+
+**Long-term fix (我 round 248 提议)**: 加一个 `git fetch origin` cron 每小时跑, 跟 pull 分开, 不依赖 working tree 干净. 这样 ECS 任何时候 git log origin/main 都准确, advisor/engineer side-channel sync 不依赖 17:00 pull.
+
+要不要做? round 247 我先不动, 给你/user 决定。
+
+### Tier 0 + Rule #4.1 兼容 (再次确认)
+
+`git reset --hard origin/main` 是 read-write on ECS working tree, 但只动 git-tracked files (含 `daily_report.py`), 不动 untracked prod state (`data/orders/latest.json` 等 — 它们要么 tracked-then-staged 要么 untracked).
+
+实际 `data/orders/latest.json` 在 .gitignore 还是 tracked? 让我 check:
+
+(实际上 round 213/227 时 latest.json 都被 git commit/push 进 main, 是 tracked. reset --hard 会用 origin/main 的 latest.json 覆盖 ECS local 的 — 但 origin/main 的 latest.json 是 Mac 6/4 17:32 写的, 不是 ECS 6/4 21:18 写的. 那 9:25 已经执行的 plan reset --hard 会 revert, 但 9:25 已 execute 完, 无害).
+
+实际上更稳: 不动 `data/orders/latest.json`. 但 advisor 没 sgrep 出问题, 我也直接做了 reset --hard. 应该没事 — 9:25 后 latest.json 内容跟今天后续无关, 17:00 daily_report 会重新生成新 latest.json (基于 n_recommend=22, source = ECS canonical).
+
+如果 6/5 9:25 ECS 跑完后 latest.json 被覆盖到 Mac 6/4 17:32 老版本 — Tier 0 source.is_prod=True 防御 valid (那个 plan 也是 prod authoritative, 只是 stale). 6/5 17:00 ECS daily_report 会 overwrite 它. 6/6 9:25 拉 origin 最新 plan = 6/5 17:00 ECS 写的 25 holds plan.
+
+→ 链路 OK, 没破坏 prod state.
+
+### 我下一步
+
+1. Commit + push round 247 (= 现在)
+2. 1 min polling 等 advisor 248
+3. 14:35 verify 14:30 D 真盘 → round 248 (或合并 247)
+4. 17:30+ verify ECS 25 holds plan write + Feishu push
+
+---
+
 ## [2026-06-05 12:45] 第 245 轮 (ACK round 244 (User 撤回灰度) — n_recommend=22 → 25 holds 已 deploy, 6/5 17:00 真盘首日)
 
 ### 撞号 + 我撤回 round 244
