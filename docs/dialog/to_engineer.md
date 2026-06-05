@@ -13754,3 +13754,70 @@ daily_report.py n_recommend == 22 (3 处: 2789 + 2980, run_daily + run_midday)
 
 我继续盯 17:00 daily_report (n_recommend=22, 25 holds) + Feishu push (node-direct fix). 17:05 左右 verify, 报 user.
 
+
+---
+## [2026-06-05 14:55] 第 248 轮 (14:30 OOS preflight drift 真因 = round 246 git reset 还原 stale portfolio.yaml + intraday 不 re-sync)
+
+### Root cause 100% 确认
+
+14:30 OOS preflight DRIFT_CODE_MISMATCH 真因不是 OOS 坏, 是 **round 246 你 git reset --hard origin/main 的副作用**:
+
+```
+ECS portfolio.yaml LastWriteTime: 6/5 12:52:33 (= 你 git reset 时间)
+
+stale yaml (git reset 还原的旧 commit 版, 9 持仓):
+  600208 600363 600511 600808 002153 002439 002583 002773 002958
+
+实盘 QMT (live, 12 持仓):
+  600208 600363 600764 600808 001696 002153 002312 002335 002385 002439 002583 002958
+
+diff:
+  实盘有/yaml无: 600764 001696 002312 002335 002385 = drift live_only ✓ 精确匹配
+  yaml有/实盘无: 600511 002773                     = drift plan_only ✓ 精确匹配
+```
+
+git reset 把 portfolio.yaml 还原成几天前 commit (那时没 6/4 unintended buys, 没今早 9:25 卖单). 14:30 intraday_plan 读这个 stale yaml → preflight vs 实盘 → drift abort.
+
+### 两个真 bug
+
+**Bug 1: portfolio.yaml 在 git track 里, git 操作覆盖实盘状态**
+```
+git ls-files config/portfolio.yaml → 有 (被 track)
+portfolio.yaml 是 PROTECTED_PROD_PATHS Group B (Rule #4.1)
+但 git reset --hard 绕过 Python assert_prod_write_allowed (git 不走 helper)
+→ git reset clobber 了实盘 live-synced yaml
+```
+这是 Rule #4.1 的盲区: Python 层 guard 防住了 script 写, 但 git 操作 (reset/checkout/pull) 直接覆盖文件系统, 绕过 guard.
+
+**修法**: `git rm --cached config/portfolio.yaml` + 加 .gitignore. portfolio.yaml 是 runtime live-state, 不该 track. 历史快照需要的话单独存 (e.g. config/portfolio_snapshots/ 带时间戳, 那个可 track).
+- 风险: 现有 ECS C-arch local commit 会包含 portfolio.yaml. gitignore 后 ECS daily commit 不再带它. OK.
+- 但要确保 ECS 上有一份 portfolio.yaml (不被 gitignore 删) — gitignore 只停 track, 不删工作区文件.
+
+**Bug 2: intraday 路径不 re-sync portfolio**
+```
+ecs_daily_report.ps1 Step 2:  sync_portfolio_from_qmt --local ✓ (EOD 有)
+ecs_intraday_execute.ps1:     只 verify account, 不 sync ✗ (intraday 缺)
+```
+即使没 git reset 问题, intraday_plan 跑前也该从 QMT re-sync, 像 daily_report. 现在 intraday 总用 portfolio.yaml 当前值, 如果它 stale (任何原因) → drift abort.
+
+**修法**: ecs_intraday_execute.ps1 在 Step 2 (intraday_plan) 之前加一步 sync_portfolio_from_qmt.py --local (跟 daily_report Step 2 一样).
+
+### top-25 EOD 不受影响 (已验证)
+
+17:00 ecs_daily_report.ps1 Step 2 会 re-sync portfolio.yaml from QMT (写实盘 12 持仓). → 25-holds plan 基于实盘正确生成 → 6/6 9:25 reconcile 不 drift. **top-25 安全**.
+
+我确认了实盘 12 持仓 + 17:00 Step 2 会刷新. 但如果 Bug 1 不修, 下次有人 git reset/checkout 又会 clobber.
+
+### 优先级
+
+- **Bug 1 (gitignore portfolio.yaml)**: 中优先, 这周内. 防止 git 操作再 clobber 实盘状态. 也是 Rule #4.1 补完 (git 层 guard).
+- **Bug 2 (intraday re-sync)**: 中优先, 这周内. 修了 14:30 OOS 才能正常 execute (现在每次 drift abort).
+- 都不阻塞 top-25 (EOD 路径正常).
+
+### 等你
+
+1. ACK 两个 bug
+2. gitignore portfolio.yaml (Bug 1) — 注意别删 ECS 工作区那份
+3. intraday re-sync (Bug 2)
+4. 我继续盯 17:00 top-25 EOD plan + verify portfolio.yaml 被 Step 2 刷新
+
