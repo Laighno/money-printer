@@ -13821,3 +13821,86 @@ ecs_intraday_execute.ps1:     只 verify account, 不 sync ✗ (intraday 缺)
 3. intraday re-sync (Bug 2)
 4. 我继续盯 17:00 top-25 EOD plan + verify portfolio.yaml 被 Step 2 刷新
 
+
+---
+## [2026-06-05 18:30] 第 249 轮 (account_report 真实账户日报迁 ECS + 修 3 数据源 — Mac 18:00 发 stale 误导报告)
+
+### 问题 — Mac 18:00 papertrade launchd 发了误导报告
+
+User 6/5 18:00 收到"真实账户日报", 内容有错:
+```
+来源: Mac com.moneyprinter.papertrade.plist (18:00) → account_report.sh → account_report.py
+读: Mac 本地数据 (P0-A 后 ECS canonical, Mac 本地 stale)
+
+错误:
+1. "明日待执行 (7单)" = 读 Mac data/orders/latest.json = 6/4 17:32 老计划
+   真实: ECS 今天 17:15 的 top-25 (18单)
+2. "今日成交 (无成交)" = 读 Mac data/orders/executions/ = 空 (ECS 9:25 的 6 单成交 Mac 没有)
+3. "累计盈亏 +167.78%" = 混了 Arm A paper-trade 累计, 不是真实 QMT 账户
+   真实账户: 今天 +0.16% / +¥459, 总资产 ¥284k
+```
+
+NAV + 持仓 + 浮盈% 这部分对 (account_report 直连 QMT 实时拉).
+
+### account_report 的真价值 (User 确认要保留)
+
+daily_report (每日持仓报告) 是前瞻 (模型信号/预测/推荐/计划), **没有真实盈亏跟踪**. account_report 独有:
+- 真实 NAV + 今日/累计盈亏 vs ZZ500
+- 每只持仓浮盈% (成本 vs 现价)
+- 今日成交
+- 14:30 real vs 9:30-shadow Arm B 对比
+
+→ 不 disable, 迁 ECS + 修数据源.
+
+### round 249 spec — 迁 ECS + 修 3 数据源
+
+**1. 迁 account_report 到 ECS scheduled task (18:00)**
+- 新建 ECS task `MoneyPrinter-AccountReport` 18:00 (或并进 daily_report 17:00 之后)
+- 跑 account_report.py on ECS → 所有 path 指向 ECS 数据:
+  - `PLAN_PATH = data/orders/latest.json` → ECS 的 18 单 top-25 ✓
+  - `EXEC_DIR = data/orders/executions/` → ECS 的真实成交 ✓
+  - `NAV_HISTORY_PATH = data/account_nav_history.json` → ECS 维护
+  - `SHADOW_STATE_PATH = data/shadow_930/state.json` → ECS 的 shadow
+- Feishu push 走 ECS lark-cli (node-direct fix, round 235)
+
+**2. 修累计盈亏 (data 源问题)**
+account_report.py 的"累计盈亏"现在混了 Arm A paper-trade. 应该:
+- 真实账户累计 = 从 NAV_HISTORY (真实 QMT NAV 序列) 算, 起点 = 账户起始
+- Arm A/B 的 +167% 是 paper-trade 实验, 单独放 "14:30 real vs shadow" section, 别混进顶部"累计盈亏"
+- 看 account_report.py 哪行把 Arm A cumulative 当账户累计, 分离
+
+**3. Disable Mac papertrade launchd (迁完后)**
+```bash
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.moneyprinter.papertrade.plist
+mv ~/Library/LaunchAgents/com.moneyprinter.papertrade.plist{,.disabled_round249}
+```
+(advisor 可代做, 或你 spec 后我做 — 这是 Mac 本地操作)
+
+### 顺便 — 其它 Mac launchd 残留排查
+
+P0-A migration 后还活着的 Mac launchd (可能也发 stale):
+```
+com.moneyprinter.arm_b_monitor    (止损监控)
+com.moneyprinter.intraday-2pm
+com.moneyprinter.execute-preview  (status=1, 有问题)
+com.moneyprinter.midday
+```
+建议一并排查: 哪些读 Mac 本地 stale 数据? 哪些该迁 ECS / disable? 这是 P0-C (其它 launchd 迁移) 的范畴, round 216 列过. 现在 account_report 是触发点, 借机清一遍.
+
+### 优先级
+
+- account_report 迁 ECS + 修数据源: 中, 这周内 (避免每天 18:00 发误导报告)
+- 今晚临时: 要不要 advisor disable Mac papertrade 防明天又发? (User 选了迁移 option, 没明说今晚 disable — 我等你/user 确认)
+- 其它 launchd 排查: P0-C, 不急
+
+### 不阻塞 top-25
+
+account_report 是报告层, 跟 top-25 执行无关. 6/6 9:25 ECS 自动执行 18 单 top-25 (用 ECS latest.json), Mac 报告误导不影响实际执行.
+
+### 等你
+
+1. ACK 迁移方向
+2. 迁 account_report 到 ECS + 修 3 数据源
+3. 确认今晚是否要 disable Mac papertrade (防 6/6 18:00 又发 stale)
+4. P0-C 其它 launchd 排查
+
