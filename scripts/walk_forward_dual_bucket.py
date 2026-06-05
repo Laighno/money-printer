@@ -216,13 +216,16 @@ def top_k_picks(scores_df: pd.DataFrame, k: int,
                 price_map: Optional[Dict[str, float]] = None,
                 cap_price: Optional[float] = None,
                 adv_lookup: Optional[Dict[str, float]] = None,
-                adv_floor: Optional[float] = None) -> pd.DataFrame:
+                adv_floor: Optional[float] = None,
+                industry_map: Optional[Dict[str, str]] = None,
+                industry_cap: Optional[int] = None) -> pd.DataFrame:
     """Return top-K rows from scores_df (must have 'code' + 'score').
 
     Applies the same filter chain as production:
       - drop 688/689/300/301 (科创板 / 创业板 — Arm B rule-of-thumb)
       - drop ADV(20d) < adv_floor (if adv_lookup + adv_floor given; OOS only)
       - drop close > cap_price (if cap_price + price_map given; OOS only)
+      - industry concentration cap (if industry_map + industry_cap given — A2 spec)
       - sort by score desc, take top K
     """
     df = scores_df.copy()
@@ -238,7 +241,22 @@ def top_k_picks(scores_df: pd.DataFrame, k: int,
     if price_map is not None and cap_price is not None:
         df["_price"] = df["code"].map(price_map).fillna(0.0)
         df = df[(df["_price"] > 0) & (df["_price"] <= cap_price)]
-    return df.sort_values("score", ascending=False).head(k).reset_index(drop=True)
+    df = df.sort_values("score", ascending=False)
+    # A2: Industry concentration cap — greedy by score desc, skip if industry full
+    if industry_map is not None and industry_cap is not None and industry_cap > 0:
+        industry_count: Dict[str, int] = {}
+        kept_rows = []
+        for _, row in df.iterrows():
+            code = str(row["code"]).zfill(6)
+            ind = industry_map.get(code, "_unknown")
+            if industry_count.get(ind, 0) >= industry_cap:
+                continue
+            kept_rows.append(row)
+            industry_count[ind] = industry_count.get(ind, 0) + 1
+            if len(kept_rows) >= k:
+                break
+        return pd.DataFrame(kept_rows).reset_index(drop=True) if kept_rows else df.head(0)
+    return df.head(k).reset_index(drop=True)
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -556,6 +574,9 @@ def run_seed(seed: int, mode: str,
              merged_hard_max_pct: float = MERGED_HARD_MAX_PCT_DEFAULT,
              enforce_price_limit: bool = False,
              protect_oos_overnight: bool = False,
+             stop_loss_pct: Optional[float] = None,
+             industry_cap: Optional[int] = None,
+             industry_map: Optional[Dict[str, str]] = None,
              ) -> BacktestResult:
     """round 180 (v3 production-faithful, advisor 178 spec):
 
@@ -615,6 +636,21 @@ def run_seed(seed: int, mode: str,
                 if date == prev_D
             }
 
+        # A1: stop-loss force-sell BEFORE EOD rebalance (avoid keeping deep losses)
+        if stop_loss_pct is not None:
+            sl_threshold = float(stop_loss_pct) / 100.0  # e.g. -10 → -0.10
+            for code in list(broker.positions.keys()):
+                pos = broker.positions[code]
+                if pos.avg_cost <= 0:
+                    continue
+                px = open_prices.get(code)
+                if px is None or px <= 0:
+                    continue
+                ret = (px - pos.avg_cost) / pos.avg_cost
+                if ret <= sl_threshold:
+                    adv = adv_today.get(code)
+                    broker.sell(code, px, date=sim_date_str, adv=adv, action="SELL_STOPLOSS")
+
         # ─── 1. EOD execute yesterday's plan on today's open (shared broker) ───
         eod_picks_executed: List[str] = []
         if enable_eod and eod_plan_for_tomorrow is not None and not eod_plan_for_tomorrow.empty:
@@ -643,7 +679,8 @@ def run_seed(seed: int, mode: str,
                 top = top_k_picks(oos_scores, k=top_k,
                                   price_map=oos_prices, cap_price=50.0,
                                   adv_lookup={c: adv_today.get(c, 0.0) for c in oos_scores["code"]},
-                                  adv_floor=100_000_000.0)
+                                  adv_floor=100_000_000.0,
+                                  industry_map=industry_map, industry_cap=industry_cap)
                 # v4: rebalance (mirror production intraday_plan delegation
                 # to daily_report.generate_order_list, which is full rebalance).
                 # Sells tagged SELL_OOS so post-hoc conflict count can split
@@ -683,6 +720,7 @@ def run_seed(seed: int, mode: str,
                     eod_scores, k=top_k,
                     adv_lookup={c: adv_today.get(c, 0.0) for c in eod_scores["code"]},
                     adv_floor=100_000_000.0,
+                    industry_map=industry_map, industry_cap=industry_cap,
                 )
             else:
                 eod_plan_for_tomorrow = pd.DataFrame()
@@ -1002,7 +1040,7 @@ def main() -> int:
                          "use cutoff-trained 'data/intraday_blend_cutoff20250831'.")
     ap.add_argument("--enforce-price-limit", action="store_true",
                     help="Round 208 (advisor #2): block fills at 涨停板/跌停板 "
-                         "(price change vs prev close ≥ ±9.95%). Default off "
+                         "(price change vs prev close >= 9.95 pct). Default off "
                          "preserves legacy WF behavior.")
     ap.add_argument("--protect-oos-overnight", action="store_true",
                     help="Round 208 (advisor #4 diagnostic): in dual mode, "
@@ -1010,6 +1048,12 @@ def main() -> int:
                          "bought yesterday — pushes OOS hold from 18h to 24h "
                          "(same as oos_only). Tests whether dual alpha is "
                          "specifically from 9:25-open-exit timing.")
+    ap.add_argument("--stop-loss-pct", type=float, default=None,
+                    help="A1 spec: force-sell position when return below this pct "
+                         "(negative, e.g. -10 means sell at 10 pct loss). Default off.")
+    ap.add_argument("--industry-cap", type=int, default=None,
+                    help="A2 spec: max stocks per industry in top-K picks (e.g. 3). "
+                         "Default off = no industry concentration cap.")
     ap.add_argument("--smoke", action="store_true",
                     help="single seed × 1 month — fast sanity check")
     args = ap.parse_args()
@@ -1059,6 +1103,15 @@ def main() -> int:
                args.oos_model_prefix, len(oos_ranker.feature_cols))
 
     # ─── Run all (mode × seed) combos ───
+    # A2: load industry map if --industry-cap set
+    industry_map: Optional[Dict[str, str]] = None
+    if args.industry_cap is not None:
+        from mp.data.fetcher import get_industry_mapping
+        codes_all = [str(c).zfill(6) for c in factors["code"].astype(str).unique()]
+        industry_map = get_industry_mapping(codes_all)
+        logger.info("A2 industry-cap={}: loaded industry map for {} codes",
+                   args.industry_cap, len(industry_map))
+
     all_results: List[BacktestResult] = []
     for mode in modes:
         for seed in seeds:
@@ -1069,7 +1122,10 @@ def main() -> int:
                            eod_ranker, oos_ranker, adv_lookup,
                            merged_hard_max_pct=args.merged_hard_max_pct,
                            enforce_price_limit=args.enforce_price_limit,
-                           protect_oos_overnight=args.protect_oos_overnight)
+                           protect_oos_overnight=args.protect_oos_overnight,
+                           stop_loss_pct=args.stop_loss_pct,
+                           industry_cap=args.industry_cap,
+                           industry_map=industry_map)
             logger.info("  done in {:.1f}s; final NAV: eod={:.0f} oos={:.0f} dual={:.0f}",
                        time.time() - t1,
                        res.nav_records[-1]["eod_nav"] if res.nav_records else 0,

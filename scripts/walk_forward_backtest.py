@@ -231,6 +231,16 @@ assert POSITION_SIZING in ("equal", "inverse_vol", "conviction", "vol_target",
 # var USE_REGIME_FEATURES=1 for A/B testing.
 USE_REGIME_FEATURES = os.environ.get("USE_REGIME_FEATURES", "0") == "1"
 
+# Strategy overlay knobs (advisor strategy-comparison A/B, 2026-06-04):
+#   STOP_LOSS_PCT: force-sell a held position once its return from avg_cost
+#     drops to/below this pct (negative, e.g. -15 = sell at 15pct loss). Off if unset.
+#   INDUSTRY_CAP: max stocks per industry in the top-K selection (e.g. 3). Off if unset.
+STOP_LOSS_PCT = os.environ.get("STOP_LOSS_PCT")
+STOP_LOSS_PCT = float(STOP_LOSS_PCT) if STOP_LOSS_PCT else None
+INDUSTRY_CAP = os.environ.get("INDUSTRY_CAP")
+INDUSTRY_CAP = int(INDUSTRY_CAP) if INDUSTRY_CAP else None
+_INDUSTRY_MAP: dict = {}  # lazy-loaded in run_walk_forward when INDUSTRY_CAP set
+
 CACHE_DIR = Path("data/wf_cache")
 REPORT_PATH = Path(os.environ.get(
     "WF_REPORT_PATH", "data/reports/walk_forward_result.md"))
@@ -827,6 +837,17 @@ def run_walk_forward():
         logger.warning("Historical snapshot lookup failed ({}); using current "
                        "{} constituents", _e, UNIVERSE)
 
+    # A2: load industry map once if INDUSTRY_CAP set
+    if INDUSTRY_CAP is not None:
+        global _INDUSTRY_MAP
+        try:
+            from mp.data.fetcher import get_industry_mapping
+            _INDUSTRY_MAP = get_industry_mapping([str(c).zfill(6) for c in codes])
+            logger.info("INDUSTRY_CAP={}: loaded industry map for {} codes",
+                       INDUSTRY_CAP, len(_INDUSTRY_MAP))
+        except Exception as _e:
+            logger.warning("INDUSTRY_CAP set but industry map load failed: {}", _e)
+
     # 2. Data
     bars_map = _load_or_fetch_bars(codes)
     panel = _load_or_build_factors(bars_map, codes)
@@ -1140,6 +1161,18 @@ def run_walk_forward():
         if COST_AWARE_REBALANCE:
             from mp.backtest.ml_backtest import _cost_aware_select
             selection = _cost_aware_select(scored, TOP_K, broker, dt, adv_lk)
+        elif INDUSTRY_CAP is not None and _INDUSTRY_MAP:
+            # A2: industry concentration cap — greedy by score desc, skip if industry full
+            ind_count: dict = {}
+            selection = []
+            for c, s in scored:
+                ind = _INDUSTRY_MAP.get(str(c).zfill(6), "_unknown")
+                if ind_count.get(ind, 0) >= INDUSTRY_CAP:
+                    continue
+                selection.append((c, s))
+                ind_count[ind] = ind_count.get(ind, 0) + 1
+                if len(selection) >= TOP_K:
+                    break
         else:
             selection = scored[:TOP_K]
         try:
@@ -1254,6 +1287,22 @@ def run_walk_forward():
             if _sel is not None:
                 pending_selection = _sel
                 pending_raw_scores = _raws
+
+        # A1: stop-loss force-sell at today's open BEFORE rebalance.
+        # Force-sell any held position whose return from avg_cost <= STOP_LOSS_PCT.
+        if STOP_LOSS_PCT is not None and broker.positions:
+            sl_thresh = STOP_LOSS_PCT / 100.0
+            dt_str_sl = dt.strftime("%Y-%m-%d")
+            for code in list(broker.positions.keys()):
+                pos = broker.positions[code]
+                if pos.avg_cost <= 0:
+                    continue
+                px = _entry_price(code, dt) or pos.current_price
+                if px is None or pd.isna(px) or px <= 0:
+                    continue
+                if (px - pos.avg_cost) / pos.avg_cost <= sl_thresh:
+                    broker.sell(code, px, date=dt_str_sl, action="SELL (stoploss)",
+                                adv=adv_lk.get((code, dt)))
 
         # --- Step A: Execute pending signal from previous close at today's open ---
         if pending_selection is not None:
