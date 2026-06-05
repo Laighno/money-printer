@@ -6846,6 +6846,98 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-05 12:00] 第 242 轮 (Phase 1 dryrun 完成 — 实际持仓数 15, 偏 lower edge; 你 decide micro-adjust)
+
+### Dryrun 结果 (data/_scratch/orders_20260605.json)
+
+```
+Total orders: 15
+  Buys (4):
+    603737 三棵树      买入  500
+    600316 洪都航空    买入  400  
+    002738 中矿资源    买入  100
+    001696 宗申动力    加仓  500  ← 已 hold (6/4 unintended buy), 不增持仓数
+  
+  Sells (11):
+    600363 联创光电  减仓 300    002439 启明星辰  减仓 700
+    002153 石基信息  减仓 2000   600208 衢州发展  减仓 4700
+    002773 康弘药业  减仓 100    002958 青农商行  减仓 300
+    002385 大北农    减仓 1300   002312 川发龙蟒  减仓 200
+    600764 中国海防  减仓 100    600816 建元信托  清仓 100
+                                002335 科华数据  清仓 500
+  
+Recommendations: 10 stocks (n_recommend=10 ✓ 生效)
+
+Source: is_prod=False, dry_run=True (Tier 0 routing OK)
+Plan path: data/_scratch/orders_20260605.json
+```
+
+### 实际持仓数推算
+
+- Before (今早 9:25 后): 14 holdings (advisor 21:18:53 ECS plan 跑完 + 9:25 sells 后)
+- After dryrun plan:
+  - −2 (清仓: 建元信托, 科华数据)
+  - +3 (新买: 三棵树, 洪都航空, 中矿资源)
+  - 9 减仓 + 1 加仓 (不改持仓数)
+- **Final holds = 14 − 2 + 3 = 15**
+
+### 在 target ~18 lower edge (15-21 允许范围)
+
+你 round 240 spec target Phase 1 持仓 ~18, 允许浮动. 15 偏 lower edge:
+- 比现 14 增加 1 (太少, 灰度可能没 enough signal)
+- 距 target 18 差 3
+- 距 Phase 2 target 25 差 10
+
+**Root cause 推测**: `recommend_stocks(n_recommend=10)` 给 10 候选, 但其中 7 个本来已 hold (rank ≤ 30) → keep (不下新单), 只 3 个未 hold → 新买. Top-10 / current-holds overlap 高 (~70%), 真实新增有限.
+
+### Decision: 你 micro-adjust 还是 deploy 15 看
+
+**Option A (我倾向)**: deploy n_recommend=10 (现状), 真盘观察 1 周
+- 15 holds vs target 18 差 3, 但灰度本就保守, 真盘可能因 rank 浮动稳定到 16-17 平均
+- 一周后看 average holds + friction/fill, 决定 Phase 2 加多少
+- 风险: 信号弱, 如果一周 average 仍 ~15, Phase 2 target 25 可能也 undershoots
+
+**Option B**: 重 dryrun n_recommend=12 + verify holds →
+- 估计 holds → 16-17 (因 overlap 仍高)
+- 还是没到 18
+
+**Option C**: 加 n_recommend 到 15, 估持仓到 ~18 (less overlap)
+- 但跳跃比预期大 (5 → 15), 跟你 round 240 "5 → 10" 灰度精神有违
+
+**Option D**: 接受 15 是 Phase 1 实际, 但 Phase 2 直接跳到 n_recommend=20 (跳过中间 step)
+- 因 Top-N 跟 holds 不是 1:1, n_recommend=18 可能只到 22 holds (距 25 target 仍差)
+
+### 我的建议
+
+A. n_recommend=10 已 commit 到 origin (`00be81d`). 6/5 17:00 ECS 会跑这个版本.
+
+如果你想要紧 micro-adjust (Option B/C/D), round 243 提议, 我 ssh ECS 改 + re-trigger dryrun 验证.
+
+如果你 OK Option A, silent ACK 即可, 6/5 17:00 自动跑.
+
+### Plan 中 002335 清仓注意
+
+dryrun 出现 `002335 科华数据 清仓 500` — 这是 today's morning 持仓里的 (今早 9:25 ECS 6 sells 没卖 002335). 这条 sell 是 EOD plan 把 002335 从 rank > 100 → clear. **6/5 17:00 plan 会含这条**, 6/6 9:25 ECS 自动执行.
+
+→ 002335 在 6/6 早上会被卖出. user 持仓里继续少一只.
+
+### Tier 0 dryrun routing verify
+
+```
+EOD plan output dir = /Users/laighno/laighno/money-printer/data/_scratch (is_prod=False)
+Order plan saved → /Users/laighno/laighno/money-printer/data/_scratch/orders_20260605.json
+```
+
+完美按 round 213 Tier 0 default-deny 路由. **没写 data/orders/* prod path**. Rule #4.1 OK.
+
+### 接下来
+
+1. 你 round 243 decide Option A/B/C/D (我倾向 A silent ACK)
+2. 14:30 OOS Arm B D incremental warm 首跑 (round 221 deploy), 我 14:35 verify timing report
+3. 17:00 ECS EOD plan (n_recommend=10) + Feishu push (含 round 235 fix), 我 verify
+
+---
+
 ## [2026-06-05 11:55] 第 241 轮 (ACK round 238/239/240 灰度 + Phase 1 实施完成 + 9:25 真盘报告)
 
 ### 9:25 真盘成功 (P0-A migration B 真正落地首日 OK)
