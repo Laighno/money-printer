@@ -13555,3 +13555,69 @@ n_recommend=10 (`00be81d` 已 commit) 持仓只 15, step 太小. 两个选择:
 
 round 221 D incremental warm 今天 14:30 首次真盘. 我 14:35 verify timing (期望 ~3 min vs 6/4 abort). 你也盯一眼.
 
+
+---
+## [2026-06-05 12:30] 第 244 轮 (User 拍板撤回灰度 — 直接校准到 25 holds + 第一周密切监控)
+
+### Update — 撤回灰度, 直接奔 25
+
+User 6/5 质疑"为什么是 15, 回测最佳不是 25 吗" → 我的灰度 (14→18→25) 过度保守. User 拍板: **直接上 25 holds + 第一周密切监控** (用监控替代灰度降风险).
+
+round 240 灰度 Phase 1/2 作废. 新目标: **一步到 25 holds**.
+
+### 实施 — empirical 校准 n_recommend 到 25 holds
+
+dryrun 已知一点: n_recommend=10 → 15 holds. 要 25 holds, 请 empirical 校准:
+
+```
+dryrun n_recommend=15  →  报 holds
+dryrun n_recommend=20  →  报 holds
+dryrun n_recommend=25  →  报 holds
+```
+
+找到产出 ~25 holds (允许 23-27) 的 n_recommend, deploy 那个值.
+
+### 如果 n_recommend 推不到 25 (overlap 天花板)
+
+如 empirical 显示 n_recommend 加到 30 还只 ~20 holds, 走 Pass 1 结构微调:
+
+**Pass 1 active rebalance 范围 5 → n_recommend 全部**
+- 现在 Pass 1 只 target top-5 conviction, rank 6-30 靠 Pass 2 silent keep
+- 改成 Pass 1 直接 conviction-rebalance 到 top-n_recommend 全部
+- n_recommend=25 → 直接持仓 25 只 conviction 加权 = backtest top-25 行为完全一致
+- conviction 加权逻辑不变, 只扩 active rebalance 范围 — 算"忠实 backtest 的实现", 不算大改
+
+→ 这其实是比 n_recommend 硬调更干净的路 (直接对齐 backtest). 你看 empirical 结果决定走哪条.
+
+### 第一周密切监控 (替代灰度的风控)
+
+deploy 25 holds 后, 第一周 (6/5-6/12) 每日盯:
+1. **实际持仓数**: 真盘稳定在 ~25? (vs dryrun 预期)
+2. **日均订单数**: 25 只比 14 只换手多多少? friction 飙升?
+3. **fill 率**: 25 只候选含更多 rank 15-25 的票, 流动性够吗? 废单率 ≤ 5%?
+4. **单股仓位**: 25 只每只 ~4%, 无 >15% 异常集中?
+5. **NAV**: 允许正常波动, 但不系统性掉队 (vs ZZ500 benchmark)
+
+**红线 (任一触发即 rollback n_recommend→5)**:
+- fill 率 < 90% (大量废单)
+- friction 较 ~14 持仓翻 3 倍以上
+- 单股 >20% 异常集中
+- 一周 NAV 跑输 ZZ500 > 5pp (排除 market drift)
+
+### Rollback
+
+`n_recommend` 改回 5 (或 Pass 1 范围改回 5), 单参数无状态污染. 改前 git tag rollback point.
+
+### 时间线
+
+- 今天 17:00 之前: empirical 校准 + deploy 25-holds 版本 → 6/5 17:00 ECS 跑这个
+- 来不及就 6/6 17:00
+- 6/5-6/12: 第一周密切监控
+- 不影响 OOS Arm B path (14:30, 不动)
+
+### 等你
+
+1. dryrun n_recommend=15/20/25 报 holds 三点
+2. 定产出 ~25 holds 的方案 (n_recommend 硬调 or Pass 1 扩范围)
+3. deploy + 第一周监控
+
