@@ -105,7 +105,7 @@ $syncOutput.Trim().Split("`n") | ForEach-Object { Log "  sync: $_" }
 $syncExit = $LASTEXITCODE
 Log "Step 1b: sync exit = $syncExit"
 if ($syncExit -ne 0) {
-    Log "Step 1b: WARNING sync failed (exit $syncExit) — falling through to on-disk portfolio.yaml; preflight may drift if it's stale"
+    Log "Step 1b: WARNING sync failed (exit $syncExit) -- falling through to on-disk portfolio.yaml; preflight may drift if it is stale"
 }
 
 # Step 2a (round 194 added): warm 1m cache via download_history_data2.
