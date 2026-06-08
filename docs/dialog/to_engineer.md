@@ -14153,3 +14153,67 @@ round 251 一口气改 3 件埋 2 雷 (git冲突 + parse错), 已够痛. 加上 
 3. ExecTimeLimit + collect 超时 + 资源评估
 4. 我这边待命, 你修好 ping 我 verify
 
+
+---
+## [2026-06-08 19:50] 第 255 轮 (深度分析 daily_report 死因 + Mac 降级方案 ready + 6/9 top-25 plan 已 secured)
+
+### 反转 — daily_report.py 其实没坏, 19:38 跑通了
+
+advisor 同步诊断 run (19:33 起) **成功生成 plan**:
+```
+19:38:06 Recommendations screened: 22 stocks
+19:38:06 Order list: 22 orders → latest.json (is_prod=True, 7578 bytes)
+19:38:08 Feishu sent ✓
+全程 "DB is fresh (last=2026-06-08), skipping API" → 秒级
+```
+
+### 深度分析 — 为什么 17:00 + 手动×3 死, 19:38 活
+
+根因 = **bars DB stale + ECS 8GB 资源紧, 不是代码**:
+```
+17:00 + 17:41/18:01 手动:  bars DB 还没刷到 6/8 → daily_report 做大量慢 API
+                          fetch (每股 get_daily_bars) + ProcessPool 重内存
+                          → 8GB OOM/超时 → 死 (输出 buffer 丢, 0 字节 log)
+19:38:                     bars DB 已刷到 6/8 (前面跑的副作用更新了 DB)
+                          → "DB fresh skipping API" → 秒级 → 跑通
+```
+
+佐证: 17:00 collect 花 15min (也是慢 API). scoring 时 sshd "Connection closed" (CPU 满). idle 4.1GB free.
+
+→ **8GB 太紧** + **DB stale 时 daily_report 退化成慢 API 风暴**. 6/5 跑通是因为那天 DB 已 fresh.
+
+### 6/9 top-25 plan 已 secured (advisor 处理)
+
+```
+ECS latest.json = 6/8 19:38 fresh 22单 top-25 (is_prod=True)
+ECS HEAD = b0bd2ec = origin (synced), latest.json 未提交本地保留
+→ 6/9 9:25 git pull = no-op → 执行 fresh top-25 ✓
+```
+
+### Mac 降级方案 ready (user 要求 — ECS 不行就 Mac 做)
+
+`scripts/mac_fallback_plan.sh` (commit b0bd2ec):
+- Mac 48GB (vs ECS 8GB) + 模型 md5 **完全一致** (verify 步骤 abort if mismatch)
+- daily_report.py 数据 = Sina/akshare live fetch (非 QMT) → Mac 能跑
+- 流程: git pull → verify 模型 → scp ECS portfolio.yaml → Mac 生成 plan → scp 回 ECS
+- 测试: Mac 生成 24单 top-25 (vs ECS 22, 差异=live 价快照时点, 实质一致)
+- 触发: ECS 17:00 daily_report 失败 (latest.json mtime < today 17:00) 时手动跑
+
+### 你仍该做 (根治, 不是 advisor 能远程修的)
+
+1. **ECS 8GB → 16GB** (daily_report ProcessPool + QMT + xtdata 同机, 8GB OOM 边缘)
+2. **bars DB 刷新时序**: collect/DB-update 必须在 daily_report.py 之前完成. 现在 DB stale 时 daily_report 退化慢 API → 雪上加霜. 确保 17:00 Step3 collect 真把 bars DB 刷到当天
+3. **ExecTimeLimit 30→60min** (慢的日子留余量)
+4. **ProcessPool worker 数限制** (8GB 上别开太多 worker)
+5. **daily_report 输出落盘** (现在 Out-String buffer, 死了看不到错误; 改 loguru 直接写文件)
+
+### 短期: Mac 降级是 8GB 升级前的兜底
+
+ECS 16GB 之前, 如果某天 17:00 又 OOM 死, 跑 `bash scripts/mac_fallback_plan.sh` 即可补 plan. 已验证可用.
+
+### 等你
+
+1. ACK 深度分析 (DB stale + 8GB, 非代码)
+2. ECS 16GB 升级评估 + bars DB 时序 + ExecTimeLimit
+3. 6/9 9:25 一起盯 top-25 首次执行 (plan 已 ready)
+
