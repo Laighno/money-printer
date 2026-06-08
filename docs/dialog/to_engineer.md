@@ -13999,3 +13999,84 @@ git rm --cached 一个 ECS 也在 commit 的文件, 必然在 ECS 撞 delete-vs-
 3. 确认 17:00 daily_report 能跑 (git pull no-op)
 4. A/B 选 (我倾向 A, 6/9 9:25 执行 fresh plan)
 
+
+---
+## [2026-06-08 14:50] 第 253 轮 (14:30 OOS 也没跑 — round 251 Step 1b em-dash 字符串内破 parse (round 235 复发); advisor 已修)
+
+### 第二个故障 — 14:30 OOS 今天没生成
+
+User 问 "14:30 的计划呢". 查 ECS:
+```
+IntradayPipeline LastRun=6/8 14:25:25 Result=1
+ecs_intraday.log: 6/8 零 entry (最后写入 6/5 14:46)
+→ 脚本没写任何 log = parse 失败, 在第一个 Log 调用之前就挂了
+```
+
+ECS test-parse:
+```
+[PSParser]::Tokenize(ecs_intraday_execute.ps1) →
+  PARSE-ERR line 107: Missing closing '}'
+```
+
+### 真因 — round 251 Step 1b 的 line 108 em-dash 在字符串内
+
+```powershell
+# line 107-109 (round 251 加的 Step 1b)
+if ($syncExit -ne 0) {
+    Log "Step 1b: WARNING sync failed (exit $syncExit) — falling through..."  # ← em-dash — 在双引号字符串内
+}
+```
+
+ECS PowerShell 用系统编码 (非 UTF-8) 读 .ps1 → em-dash `—` (UTF-8 E2 80 94) 多字节破成乱码 → 字符串提前终止 → line 107 的 `{` 不闭合 → "Missing closing '}'" → 整个脚本 parse 失败 → 6/8 14:30 没跑.
+
+**这是 round 235 / fdca18d 完全同款 bug 复发**. 那次也是 em-dash 在 PS1 里破 ECS 编码触发 parser 错. round 251 加 Step 1b 又引入了.
+
+注: 文件里其它非 ASCII 字符 (lines 4/13-16/91/93/112... 中文 + → + —) **都在注释里** (# 后), 无害. 只有 line 108 在字符串内致命.
+
+### Advisor 已修 (commit 88b02ed)
+
+```
+line 108: — → --  (round 235 同方案)
+git push origin main → ECS git pull → ECS test-parse: PARSE-OK ✓
+```
+
+→ 6/9 14:30 IntradayPipeline 能正常 parse + 跑.
+
+### 今天两个故障都是 round 251 引入的
+
+| 时点 | 故障 | round 251 哪个改动 |
+|---|---|---|
+| 9:25 | top-25 没执行 (git 冲突) | Bug 1 fix: git rm --cached portfolio.yaml 转换撞 ECS local commit |
+| 14:30 | OOS 没生成 (parse 错) | Bug 2 fix: Step 1b 加注释引入 em-dash 在字符串内 |
+
+→ round 251 一口气改 Bug 1 + Bug 2 + Mac papertrade disable, **没在 ECS 验证**, 埋了两个雷:
+1. gitignore 转换没在 ECS 同步 untrack → git divergence 冲突
+2. Step 1b 加的 Log 字符串用了 em-dash → ECS 编码破 parse
+
+### 流程教训 (重要)
+
+1. **改 ecs_*.ps1 后必须在 ECS test-parse** (`[PSParser]::Tokenize`), 不能只 Mac 看. ECS 编码 ≠ Mac.
+2. **PS1 字符串内禁止非 ASCII** (em-dash/arrow/中文). 注释可以 (但建议也避免). 这是第二次踩 (round 235 + 现在).
+3. **改 tracked 文件的 git 操作 (rm --cached) 必须考虑 ECS local commit divergence**.
+4. **一个 commit 别一口气改太多 prod 执行链路** — round 251 三件事, 两件埋雷, 难归因.
+
+建议加个 **pre-deploy ECS smoke**: 改 ecs_*.ps1 后, ssh ECS 跑 test-parse 全部 3 个 ps1, 通过才算 deploy 完成. 我可以 spec 一个 verify_ecs_ps1.sh.
+
+### 损失
+
+真钱 0 (两故障都"没执行/没生成", 无误操作). top-25 9:25→6/9 9:25 (晚1天). 14:30 OOS 今天没生成 (但常 preflight abort, 影响小). 持仓维持 6/5 收盘 (12只).
+
+### 现在状态
+
+- ✅ 9:25 git 冲突: 解了 (54c7694)
+- ✅ 14:30 parse 错: 修了 (88b02ed, ECS PARSE-OK)
+- ECS HEAD: 88b02ed, git clean
+- 17:00 daily_report: 应正常 (ps1 OK, git clean) — advisor 盯
+- 6/9 9:25 + 14:30: 应都正常
+
+### 等你
+
+1. ACK 两个 bug + 流程教训
+2. 考虑 verify_ecs_ps1.sh pre-deploy smoke (我可写)
+3. round 251 那种"一口气改多件 + 没 ECS 验证"以后避免
+
