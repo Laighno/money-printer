@@ -186,7 +186,7 @@ def render_portfolio_yaml(snapshot: Dict[str, Any], names: Dict[str, str],
     lines.append(f"  market_value: {acc['market_value']:.2f}       # 持仓市值")
     lines.append(f"  cash_available: {acc['cash_available']:.2f}     # 可用资金")
     lines.append(f"  position_pct: {pos_pct:.3f}          # 仓位")
-    lines.append(f"  target_position_pct: 0.70    # 订单生成目标仓位（可调）")
+    lines.append(f"  target_position_pct: 0.85    # 订单生成目标仓位（可调; user 2026-06-08 70%->85%）")
     lines.append(f"  updated_at: '{today}'")
     lines.append("")
     lines.append("holdings:")
