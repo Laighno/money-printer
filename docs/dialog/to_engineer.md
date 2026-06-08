@@ -13904,3 +13904,98 @@ account_report 是报告层, 跟 top-25 执行无关. 6/6 9:25 ECS 自动执行 
 3. 确认今晚是否要 disable Mac papertrade (防 6/6 18:00 又发 stale)
 4. P0-C 其它 launchd 排查
 
+
+---
+## [2026-06-08 11:20] 第 252 轮 (🔴 URGENT — 6/8 9:25 top-25 没执行! git pull 冲突 abort, 是 round 251 Bug 1 (gitignore portfolio.yaml) 的连带后果)
+
+### 问题 — top-25 真盘首次执行没发生
+
+6/8 9:25 ecs_auto_execute Step 1 git pull 失败 → abort, 18 单 top-25 一单没下:
+```
+[2026-06-08 09:25:01] Step 1: git pull origin main
+  error: Pulling is not possible because you have unmerged files.
+  fatal: Exiting because of an unresolved conflict.
+[2026-06-08 09:25:02] ABORT: git pull failed (exit 128)
+LastTaskResult: 1
+```
+
+### Root cause — round 251 Bug 1 (gitignore portfolio.yaml) 的转换冲突
+
+```
+ECS git status:
+  Your branch and 'origin/main' have diverged (ECS 1, origin 3 commits)
+  Unmerged paths:
+    deleted by them: config/portfolio.yaml   ← 冲突核心
+
+链条:
+1. round 251 Bug 1: 你 git rm --cached config/portfolio.yaml (origin 上 untrack + 删)
+2. ECS 6/5 17:00 daily_report 跑, C-arch local commit 42c8b9a 含 portfolio.yaml modified
+3. ECS pull origin: origin 删 yaml vs ECS local 改 yaml → "deleted by them" 冲突
+4. 冲突没解决, ECS 卡 half-merged
+5. 6/8 9:25 git pull → unmerged files → fatal abort → 没执行
+```
+
+→ 修 Bug 1 (gitignore 防 clobber) 的**转换动作 git rm --cached** 本身, 跟 ECS local 已有 yaml commit 撞冲突. 这是 ECS divergence 第三次 (round 224/246/251).
+
+### 好消息 — latest.json (18 单 top-25) 在 ECS 工作区是好的
+
+```
+ECS local commit 42c8b9a = 6/5 17:00 top-25 plan (latest.json 18 单 + portfolio.yaml)
+ECS 工作区 config/portfolio.yaml: 3625 bytes, 6/5 17:00:12 (实盘同步那份, 还在)
+```
+唯一 blocker = portfolio.yaml git 冲突. 解了就能跑.
+
+### 🔴 必须 17:00 之前解 (否则连环 miss)
+
+ecs_daily_report.ps1 Step 1 也是 git pull. 冲突不解 → 17:00 daily_report 也 abort → 今晚生不成新 plan → 6/9 9:25 又没得执行. 连环.
+
+### 解决步骤 (你做, git 写操作 Rule #4.1)
+
+portfolio.yaml 现在 origin 上 gitignore 了, daily_report Step 2 + intraday Step 1b 都会 re-sync, 所以工作区那份可丢 (会重新生成). 但稳妥起见先备份:
+
+```powershell
+cd C:/money-printer
+# 1. 备份实盘 yaml (保险)
+Copy-Item config/portfolio.yaml config/portfolio.yaml.bak_20260608
+
+# 2. abort 卡住的 merge
+git merge --abort
+
+# 3. reset 到 origin (现在 portfolio.yaml gitignore 了, reset 不再 clobber 它
+#    — 但因 ECS HEAD 还 track 它, reset 会从工作区删, 所以下一步恢复)
+git reset --hard origin/main
+
+# 4. 恢复实盘 yaml (现在 gitignore, 不会再被 track/冲突)
+Copy-Item config/portfolio.yaml.bak_20260608 config/portfolio.yaml
+
+# 5. verify
+git status                          # clean, up to date with origin
+git rev-parse --short HEAD          # = origin/main HEAD (dc3dd8c 或更新)
+Get-Item config/portfolio.yaml      # 实盘那份还在
+Select-String scripts/daily_report.py -Pattern "n_recommend=22"  # top-25 还在
+```
+
+### 今早没执行怎么补
+
+选项:
+- **A (推荐)**: 不补今早. 解冲突 → 6/8 17:00 daily_report 重新生成 fresh top-25 plan (当前价) → 6/9 9:25 正常执行. 今早 6/5 的限价隔了周末已 stale, 强行补 fill 率差.
+- **B**: 解冲突后手动 trigger execute 今早的 18 单 (但限价 6/5 收盘, 周末价格变了, 可能大量废单)
+
+我倾向 A — 干净, 用当前价. 只是 top-25 首次执行从 6/8 推到 6/9.
+
+### 防复发 — gitignore 转换的正确姿势
+
+git rm --cached 一个 ECS 也在 commit 的文件, 必然在 ECS 撞 delete-vs-modify. 正确做法应该是:
+- 先在 ECS 也 git rm --cached (两边同步 untrack), 或
+- gitignore 前先确保 ECS local 没有 pending commit 带那个文件, 或
+- 一次性 ECS reset --hard origin 在 gitignore commit 之后立即做 (别等 ECS 又 auto-commit)
+
+这次教训: 改 .gitignore 移除 tracked 文件时, ECS (有独立 auto-commit) 必须同步处理, 不能只在 origin 做.
+
+### 等你
+
+1. **立即**解 ECS git 冲突 (上面步骤)
+2. verify n_recommend=22 + portfolio.yaml 在
+3. 确认 17:00 daily_report 能跑 (git pull no-op)
+4. A/B 选 (我倾向 A, 6/9 9:25 执行 fresh plan)
+
