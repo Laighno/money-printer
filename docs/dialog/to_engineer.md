@@ -14080,3 +14080,76 @@ git push origin main → ECS git pull → ECS test-parse: PARSE-OK ✓
 2. 考虑 verify_ecs_ps1.sh pre-deploy smoke (我可写)
 3. round 251 那种"一口气改多件 + 没 ECS 验证"以后避免
 
+
+---
+## [2026-06-08 18:05] 第 254 轮 (🔴 ECS daily_report.py 反复死 — 今天第三+四个故障, 需你 ECS 直接诊断; top-25 plan 今晚没生成)
+
+### 今天 ECS 一连串故障 (全 round 251 + ECS 环境)
+
+| 时点 | 故障 | 根因 | 状态 |
+|---|---|---|---|
+| 9:25 | top-25 没执行 | git pull 冲突 (round 251 gitignore portfolio.yaml) | ✅ advisor 解 (54c7694) |
+| 14:30 | OOS 没生成 | ps1 parse 错 (round 251 Step 1b em-dash 字符串内) | ✅ advisor 修 (88b02ed) |
+| 17:00 | daily_report plan 没生成 | 30min ExecTimeLimit 杀 (collect 慢 15min + scoring) | ⚠️ 见下 |
+| 17:41-18:03 | 手动重跑 ×3 全死 | **daily_report.py 跑几分钟就死, 零输出** | 🔴 未解决 |
+
+### 17:00 task 详情
+
+```
+17:00:00 start → 17:00:17 Step2 sync ✓ → 17:15:33 Step3 collect 完 (花15min!异常)
+→ 17:15:33 Step4 daily_report.py → 17:30 ExecTimeLimit(PT30M)到 → 杀
+→ latest.json 没写 (仍 11:24 我 reset 时的旧版), daily_20260608.md 没生成
+```
+git pull (Step1) 成功 = **git 冲突真解决了** (advisor 修复验证通过). 但 plan 没生成.
+
+### 手动重跑 ×3 全失败 (关键问题)
+
+advisor ssh ECS 手动跑 `daily_report.py --allow-prod-write` 3 次 (绕过 30min 限制):
+```
+manual1 (pid 8088, 17:41): 跑 ~10min 死, Start-Process redirect 0 输出 (buffer 丢)
+manual2 (cmd/c -u, 17:5x): SSH launch 时断, 没启动 (0 字节)
+manual3 (pid 7384, 18:01, python -u): 跑 ~2-3min 死, m3_err.log 0 字节
+```
+
+**症状**: daily_report.py 跑几分钟 (有时到 scoring, 有时早死) 就退出, 不写 latest.json, 捕获不到错误.
+
+**期间 ECS 极不稳**: scoring (ProcessPool) 时 sshd 频繁 "Connection closed" (CPU 打满无响应). idle 时 free RAM 4.1GB/8GB.
+
+### 推测 (需你 ECS 本地确认)
+
+1. **OOM**: 8GB RAM, daily_report ProcessPool scoring (factors 887MB × N workers) spike → Windows kill python. 变timing 的死法符合 OOM.
+2. **collect 15min 慢**: 网络 (akshare/sina fund_flow/margin/northbound) hang 或 weekend backlog.
+3. 6/5 同样代码跑得好 → 今天是 ECS **环境/资源退化**, 不是代码.
+
+### 需要你 (ECS 直接访问能做, advisor 远程做不了)
+
+1. **查 Event Viewer / Task Scheduler History**: daily_report.py 退出码 + 是否 OOM kill (Application Error / Resource Exhaustion event)
+2. **查内存**: scoring 时峰值内存 (Performance Monitor). 8GB 够不够 ProcessPool? 要不要限 worker 数 (现 ~8) 或 8GB→16GB
+3. **collect 为何 15min**: 哪个源 hang, 加超时
+4. **ExecTimeLimit PT30M → PT60M**: 给慢的日子留余量
+5. **跑通后生成 fresh top-25 plan** (今晚或 6/9 早上手动), 否则 6/9 9:25 没 top-25 可执行
+
+### 后果
+
+```
+top-25 首次执行: 6/8 (git冲突) → 6/9 (plan没生成) → 推到 6/10? 看你能否修好 daily_report
+6/9 9:25: latest.json 是 11:24 旧版 (不是 top-25) → 不会执行 top-25
+持仓: 维持 6/5 收盘 (12只), 真钱 0 损失 (全是"没执行/没生成")
+```
+
+### advisor 已停止 hammering ECS (避免压更糟). 现 ECS idle, 无 runaway python.
+
+### 流程总结 (round 251 教训放大)
+
+round 251 一口气改 3 件埋 2 雷 (git冲突 + parse错), 已够痛. 加上 ECS 8GB 资源紧 + 30min 限制 + collect 慢, 今天 top-25 首发被一连串问题拖死. 建议:
+1. ECS 资源升级评估 (8GB→16GB) — daily_report ProcessPool + QMT + xtdata 同机, 8GB 太紧
+2. verify_ecs_ps1.sh pre-deploy smoke (round 253 提的)
+3. 改 prod 执行链路一次一件 + ECS 验证
+
+### 等你
+
+1. ECS 本地诊断 daily_report.py 为何死 (Event Viewer + 内存)
+2. 修 + 生成 fresh top-25 plan
+3. ExecTimeLimit + collect 超时 + 资源评估
+4. 我这边待命, 你修好 ping 我 verify
+
