@@ -14217,3 +14217,81 @@ ECS 16GB 之前, 如果某天 17:00 又 OOM 死, 跑 `bash scripts/mac_fallback_
 2. ECS 16GB 升级评估 + bars DB 时序 + ExecTimeLimit
 3. 6/9 9:25 一起盯 top-25 首次执行 (plan 已 ready)
 
+
+---
+## [2026-06-09 09:45] 第 256 轮 (🔴 User 拍板 A: EOD 为主 — 9:25 执行的是 OOS 14:30 reconcile 不是 EOD 日报, 今早交易单对不上日报)
+
+### 用户发现 — 交易单和日报对不上
+
+User 6/9 早: "今早交易单和日报对不上". 查实:
+```
+日报 (user 看的):      EOD latest.json, report_date 6/8, 24单 (top-25 85%)
+9:25 reconcile target: intraday_latest.json, report_date 6/5, 13codes (旧OOS 14:30)
+9:25 实际执行:         reconcile_latest.json, 11单 (vs 6/5 旧OOS的残差)
+```
+→ 9:25 执行的 11 单是 reconcile **vs 6/5 旧 OOS 14:30 target**, 跟 user 的 85% top-25 EOD 日报**完全两回事**.
+
+### Root cause — 架构脱节
+
+```
+ecs_auto_execute.ps1 Step 4:
+  reconcile_plan.py --target-plan data\orders\intraday_latest.json  ← 写死 OOS 14:30
+  → 9:25 一直 reconcile OOS 14:30 target, EOD 日报只是 exit-10 deep fallback
+
+今天 6/9: 14:30 OOS 连日失败 → intraday_latest.json 卡 6/5 → staleness=2 (==max)
+         → 没触发 exit-10 fallback → 用 6/5 旧 OOS reconcile → 执行 11 单
+         → user 的 85% top-25 EOD plan 根本没执行
+```
+
+User 这几天调的全是 EOD path (top-25, 85%, daily_report→latest.json), 但系统 9:25 执行的是 OOS 14:30 path. 脱节。
+
+### User 拍板 A: 切 EOD 为主
+
+9:25 执行 EOD latest.json (top-25/85%), 废弃 OOS 14:30 reconcile 作为执行驱动.
+
+### 正式修复 spec (核心真钱执行, 你做 + verify)
+
+**reconcile_plan.py line 295 硬检查阻止 EOD target**:
+```python
+if plan.get("entry_path") != "intraday_14_30":   # ← EOD plan entry_path=None, 被挡
+    return 10
+```
+
+**改法 (推荐 A1: reconcile against EOD, robust)**:
+1. reconcile_plan.py 加 `--target-kind {intraday,eod}` (default intraday 保持兼容):
+   - `eod`: 跳过 entry_path=="intraday_14_30" 检查 (改成接受 entry_path in {None, "eod", "daily_report"})
+   - reconstruct_target_portfolio 已支持 daily_report schema (holdings_at_plan_time + orders), 不用改
+   - staleness 用 EOD report_date (max 2 trading days 仍合理)
+2. ecs_auto_execute.ps1 Step 4:
+   ```
+   --target-plan data\orders\latest.json  (was intraday_latest.json)
+   --target-kind eod
+   ```
+   → 9:25 reconcile EOD target (12持仓+24单=85%top25目标) vs live QMT → 残差 → 执行
+3. exit-10 deep-fallback 现在指向 latest.json, 跟 --target-plan 同文件 → 改成: EOD target missing/stale 直接 abort (别 trade blind)
+
+**OOS 14:30 path 处置**:
+- intraday_plan / intraday_latest.json 不再驱动 9:25 执行
+- 建议 **disable MoneyPrinter-IntradayPipeline task** (它连日 parse错/drift/OOM, 现在又是 vestigial) — 省 ECS 资源 + 停报错. user 要 OOS 研究再 re-enable
+- 或保留为 shadow (写 intraday_latest.json 但 9:25 忽略) — 你看
+
+### 6/10 安全网 (不依赖, 但 note)
+
+OOS target (6/5) 明天 staleness=3 > 2 → exit-10 → accidental deep-fallback 到 EOD latest.json → 会执行 EOD plan. 但前提 EOD latest.json fresh (需 6/9 17:00 daily_report 生成, 或 Mac fallback). 这是巧合安全网, 不是修复.
+
+### 验证要求 (改完, 下次 9:25 前)
+
+dry-run: ECS 跑 `reconcile_plan.py --target-plan latest.json --target-kind eod` (不执行, 只生成 reconcile_latest.json) → 看残差是否 = 把持仓往 85% top-25 调 (买明阳/中矿/深桑达... 卖旧集中仓). 合理才 deploy.
+
+### 真钱影响评估 (今早 11 单)
+
+今早执行的 11 单把持仓往 6/5 旧 OOS 13-code target 调 (买宗申/大北农/康弘/青农 — 旧仓, 非新top25). 不是灾难 (都是合理票), 但不是 user 想要的 85% top-25 方向. 修复后下次 9:25 会纠正到 top-25.
+
+### 等你
+
+1. ACK A (EOD primary)
+2. reconcile_plan.py --target-kind eod + ps1 --target-plan latest.json
+3. disable/shadow IntradayPipeline
+4. dry-run verify 残差合理
+5. 我这边盯下次 9:25 确认执行 EOD top-25
+
