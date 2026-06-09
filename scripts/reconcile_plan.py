@@ -257,11 +257,17 @@ def main() -> int:
     ap.add_argument("--out", default="data/orders/reconcile_latest.json")
     ap.add_argument("--qmt-account", required=True)
     ap.add_argument("--qmt-userdata", required=True)
+    ap.add_argument("--target-kind", default="intraday", choices=["intraday", "eod"],
+                    help="Round 258: target plan kind. 'intraday' (default, "
+                         "backward-compat) requires entry_path=='intraday_14_30'. "
+                         "'eod' accepts EOD daily_report plans (entry_path None/'eod'/"
+                         "'daily_report'). User 拍板 6/9 round 256: 9:25 reconcile "
+                         "against EOD top-25 plan, not the OOS 14:30 target.")
     ap.add_argument("--max-staleness-trading-days", type=int, default=2,
                     help="Max trading days after the target's report_date before "
                          "deep-fallback (exit 10). Default 2 covers normal "
                          "(prev trading day), Mon-after-Fri, and 14:30-down-1-day; "
-                         "≥3 (14:30 down ≥2 days) → fallback.")
+                         ">=3 (14:30 down >=2 days) -> fallback.")
     args = ap.parse_args()
 
     target_path = Path(args.target_plan)
@@ -292,10 +298,25 @@ def main() -> int:
         )
         return 11
 
-    if plan.get("entry_path") != "intraday_14_30":
-        logger.warning("Target plan entry_path={!r} != 'intraday_14_30' — deep fallback (exit 10)",
-                       plan.get("entry_path"))
-        return 10
+    # Round 258 (advisor 256/257 ask): kind-aware entry_path check.
+    # 'intraday' kind requires entry_path=='intraday_14_30' (existing behavior).
+    # 'eod' kind accepts EOD daily_report plans whose entry_path is missing,
+    # None, '', 'eod', or 'daily_report'. Adding this so ecs_auto_execute.ps1
+    # can switch 9:25 reconcile from OOS 14:30 target -> EOD top-25 latest.json.
+    entry_path = plan.get("entry_path")
+    if args.target_kind == "intraday":
+        if entry_path != "intraday_14_30":
+            logger.warning("Target plan entry_path={!r} != 'intraday_14_30' "
+                           "(target-kind=intraday) -> deep fallback (exit 10)",
+                           entry_path)
+            return 10
+    else:  # eod
+        allowed_eod = {None, "", "eod", "daily_report"}
+        if entry_path not in allowed_eod:
+            logger.warning("Target plan entry_path={!r} not in allowed EOD set "
+                           "(target-kind=eod, allowed={!r}) -> deep fallback (exit 10)",
+                           entry_path, sorted(str(x) for x in allowed_eod))
+            return 10
 
     report_date = plan.get("report_date")
     if not report_date:

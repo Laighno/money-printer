@@ -93,20 +93,25 @@ if ($portfolioContent -notmatch "$EXPECTED_ACCOUNT") {
 
 $pythonExe = "$REPO\.venv\Scripts\python.exe"
 
-# Step 4: diff-reconcile against the last 14:30 intraday target (round 103).
-# REPLACES the old flag-gate. reconcile_plan.py compares the live QMT
-# portfolio to the 14:30 intended target and emits ONLY the residual:
-#   - normal day  → 14:30 fully filled → residual empty → executor no-ops
-#   - 涨停/跌停 day → 14:30 didn't fill → residual fills the gap at open
-# Exit codes: 0 = reconcile_latest.json written (execute it);
-#             10 = target missing/stale (14:30 infra down ≥2 trading days)
-#                  → deep-fallback to EOD blend latest.json;
-#             2/3 = QMT/other failure → abort.
-Log "Step 4: reconcile_plan.py (live vs 14:30 target diff)"
+# Step 4: diff-reconcile against the EOD daily_report top-25 plan (round 258,
+# advisor round 256/257 ask, user 拍板 6/9 'A: EOD primary').
+# WAS reconciling against 14:30 OOS target (intraday_latest.json) -- but that
+# decoupled 9:25 execute from the EOD plan user sees in Feishu (6/9 incident:
+# executed 11 orders vs stale 6/5 OOS target while user expected top-25 85%).
+# Now: reconcile latest.json (EOD top-25) vs live QMT -> residual.
+#   - residual non-empty -> execute the residual (closes the gap to 85% top-25)
+#   - residual empty     -> executor no-ops (already in target shape)
+# Exit codes: 0  = reconcile_latest.json written (execute it);
+#             10 = target missing/stale (EOD plan failed >2 trading days) -> ABORT
+#                  (target IS the EOD plan, no separate fallback exists);
+#             11 = target source non-authoritative (Tier 0 replay defense) -> ABORT;
+#             2/3 = QMT/other failure -> abort.
+Log "Step 4: reconcile_plan.py (live vs EOD top-25 target diff, --target-kind eod)"
 $reconArgs = @(
     "-X", "utf8",
     "scripts\reconcile_plan.py",
-    "--target-plan", "data\orders\intraday_latest.json",
+    "--target-plan", "data\orders\latest.json",
+    "--target-kind", "eod",
     "--out", "data\orders\reconcile_latest.json",
     "--qmt-account", $EXPECTED_ACCOUNT,
     "--qmt-userdata", $USERDATA
@@ -118,22 +123,14 @@ Log "Step 4: reconcile exit = $reconExit"
 
 if ($reconExit -eq 0) {
     $planPath = "data\orders\reconcile_latest.json"
-    Log "Step 4: using reconcile plan (residual补 of 14:30 target)"
-} elseif ($reconExit -eq 10 -or $reconExit -eq 11) {
-    # Deep fallback:
-    #   exit 10 = 14:30 target missing or stale ≥2 trading days
-    #   exit 11 = 14:30 target source not prod-authoritative (round 213 Tier 0)
-    # In both cases execute the EOD blend plan (daily_report 17:00 still
-    # regenerates it). Exit 11 specifically defends against ad-hoc replay
-    # overwriting intraday_latest.json — the 6/4 9:25 incident root cause.
-    $planPath = "data\orders\latest.json"
-    $fbReason = if ($reconExit -eq 10) { "target missing/stale" }
-                else { "target source non-authoritative (replay/ad-hoc)" }
-    Log "Step 4: reconcile signalled deep-fallback ($fbReason) -> EOD blend latest.json"
-    if (-not (Test-Path "$REPO\$planPath")) { Abort "fallback plan missing: $planPath" }
-    $planAge = ((Get-Date) - (Get-Item "$REPO\$planPath").LastWriteTime).TotalHours
-    Log "Step 4: fallback plan age = $([math]::Round($planAge,1))h"
-    if ($planAge -gt 90) { Abort "fallback plan older than 90h -- stale, aborting" }
+    Log "Step 4: using reconcile plan (residual to close gap to EOD top-25)"
+} elseif ($reconExit -eq 10) {
+    # EOD target missing or stale. Since target IS the EOD plan there's no
+    # separate fallback file -- abort rather than trade blind.
+    Abort "reconcile signalled exit 10 (EOD target missing/stale) -- no fallback target, aborting (do NOT trade blind)"
+} elseif ($reconExit -eq 11) {
+    # EOD target source not prod-authoritative (round 213 Tier 0 defense).
+    Abort "reconcile signalled exit 11 (EOD target source non-authoritative -- replay/ad-hoc) -- aborting"
 } else {
     Abort "reconcile_plan failed (exit $reconExit) -- QMT/other error, not trading blind"
 }

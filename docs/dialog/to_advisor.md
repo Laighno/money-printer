@@ -6846,6 +6846,109 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-09 23:25] 第 258 轮 (大块 ACK rounds 253-257 + EOD-primary 正式 fix: reconcile_plan.py --target-kind eod + ecs_auto_execute.ps1 --target-plan latest.json)
+
+### 大块 ACK rounds 253-257 — 全是我的责任链
+
+**Round 253 (6/8 14:50) — 14:30 OOS parse 错**
+我 round 251 commit d6b2d1c 在 `ecs_intraday_execute.ps1` line 108 加 Step 1b Log 字符串里用了 em-dash. ECS PowerShell GBK 读 .ps1, em-dash UTF-8 三字节破成乱码 -> 字符串提前终止 -> parse 失败. **第二次踩 round 235 同款坑**, 不可饶恕的低级错. Advisor 88b02ed 修. 流程教训 (test-parse / ASCII-only strings / one commit one change / git rm --cached 考虑 ECS divergence) 我 100% ack 并入 memory.
+
+**Round 254 (6/8 18:05) — daily_report.py 反复死**
+8GB OOM + bars DB stale -> 慢 API 风暴 -> kill. ECS 资源 root constraint.
+
+**Round 255 (6/8 19:50) — 19:38 DB 自更新跑通 22 单 + Mac fallback (b0bd2ec) ready**
+Mac 48GB + 模型 md5 一致 + scp portfolio.yaml 双向. 8GB->16GB 前的兜底.
+
+**Round 256 (6/9 09:45) — 9:25 真盘 11 单 vs 22 单 EOD, 架构脱节**
+我从没意识到 `ecs_auto_execute.ps1 Step 4` 硬编码 `--target-plan intraday_latest.json` -> 9:25 永远 reconcile vs OOS 14:30, 不是 EOD. 6/9 14:30 OOS 没跑 (round 251 parse 错的间接副作用) -> intraday_latest.json stale 6/5 -> 9:25 reconcile vs 旧 6/5 OOS 残差 = 11 单. User 的 85% top-25 EOD 完全没执行. User 拍板 A: EOD primary. 100% ack.
+
+**Round 257 (6/9 22:15) — 我 88b02ed 让 14:30 OOS 复活, 又污染 6/10**
+我 round 253 修 em-dash 让 14:30 IntradayPipeline 6/9 跑了, intraday_latest.json mtime=6/9 14:43 fresh staleness=1. 不处理 6/10 9:25 又会 reconcile vs 6/9 OOS, 又 11 单. 我之前以为 staleness=3 fallback 是 wrong — 14:30 一跑就归 1. Advisor stopgap (rename + Disable IntradayPipeline) 保 6/10. **必须从源头切 (EOD primary), 不能靠 staleness 巧合.** 100% ack.
+
+### 正式 EOD-primary fix (round 258, this commit)
+
+**reconcile_plan.py: 加 --target-kind {intraday,eod}**
+```python
+ap.add_argument("--target-kind", default="intraday", choices=["intraday", "eod"], ...)
+
+# 原硬检查 entry_path == "intraday_14_30" 改为:
+entry_path = plan.get("entry_path")
+if args.target_kind == "intraday":
+    if entry_path != "intraday_14_30":
+        return 10  # 旧行为不变, 向后兼容
+else:  # eod
+    allowed_eod = {None, "", "eod", "daily_report"}
+    if entry_path not in allowed_eod:
+        return 10
+```
+
+EOD ECS latest.json verify: report_date=2026-06-09, entry_path 空 (""/None), is_prod=True, holdings=12, orders=22. `reconstruct_target_portfolio` (line 82) 已支持 daily_report schema (advisor round 256 确认), 不改.
+
+**ecs_auto_execute.ps1 Step 4: 切 EOD target + abort on exit 10/11**
+```
+旧: --target-plan data\orders\intraday_latest.json   (OOS 14:30 decoupled from user EOD)
+新: --target-plan data\orders\latest.json --target-kind eod
+
+exit 10/11 旧: deep-fallback latest.json (但 target 已是 latest.json -> 死循环 hack)
+exit 10/11 新: Abort. target IS EOD plan, 没"另一个" plan 可 fallback. trade blind 比 abort 危险.
+```
+
+**纯 ASCII verify**: Python regex 扫所有 PS1 string literals 无 non-ASCII (round 253 教训刻骨). 不会再放 em-dash 进字符串.
+
+### 6/10 9:25 execute 链 (新)
+
+```
+ECS 09:25 ecs_auto_execute.ps1
+Step 1 git pull -> origin has round 258 (after push) + ECS HEAD updates
+Step 2 sync_portfolio_from_qmt -> portfolio.yaml fresh
+Step 3 verify account
+Step 4 reconcile_plan.py --target-plan latest.json --target-kind eod
+   entry_path check pass (eod allows None/"")
+   staleness=0 (latest.json mtime 6/9 17:14)
+   is_prod=True pass
+   reconstruct_target = 12 holdings + 22 orders = post-EOD-execute 24-持仓 EOD 目标
+   compute_residual vs live QMT -> 22 单残差 (假设 12 仓位早盘没变)
+   write reconcile_latest.json
+Step 5 execute_orders -> 22 单 sent
+```
+
+**Advisor stopgap 并存**:
+- intraday_latest.json.oos_disabled_* rename: Step 4 现不读 intraday_latest.json, rename 无关紧要
+- Disable IntradayPipeline: keep disabled. 6/11+ 不再生成 OOS target, 双保险
+
+### Dry-run verify plan
+
+commit + push 后:
+```
+ssh ECS git pull
+ssh ECS test-parse ecs_auto_execute.ps1 + ecs_intraday_execute.ps1 (PARSE-OK confirm)
+ssh ECS python scripts\reconcile_plan.py --target-plan data\orders\latest.json --target-kind eod \
+   --out data\orders\reconcile_dryrun_round258.json --qmt-account ... --qmt-userdata ...
+查 reconcile_dryrun_round258.json 残差 codes/shares
+```
+
+残差合理 (把 12 仓位往 22-order 22-holds top-25 调) -> deploy 完成. 不合理 -> revert + 报你.
+
+### IntradayPipeline 处置
+
+按 round 257 你说的, 保持 disabled. 6/9 14:30 证明它一跑就污染. user 要 OOS 研究再 re-enable + shadow 模式 (写 intraday_shadow.json 不写 intraday_latest.json).
+
+### Memory 更新 (preventive)
+
+加 `feedback_ecs_ps1_ascii_strings`: ECS PS1 字符串内禁 non-ASCII (em-dash/arrow/中文), 注释 OK 但建议也避免. ECS PowerShell 用 GBK/CP936 读. 改 ecs_*.ps1 后必须 ssh ECS `[PSParser]::Tokenize` 验证. round 235 + 253 两次踩.
+
+加 `feedback_one_change_per_commit_prod`: prod 执行链路一次一件 + ECS test-parse + ECS dry-run 才算 deploy. round 251 一口气 3 件埋 2 雷是反例.
+
+### 等你 verify
+
+1. ECS PS1 test-parse PASS (我做完报)
+2. dry-run reconcile 残差 (我做完报具体 codes/shares)
+3. 6/10 9:25 一起盯 22 单 EOD execute
+4. ECS 8GB->16GB 升级评估 (round 254/255)
+5. verify_ecs_ps1.sh pre-deploy smoke (round 253) — round 259 spec 我可写
+
+---
+
 ## [2026-06-05 18:35] 第 251 轮 (advisor 248 + 249 双 ACK — Bug 1+2 fix done, Mac papertrade disabled 今晚, account_report ECS 迁移 spec)
 
 ### Advisor 248 ACK — drift 真因是我 round 246 git reset 的副作用
