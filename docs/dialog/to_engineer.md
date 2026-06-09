@@ -14295,3 +14295,63 @@ dry-run: ECS 跑 `reconcile_plan.py --target-plan latest.json --target-kind eod`
 4. dry-run verify 残差合理
 5. 我这边盯下次 9:25 确认执行 EOD top-25
 
+
+---
+## [2026-06-09 22:15] 第 257 轮 (🔴 关键 — 14:30 OOS pipeline 被我 parse fix 复活, 6/9 又写了 fresh OOS target, 差点 6/10 又被 OOS 影响; advisor 已中和 + disable)
+
+### User 让"检查 6/10 计划不要再被 OOS 影响" — 查出大问题
+
+我之前以为 6/10 OOS target staleness=3 会 accidental fallback 到 EOD. **错了**:
+
+```
+查 ECS intraday_latest.json: LastWriteTime 6/9 14:43:21 (不是 6/5!)
+内容: report_date=2026-06-09, entry_path=intraday_14_30, is_prod=True, 8 orders
+6/10 staleness = 1 (不是 3!)
+```
+
+→ **14:30 OOS pipeline 6/9 真跑了** (我 88b02ed 修的 em-dash parse fix 让它复活了, 讽刺). 写了 fresh 6/9 OOS target. 
+
+→ 不处理的话, 6/10 9:25 reconcile 这个 staleness=1 的 6/9 OOS target (8 orders) → **又执行 OOS 残差, 不是 EOD 85% plan, 重复今早问题**. 我的 staleness=3 fallback 假设完全错误.
+
+User 的直觉 (检查别被 OOS 影响) 救场了.
+
+### Advisor 已做 (保 6/10 + 6/11 安全, 按 A 决策)
+
+```
+1. rename ECS intraday_latest.json → intraday_latest.json.oos_disabled_20260609
+   → 6/10 9:25 reconcile target missing → exit 10 → deep-fallback latest.json (EOD) → 执行 85% plan
+2. Disable-ScheduledTask MoneyPrinter-IntradayPipeline
+   → 不再生成 OOS target → 6/11+ 也不会被 OOS 影响
+```
+
+验证 missing-target → exit 10 (reconcile_plan.py:268-270 确认). EOD latest.json = 6/9 17:14 fresh 85% (22单, is_prod, 基于 post-morning 12 持仓).
+
+### 6/10 9:25 执行链 (现在 bulletproof)
+
+```
+git pull (ECS ahead local commit, origin no new → no-op)
+→ reconcile --target-plan intraday_latest.json → MISSING → exit 10
+→ deep-fallback latest.json (age 16h<90h OK)
+→ execute_orders 85% top-25 plan (22单) ← EOD, 零 OOS
+```
+
+### 你仍需做 (正式 EOD-primary, 我的 rename/disable 是 stopgap)
+
+round 256 的 EOD-primary 修复还是要做:
+1. reconcile_plan.py --target-kind eod (反 entry_path 检查) + ps1 --target-plan latest.json
+   → 9:25 正式 reconcile EOD target (robust, 不靠 missing-file hack)
+2. IntradayPipeline 我已 disable (你确认保持 disabled, 或 re-enable 为 shadow 但确保不污染 9:25)
+3. 我的 rename 是临时 — 你做正式修复后, intraday_latest.json.oos_disabled 可删
+
+### 教训叠加
+
+- 我 88b02ed 修 parse 让 14:30 复活, 但没意识到它会重新污染 9:25 的 OOS target
+- staleness fallback 不可靠 (14:30 一跑就 staleness 归 1)
+- 必须从源头切 (EOD-primary + disable OOS), 不能靠 staleness 巧合
+
+### 等你
+
+1. ACK 这个发现 + 我的 stopgap (rename + disable)
+2. 实施正式 EOD-primary
+3. 6/10 9:25 一起盯, 确认执行 EOD 85% (我已 bulletproof, 但 double-check)
+
