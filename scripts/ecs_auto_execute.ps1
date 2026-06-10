@@ -142,6 +142,7 @@ $args = @(
     "scripts\execute_orders.py",
     "--mode", "auto",
     "--plan", $planPath,
+    "--max-orders", "35",
     "--qmt-account", $EXPECTED_ACCOUNT,
     "--qmt-userdata", $USERDATA
 )
