@@ -385,3 +385,148 @@ class TestRunOrchestration:
                                        fill_wait_seconds=0)
         assert results[0]["status"] == "skipped"
         assert "cap" in results[0]["note"]
+
+    def test_buy_limit_capped_at_price_cage_when_stock_opens_low(self, monkeypatch):
+        """Round 260 Bug 1: plan limit prev_close*1.01 > cage when stock opens
+        low → re-price down to cage. cage_max = max(live*1.02, live+0.10).
+        """
+        from scripts import execute_orders
+
+        # Plan limit ¥42.86, live ¥40.00 → cage = max(40.80, 40.10) = 40.80
+        # 42.86 > 40.80 → cap to 40.80
+        monkeypatch.setattr(execute_orders, "_fetch_current_price",
+                            lambda c: {"600363": 40.00}.get(c))
+        monkeypatch.setattr(execute_orders, "preflight_account_reconcile",
+                            lambda *a, **kw: (True, "ok"))
+
+        broker = DryRunBroker(cash=100000, autofill=True)
+        plan = {
+            "generated_at": "x",
+            "account_snapshot": {"total_assets": 100000, "cash_available": 100000,
+                                  "market_value": 0},
+            "holdings_at_plan_time": [],
+            "orders": [
+                {"code": "600363", "name": "test", "action": "buy",
+                 "shares": 100, "limit_price": 42.86, "cost": 4286,
+                 "reason": "test"},
+            ],
+            "alerts": [],
+        }
+
+        results = execute_orders.run(broker, plan, mode="dryrun",
+                                       max_single_pct=0.95,
+                                       fill_wait_seconds=0,
+                                       cash_settle_wait_seconds=0)
+        assert results[0]["status"] == "sent"
+        assert abs(results[0]["limit_price"] - 40.80) < 0.01, \
+            f"expected cage ¥40.80, got ¥{results[0]['limit_price']}"
+
+    def test_buy_limit_preserved_when_within_cage(self, monkeypatch):
+        """Round 260 Bug 1: plan limit BELOW cage_max → preserved (no upward repricing).
+        """
+        from scripts import execute_orders
+
+        # Plan ¥42.86, live ¥42.50 → cage = max(43.35, 42.60) = 43.35
+        # Plan 42.86 < cage 43.35 → no reprice
+        monkeypatch.setattr(execute_orders, "_fetch_current_price",
+                            lambda c: {"600363": 42.50}.get(c))
+        monkeypatch.setattr(execute_orders, "preflight_account_reconcile",
+                            lambda *a, **kw: (True, "ok"))
+
+        broker = DryRunBroker(cash=100000, autofill=True)
+        plan = {
+            "generated_at": "x",
+            "account_snapshot": {"total_assets": 100000, "cash_available": 100000,
+                                  "market_value": 0},
+            "holdings_at_plan_time": [],
+            "orders": [
+                {"code": "600363", "name": "test", "action": "buy",
+                 "shares": 100, "limit_price": 42.86, "cost": 4286,
+                 "reason": "test"},
+            ],
+            "alerts": [],
+        }
+
+        results = execute_orders.run(broker, plan, mode="dryrun",
+                                       max_single_pct=0.95,
+                                       fill_wait_seconds=0,
+                                       cash_settle_wait_seconds=0)
+        assert results[0]["status"] == "sent"
+        assert results[0]["limit_price"] == 42.86
+
+    def test_buy_skipped_when_cash_insufficient(self, monkeypatch):
+        """Round 260 Bug 2: broker.cash_available < buy notional → skip cleanly.
+
+        Use big existing positions to satisfy concentration check while
+        keeping cash too small. Mimics real scenario where sells haven't
+        settled yet so account has positions+cash but cash is low.
+        """
+        from scripts import execute_orders
+
+        monkeypatch.setattr(execute_orders, "_fetch_current_price",
+                            lambda c: {"600363": 42.50}.get(c))
+        monkeypatch.setattr(execute_orders, "preflight_account_reconcile",
+                            lambda *a, **kw: (True, "ok"))
+
+        # 500k assets total, but only ¥1,000 cash (rest in positions)
+        # Buy needs 100 × ¥42.86 = ¥4,286 → cash short
+        # 4286/500000 = 0.86% (well under concentration cap)
+        seed_pos = Position(code="999999", name="seed",
+                             shares_total=10000, shares_available=10000,
+                             avg_cost=49.90, market_price=49.90,
+                             market_value=499000)
+        broker = DryRunBroker(cash=1000, positions=[seed_pos], autofill=True)
+        plan = {
+            "generated_at": "x",
+            "account_snapshot": {"total_assets": 500000, "cash_available": 1000,
+                                  "market_value": 499000},
+            "holdings_at_plan_time": [],
+            "orders": [
+                {"code": "600363", "name": "test", "action": "buy",
+                 "shares": 100, "limit_price": 42.86, "cost": 4286,
+                 "reason": "test"},
+            ],
+            "alerts": [],
+        }
+
+        results = execute_orders.run(broker, plan, mode="dryrun",
+                                       max_single_pct=0.95,
+                                       fill_wait_seconds=0,
+                                       cash_settle_wait_seconds=0)
+        assert results[0]["status"] == "skipped"
+        assert "insufficient cash" in results[0]["note"]
+
+    def test_sells_run_before_buys_with_phase_separation(self, monkeypatch):
+        """Round 260 Bug 2: sells/buys split into two phases."""
+        from scripts import execute_orders
+
+        monkeypatch.setattr(execute_orders, "_fetch_current_price",
+                            lambda c: {"000539": 6.40, "603529": 22.00,
+                                       "600363": 42.86}.get(c))
+        monkeypatch.setattr(execute_orders, "preflight_account_reconcile",
+                            lambda *a, **kw: (True, "ok"))
+
+        plan = self._make_plan()
+        plan_positions = [
+            Position(code=h["code"], name=h["name"],
+                     shares_total=h["shares"], shares_available=h["shares"],
+                     avg_cost=h["avg_cost"],
+                     market_price=h["avg_cost"],
+                     market_value=h["shares"] * h["avg_cost"])
+            for h in plan["holdings_at_plan_time"]
+        ]
+        broker = DryRunBroker(cash=200000, positions=plan_positions, autofill=True)
+        broker.connect()
+
+        results = execute_orders.run(broker, plan, mode="dryrun",
+                                       fill_wait_seconds=0,
+                                       cash_settle_wait_seconds=0)
+
+        sent = [r for r in results if r["status"] == "sent"]
+        actions = [r["action"] for r in sent]
+        last_sell_idx = max((i for i, a in enumerate(actions) if a == "sell"),
+                             default=-1)
+        first_buy_idx = min((i for i, a in enumerate(actions) if a == "buy"),
+                             default=len(actions))
+        assert last_sell_idx < first_buy_idx, \
+            f"sells must precede buys; got {actions}"

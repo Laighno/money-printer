@@ -227,6 +227,7 @@ def run(
     max_single_pct: float = 0.50,
     price_drift_pct: float = 0.02,
     fill_wait_seconds: float = 2.0,
+    cash_settle_wait_seconds: float = 15.0,
     reconcile_tolerance: Optional[float] = None,
     arm_b_tracker=None,
 ) -> list[dict]:
@@ -276,11 +277,19 @@ def run(
         return [{"status": "failed", "note": "positions drift", "code": "-",
                   "name": "PREFLIGHT", "action": "-", "shares": 0, "limit_price": 0}]
 
-    # Reorder: sells first, then buys (T+0 cash flow)
-    sorted_orders = sorted(orders, key=lambda o: 0 if o["cost"] < 0 else 1)
+    # Phase order: sells first, then settlement wait, then buys.
+    # Round 260 (advisor 259 Bug 2): broker (国金) has documented sell-proceeds
+    # delay — sell cash is NOT immediately credited even though T+0 logically
+    # allows it. The pre-round-260 loop ran sells+buys interleaved with only
+    # fill_wait_seconds=2s between orders, causing tail buys to fail with
+    # "可用资金不足" once pre-existing cash was consumed and sell proceeds
+    # hadn't arrived yet (6/11 9:25 incident: 601615 + 603737 rejected).
+    sells = [o for o in orders if o["cost"] < 0]
+    buys  = [o for o in orders if o["cost"] > 0]
 
     results: list[dict] = []
-    for i, o in enumerate(sorted_orders, 1):
+
+    def _run_one(o, idx, total):
         code, action, shares, limit = (
             o["code"],
             "buy" if o["cost"] > 0 else "sell",
@@ -289,16 +298,32 @@ def run(
         )
         name = o.get("name", code)
         logger.info("--- [{}/{}] {} {} {} 股 @ ¥{:.2f} ---",
-                    i, len(sorted_orders), action.upper(), code, shares, limit)
+                    idx, total, action.upper(), code, shares, limit)
 
-        # Price drift gate
+        # Price drift gate (also returns cur_price used below for re-price + cash check)
         ok, msg, cur_price = preflight_price_drift(code, limit, action, price_drift_pct)
         if not ok:
             logger.warning("SKIP {}: {}", code, msg)
             results.append({"status": "skipped", "code": code, "name": name,
                              "action": action, "shares": shares,
                              "limit_price": limit, "note": msg})
-            continue
+            return
+
+        # Round 260 (advisor 259 Bug 1): re-price buy limit against A-share
+        # price cage. plan's limit_price = prev_close * 1.01 (reconcile_plan
+        # compute_residual line 149/163), but when stock opens LOW the cage
+        # = max(live * 1.02, live + 0.10) can be BELOW prev_close * 1.01 →
+        # broker rejects "价格错误". Cap planned limit at cage_max when live
+        # price is available; otherwise proceed with plan limit (drift gate
+        # already enforced sanity above).
+        if action == "buy" and cur_price is not None:
+            cage_max = max(cur_price * 1.02, cur_price + 0.10)
+            if limit > cage_max:
+                logger.info(
+                    "  re-price buy {}: plan ¥{:.2f} > cage ¥{:.2f} (live ¥{:.2f}); "
+                    "using cage", code, limit, cage_max, cur_price
+                )
+                limit = cage_max
 
         # Concentration check for buys: would this push code past single-cap?
         if action == "buy":
@@ -314,7 +339,22 @@ def run(
                 results.append({"status": "skipped", "code": code, "name": name,
                                  "action": action, "shares": shares,
                                  "limit_price": limit, "note": msg})
-                continue
+                return
+
+            # Round 260 (advisor 259 Bug 2): check live cash_available before
+            # placing each buy. Even after the settlement sleep below, a
+            # partially-filled sell or slow broker credit can leave cash short
+            # for tail buys. Skip cleanly with explanatory note instead of
+            # eating a broker rejection that costs nothing more than a log.
+            needed = shares * limit
+            if cur_acct.cash_available < needed:
+                msg = (f"insufficient cash: have ¥{cur_acct.cash_available:.0f}, "
+                       f"need ¥{needed:.0f}; sell proceeds may not have settled")
+                logger.warning("SKIP {}: {}", code, msg)
+                results.append({"status": "skipped", "code": code, "name": name,
+                                 "action": action, "shares": shares,
+                                 "limit_price": limit, "note": msg})
+                return
 
             # Arm B daily budget cap (round 161 guardrail (a)): if a tracker
             # is engaged (intraday 14:30 path), refuse buys that would push
@@ -328,7 +368,7 @@ def run(
                                      "action": action, "shares": shares,
                                      "limit_price": limit,
                                      "note": f"arm_b_cap: {msg}"})
-                    continue
+                    return
 
         # Interactive confirm
         if mode == "interactive":
@@ -336,7 +376,7 @@ def run(
                 results.append({"status": "skipped", "code": code, "name": name,
                                  "action": action, "shares": shares,
                                  "limit_price": limit, "note": "user declined"})
-                continue
+                return
 
         # Execute
         result = broker.place_limit_order(code, action, shares, limit)
@@ -365,6 +405,21 @@ def run(
         # Brief pause to let broker register state
         if mode != "dryrun" and fill_wait_seconds > 0:
             time.sleep(fill_wait_seconds)
+
+    # Phase 1: all sells
+    total = len(sells) + len(buys)
+    for i, o in enumerate(sells, 1):
+        _run_one(o, i, total)
+
+    # Phase 1.5: sell-proceeds settlement gate. Skip when nothing to wait for.
+    if mode != "dryrun" and sells and buys and cash_settle_wait_seconds > 0:
+        logger.info("Waiting {:.0f}s for sell proceeds to settle before buys "
+                    "(advisor round 259 Bug 2 fix)...", cash_settle_wait_seconds)
+        time.sleep(cash_settle_wait_seconds)
+
+    # Phase 2: all buys
+    for i, o in enumerate(buys, 1):
+        _run_one(o, len(sells) + i, total)
 
     return results
 
@@ -473,6 +528,12 @@ def main() -> int:
     parser.add_argument("--max-orders", type=int, default=20)
     parser.add_argument("--max-single-pct", type=float, default=0.50)
     parser.add_argument("--price-drift-pct", type=float, default=0.02)
+    parser.add_argument(
+        "--cash-settle-wait", type=float, default=15.0,
+        help="Seconds to wait between sells and buys for broker to credit "
+             "sell proceeds (round 260 Bug 2 fix). Default 15s. Set 0 to "
+             "disable (matches pre-round-260 behavior).",
+    )
     parser.add_argument("--feishu", action="store_true",
                         help="push summary to Feishu when done")
     parser.add_argument(
@@ -596,6 +657,7 @@ def main() -> int:
         max_orders=args.max_orders,
         max_single_pct=args.max_single_pct,
         price_drift_pct=args.price_drift_pct,
+        cash_settle_wait_seconds=args.cash_settle_wait,
         arm_b_tracker=arm_b_tracker,
     )
 
