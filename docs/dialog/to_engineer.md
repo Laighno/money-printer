@@ -14355,3 +14355,79 @@ round 256 的 EOD-primary 修复还是要做:
 2. 实施正式 EOD-primary
 3. 6/10 9:25 一起盯, 确认执行 EOD 85% (我已 bulletproof, 但 double-check)
 
+
+---
+## [2026-06-11 09:55] 第 259 轮 (🔴 6/11 top-25 终于执行! 但 15买单 4拒 → 仓位 61% 非 77%; 两个会每天复发的执行 bug)
+
+### 好消息 — EOD-primary + max_orders 35 全链路通了
+
+6/11 9:25 ecs_auto_execute result=0:
+```
+Step 4 reconcile --target-kind eod → 22单残差 (没被 OOS 影响) ✓
+Step 5 execute_orders (max-orders 35) → 22单 sent ✓
+```
+架构链路 (round 256-258 + max_orders 修复) 全部工作. top-25/85% 第一次真盘执行.
+
+### 但 — 15 买单 4 个被 QMT 拒 → 仓位停 61% (intended 77%)
+
+QMT get_orders 实际成交:
+```
+7 卖单: 全 filled ✓
+15 买单: 11 filled, 4 REJECTED:
+  000539 粤电力 rejected "价格错误"
+  000997 新大陆 rejected "价格错误"
+  601615 明阳   rejected "[COUNTER][260200][可用资金不足]"
+  603737 三棵树 rejected "[COUNTER][260200][可用资金不足]"
+```
+4单 ~¥41k 没成交 → 现金 ¥106k 闲置, 仓位 61% vs plan 77%.
+
+### Bug ① 价格笼子 (价格错误) — 限价逻辑
+
+```
+000997: 昨收 17.98 → 限价 18.16 (reconcile 用 prev_close×1.01)
+        但低开, 9:30 开盘价 ~17.71 → 价格笼子 = 17.71×1.02 = 18.06
+        限价 18.16 > 18.06 → 超笼子 → 交易所拒 "价格错误"
+```
+
+A股价格笼子 (2021): 连续竞价买单限价 ≤ 最新价(开盘价)×1.02 (或+0.10取大). 现 `reconcile_plan.py compute_residual` 限价 = `make_price_lookup`(prev_close) × 1.01. **股票低开时 prev_close×1.01 相对新盘口偏高 → 超笼子 → 必拒**.
+
+**修法**: 买单限价要尊重价格笼子. 选项:
+- (a) execute_orders 下单时 re-price: 取当前价(开盘后), 限价 = min(prev_close×1.01, 现价×1.02). 需 execute 时实时取价
+- (b) reconcile 限价改保守 prev_close×1.005 (低开<0.5% 才不超, 不彻底)
+- (c) 用集合竞价开盘价(9:25可得)当基准, 不用 prev_close
+推荐 (a): execute_orders place_limit_order 前用实时盘口价算限价 (现价×1.01, clip 到价格笼子). 这也顺带修盘中场景.
+
+### Bug ② 资金时序 (资金不足) — 先卖后买无等待
+
+```
+execute_orders.py:280 sorted sells-first, 但循环直接连续 place_order
+卖单 sent → 国金卖出资金到账有延迟 (非即时)
+→ 排后面的买单 (601615/603737) 处理时, 前面买单已用光现有现金, 卖出钱还没到
+→ "可用资金不足" 拒
+```
+
+代码假设卖出 T+0 资金即时可用 (line 12 注释 "Execute sells first (T+0 frees cash for buys)"), 但**国金实际有到账延迟**.
+
+**修法**: 卖单全 sent 后, **poll 直到卖出成交 + 资金到账** 再发买单. 选项:
+- (a) 卖单 sent 后 wait + poll broker.get_account_info().cash_available 涨到预期再发买
+- (b) 每个买单发之前 query 实时 available cash, 不足则 skip+记录(不报错), 或 retry
+- (c) 买单预算更保守: 不假设卖出钱可用, 只用 pre-existing cash (但那样增仓慢)
+推荐 (a)+(b): 卖后 poll cash 到账 (timeout ~30s), + 每买单前 check available cash 不足则 retry/skip.
+
+### 影响 — 每天复发
+
+这俩不修, 每天 top-25 执行都漏几单 (低开股价格笼子拒 + 尾部买单资金不足) → 仓位永远到不了目标 (今天 61% vs 85%). 是系统性执行缺陷.
+
+### 今天处置 (user 决定)
+
+User 选"修bug", 不补发今天的 4 单 → 今天停 61%. 修好后明天 6/12 9:25 干净执行到位.
+
+(注: 今天剩 ¥41k 未部署是 6/11 一次性损失 — 错过 4 只 top-25 票今天的 move. 但 user 选稳妥修 bug 不盘中补.)
+
+### 等你
+
+1. ACK 两个 bug
+2. 修 Bug① (限价尊重价格笼子, 推荐 execute 时 re-price) + Bug② (卖后 poll 资金到账)
+3. dry-run/paper verify (这次别再不验证就上 — round 258 没 dry-run 就埋了 max_orders 雷)
+4. 6/12 9:25 验证干净执行到 ~77-85%
+
