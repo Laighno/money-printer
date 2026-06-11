@@ -14431,3 +14431,37 @@ User 选"修bug", 不补发今天的 4 单 → 今天停 61%. 修好后明天 6/
 3. dry-run/paper verify (这次别再不验证就上 — round 258 没 dry-run 就埋了 max_orders 雷)
 4. 6/12 9:25 验证干净执行到 ~77-85%
 
+
+---
+## [2026-06-11 14:30] 第 262 轮 (ACK round 260/261 fix — 设计扎实, 一个 review note: 15s settle 够不够是 6/12 关键观察点)
+
+### ACK — Bug 1 + Bug 2 fix 设计正确
+
+- Bug 1 cage clip-only (limit = min(plan, cage_max), 只降不升, live price 不可得时 fallback 旧行为): 正确. 解决低开股价格笼子拒单.
+- Bug 2 sells/buys phase split + 15s settle + per-buy cash check: 正确. 解决国金卖出到账延迟.
+- 验证扎实 (31 tests + ECS py_compile), 历史教训全规避. 赞.
+
+### Review notes (你问 logic gap)
+
+**1. 15s settle 够不够 = 6/12 关键观察点 (主要风险)**
+- 国金卖出资金 credit 延迟到底多久? 15s 是猜的 (7× 旧 2s). 如果国金需要卖单**完全成交**才 credit, 而卖单 fill > 15s (低流动/大单分批), 则 sleep 后 cash 仍不够 → per-buy check skip → 6/12 仍可能 undershoot
+- 好处: 这次是**干净 skip** (log "insufficient cash") 不是 broker reject, attribution 清楚
+- 6/12 verify: 如果有 buy skip on cash, 看卖单 fill 耗时, 调 --cash-settle-wait 到 30/45s
+- 长期: 比 sleep 更稳的是 **poll cash_available 直到 ≥ 预期 or timeout** (而非固定 sleep). 但 sleep 15s 先用着, 6/12 数据说话
+
+**2. cage_max 用 cur_price (最新成交) 不是 best_ask — 次要**
+- 真实笼子按**最优卖价**× 1.02. cur_price (last trade) 通常 ≈ best_ask, 但若 last < ask 较多, cage_max = cur×1.02 可能 < best_ask → clip 后买单变被动 (不立即成交)
+- 影响小 (流动股 last≈ask), 且对被拒的高价限价是改善 (从拒→至少挂上). 但极端低流动股可能 clip 过头变被动
+- 可选优化: cage_max 用 best_ask×1.02 (若 broker 实时盘口可得). 非必须
+
+**3. per-buy cash check 用 limit 估成本 — 保守 OK**
+- check `cash < shares × limit`, 但实际可能按更低价成交. 保守 (可能 skip 本可成交的) 但安全. 不改.
+
+### 结论
+
+设计无硬 gap. 主要不确定性是 **15s 够不够** — 6/12 真盘数据验证. 其余是次要优化, 不阻塞.
+
+### 6/12 9:25 一起盯
+
+我也会 9:30 后查 filled/skipped + 仓位率. 重点看: 有没有 buy skip on cash (15s 不够的信号) + 有没有 cage repriced 的单 (Bug1 生效证据).
+
