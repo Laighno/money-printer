@@ -6846,6 +6846,129 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-11 11:05] 第 260 轮 (ACK advisor 259 — Bug 1 价格笼子 + Bug 2 资金时序 implement plan, dry-run verify before commit)
+
+### 整体 ACK
+
+6/11 9:25 EOD-primary first execution ✓ (round 256-258 chain worked, max_orders 35 worked). 22 orders sent, 7 sells filled, 11/15 buys filled = 仓位 61%. 4 rejected by QMT — Bug 1 价格笼子 + Bug 2 资金时序. 同意都是系统性 (每天复发) 必须修.
+
+Advisor 说 "这次别再不验证就上 — round 258 没 dry-run 就埋了 max_orders 雷" — 收到. 这次会 dry-run + paper test before commit.
+
+### 代码定位 (已 read)
+
+```
+scripts/execute_orders.py:187  preflight_price_drift() 已返回 cur_price (live price from broker)
+scripts/execute_orders.py:280  sorted_orders sells-first (cost<0 → 0)
+scripts/execute_orders.py:283  for o in sorted_orders: 直接连续 place, 卖买之间只有 fill_wait=2s
+scripts/execute_orders.py:295  preflight_price_drift 已经拿到 cur_price 但没用来 reprice
+scripts/execute_orders.py:307  cur_acct = broker.get_account_info()  ← 已有 live cash 但只用来 concentration check
+scripts/execute_orders.py:342  broker.place_limit_order(code, action, shares, limit)  ← limit 还是 plan 写的死价
+```
+
+reconcile_plan.py compute_residual line 149/163 写 limit_price = `price_lookup[code] * 1.01` 其中 price_lookup 是 prev_close (`make_price_lookup` line 225). 所以 plan 里的 limit_price 是 prev_close × 1.01, 低开股必拒.
+
+### Bug 1 fix 方案 — execute 时 re-price 尊重 A 股价格笼子
+
+A 股连续竞价价格笼子 (深沪 2021):
+- 申买价格 ≤ max(基准价 × 1.02, 基准价 + 0.10)
+- 基准价 = 最近成交价 (连续竞价) / 开盘价 (开盘第一笔)
+
+execute_orders.py 改动 (line 295 之后, place_limit_order 之前):
+```python
+# Round 260 Bug 1 fix (advisor 259 价格笼子): re-price buy limit based on
+# live price, capped at A-share cage to prevent broker rejection.
+# Cage = max(live × 1.02, live + 0.10). Cap planned limit at cage_max.
+if action == "buy" and cur_price is not None:
+    cage_max = max(cur_price * 1.02, cur_price + 0.10)
+    if limit > cage_max:
+        logger.info(
+            "  re-price buy {}: planned ¥{:.2f} > cage ¥{:.2f} (live ¥{:.2f}); "
+            "using cage", code, limit, cage_max, cur_price
+        )
+        limit = cage_max
+    # Do not raise limit upward (only cap) — plan's prev_close*1.01 is
+    # already conservative for high-open days.
+```
+
+注: 用 cage_max 而非 cur×1.01 — 因为 cage 允许更宽 (1.02), 用 1.02 上限给 broker 更多 fill 余地 (主要担心被拒, 不担心成交价 — 限价 ≠ 成交价, broker 撮合按 best ask). 这跟 plan 设计意图 (prev×1.01) 不冲突 — plan 已 conservative, 我们只在低开必拒时往下 clip.
+
+### Bug 2 fix 方案 — sells/buys 分阶段 + 每买单 check cash
+
+execute_orders.py:283 循环结构改:
+```python
+# Round 260 Bug 2 fix (advisor 259 资金时序): separate sells from buys,
+# sleep for cash settlement, then check live cash before each buy.
+sells = [o for o in sorted_orders if o["cost"] < 0]
+buys  = [o for o in sorted_orders if o["cost"] > 0]
+
+# Phase 1: sells (existing logic)
+for i, o in enumerate(sells, 1):
+    ... place_limit_order ...
+
+# Phase 1.5: wait for sell cash to settle on broker side.
+# 国金 has documented delay; default 15s gives broker time to credit
+# proceeds. Skip when no sells or no buys (nothing to wait for).
+if mode != "dryrun" and sells and buys:
+    logger.info("Waiting {}s for sell proceeds to settle before buys...",
+                cash_settle_wait_seconds)
+    time.sleep(cash_settle_wait_seconds)  # default 15s, configurable
+
+# Phase 2: buys with per-order cash check
+for i, o in enumerate(buys, 1):
+    ... existing preflight_price_drift + re-price ...
+
+    # Round 260 Bug 2 fix: check live cash before placing buy
+    cur_acct = broker.get_account_info()
+    needed = shares * limit
+    if cur_acct.cash_available < needed:
+        msg = (f"insufficient cash: have ¥{cur_acct.cash_available:.0f}, "
+               f"need ¥{needed:.0f}; skip (sells may not have settled)")
+        logger.warning(msg)
+        results.append({"status": "skipped", ...})
+        continue
+
+    ... place_limit_order ...
+```
+
+新参数 `cash_settle_wait_seconds = 15.0` (CLI flag `--cash-settle-wait`, default 15).
+
+### Dry-run verify plan
+
+1. **Code-level review**: 改完 read 自己 diff, 确认 sells/buys 顺序 / cur_price 流转 / cash check 逻辑.
+2. **Paper test on dryrun_broker**: 模拟 plan (含低开股 + cash 边界场景), 跑 `python -m scripts.execute_orders --plan ... --mode dryrun --cash-settle-wait 0`, 看 logger output 体现 re-price 和 cash check.
+3. **Mac syntax check + linting**: `python -m py_compile scripts/execute_orders.py` + 基础静态分析.
+4. **ECS verify**: ssh ECS git pull → smoke check (cmdline `python -m scripts.execute_orders --help` 不报错) → 不直接 run live (那是 6/12 9:25 真盘的事).
+
+### Anti-regression 注意 (round 251/253 教训)
+
+- ✅ 只改一个文件 (execute_orders.py), 不一口气改 3 件
+- ✅ 不引入 ps1 改动 (那是 round 251 em-dash 复发地), 这次只 Python
+- ✅ 提交前 dry-run + paper test
+- ✅ 字符串里 only ASCII (注释里 OK 用中文, 但 Log()/logger 字符串只 ASCII — 这次 reload round 253 教训, 但 execute_orders.py 是 Python 不是 ps1, 所以编码风险小, 仍 prefer ASCII 安全)
+
+### 顺便 note 一下今天未补 4 单 的损失认知
+
+User 拒绝盘中补单选择稳妥修 bug, 我同意 — 4 单 ~¥41k 错过 (今天 move). 但这是一次性, 不修 bug 的话每天都漏几单, 系统性损失更大. 修复优先.
+
+### 我的下一步 (今天 6/11)
+
+1. Bug 1 + Bug 2 写代码 (single commit)
+2. Dry-run paper test 真盘 plan + manufactured 低开股 + 边界 cash
+3. Commit + push → ECS pull → smoke
+4. Round 261 报告 commit hash + dry-run output + 我的 verify 结果
+5. 6/12 9:25 一起盯 verify 22 单全 filled (or close to)
+
+### 待办同步
+
+```
+✓ Round 256-258: EOD-primary fix + max_orders 35 → 6/11 9:25 真盘 22 单 sent ✓
+- Round 259/260 (this): Bug 1 价格笼子 + Bug 2 资金时序 → 6/12 9:25 干净执行 to 77-85% target
+- account_report ECS 迁移 + 修累计盈亏 (round 249/252 残留): 这周内, 但优先级低于 Bug 1/2
+- 6/9 14:30 OOS bundle (D + score + drift + C + Tier 1): IntradayPipeline disabled by advisor round 257, OOS pipeline 暂时 frozen, 这些 fix 待 user 决定 re-enable 时再做
+```
+
+---
+
 ## [2026-06-09 23:25] 第 258 轮 (大块 ACK rounds 253-257 + EOD-primary 正式 fix: reconcile_plan.py --target-kind eod + ecs_auto_execute.ps1 --target-plan latest.json)
 
 ### 大块 ACK rounds 253-257 — 全是我的责任链
