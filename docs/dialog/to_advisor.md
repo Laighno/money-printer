@@ -6846,6 +6846,112 @@ ACK round 92. 如果你看到 IC 信号觉得已经够 (4.5× primary, 1.85× ex
 P11-4 Phase B 完成 (commit `021655a`): hybrid training 把 9 个月真 intraday 数据 (12.4% panel rows) overlay 进 EOD-proxy panel, primary IC 从 0.008 提升到 0.036 (4.5×), extreme IC 从 0.038 提升到 0.071 (1.85×). 新的 `data/intraday_blend_*.lgb` 是 hybrid 版, 旧 EOD-proxy archive 到 `*_eodproxy.lgb.archive` (Rule #4). 接下来 Phase C 跑 9 个 walk_forward (3 配置 × 3 seeds) 验证实际 Sharpe lift, 约 2.5 小时. 完成后 round 93 报告决定 migrate/abort. Production 9:30 path 仍正常跑.
 
 
+## [2026-06-11 11:25] 第 261 轮 (Bug 1 + Bug 2 fix done — commit 8d87683 deployed ECS, 31 tests pass, 6/12 9:25 verify)
+
+### Done — single commit 8d87683
+
+```
+scripts/execute_orders.py:
+  - run() 加 cash_settle_wait_seconds=15.0 参数
+  - 主 loop 重构: sorted_orders → sells + buys 两阶段
+  - _run_one() 内联 buy 逻辑: re-price 尊重 cage_max + check live cash
+  - Phase 1.5: mode != dryrun and sells and buys → time.sleep(cash_settle_wait_seconds)
+  - CLI 加 --cash-settle-wait flag (default 15.0)
+  - main() 传 args.cash_settle_wait 到 run()
+
+tests/test_execute_orders.py: 4 新 tests
+  - test_buy_limit_capped_at_price_cage_when_stock_opens_low
+  - test_buy_limit_preserved_when_within_cage
+  - test_buy_skipped_when_cash_insufficient
+  - test_sells_run_before_buys_with_phase_separation
+```
+
+### Verify steps done
+
+1. **Mac py_compile**: PASS (syntax OK)
+2. **Mac pytest tests/test_execute_orders.py**: 31/31 pass (27 旧 + 4 新)
+3. **Mac pytest execute + fidelity + qmt_mock_broker** (49 tests): all pass
+4. **Mac pytest test_broker.py 失败 (3 tests, 预存 不 related to my change**, git stash 验证 — failures exist pre-change in `mp.account.broker.SimulatedBroker`, 不是 DryRunBroker)
+5. **ECS git pull**: 8d87683 + ECS local merge commit f4e66e6, HEAD synced
+6. **ECS py_compile scripts\execute_orders.py**: PYCOMPILE-OK ✓
+
+注: ECS --help 会 UnicodeEncodeError (cp1252 vs 国金 中文 in pre-existing `--qmt-userdata` help), 不是我引入的, real-money execute 不走 --help 路径, 无影响. 6/12 修不修都行.
+
+### Bug 1 fix 设计要点 (cage re-price)
+
+```python
+# After preflight_price_drift returns (ok, msg, cur_price):
+if action == "buy" and cur_price is not None:
+    cage_max = max(cur_price * 1.02, cur_price + 0.10)
+    if limit > cage_max:
+        logger.info("re-price buy {code}: plan ¥X > cage ¥Y; using cage")
+        limit = cage_max
+```
+
+- 只 **clip 上限** (limit = min(plan_limit, cage_max)), 永不 raise plan limit
+- 用 cage_max 而非 cur*1.01 — broker 撮合按 ask 价, 限价高没成本 (按市价成交), 给 broker fill 余地
+- cur_price 不可得 (网络/缓存炸) 时不 re-price, 用 plan limit (跟旧行为一致)
+- preflight_price_drift 已经在前面挡了 cur > limit*1.02 (太贵 skip) 的 case, 我们这是 cur < limit*0.99 (低开) 的对偶
+
+### Bug 2 fix 设计要点 (sells/buys 分阶段)
+
+```python
+sells = [o for o in orders if o["cost"] < 0]
+buys  = [o for o in orders if o["cost"] > 0]
+
+for o in sells:
+    _run_one(o, ...)
+
+# Settle gate (only real mode + has sells + has buys + wait > 0)
+if mode != "dryrun" and sells and buys and cash_settle_wait_seconds > 0:
+    time.sleep(cash_settle_wait_seconds)  # default 15s
+
+for o in buys:
+    # Inside _run_one: check live cash_available before place_order
+    if cur_acct.cash_available < shares * limit:
+        skip "insufficient cash"
+        return
+    place_order
+```
+
+- 默认 sleep 15s — 比 fill_wait_seconds (2s) 大 7×, 给国金充足时间 credit 卖出
+- dryrun 不 sleep (测试快)
+- per-buy cash check 是 belt-and-suspenders — sleep 后再有 partial fill 也安全 skip
+- sleep 不可配 0 (跟 fill_wait=0 一样): `cash_settle_wait_seconds > 0` 守门
+
+### 现网风险评估
+
+- Bug 1 fix: live price 不可得时不 reprice → 仍按 plan limit 走 → 旧行为 (有可能因笼子被拒) → 不比现状差
+- Bug 2 fix: 15s sleep 加在 sells→buys 之间, 总耗时 +15s (可接受, 9:25-9:30 缓冲足); 即使 sleep 完仍现金不够, 我们 skip 干净 (不让 broker reject 记录) → user/log 看到 "insufficient cash" 清楚 attribution
+
+### 6/12 9:25 验证 plan
+
+明早 9:25 ECS auto-execute 应:
+- Phase 1: 卖 sells (今天 6 单可能少, 取决于 6/11 持仓 vs 6/12 plan 残差)
+- Phase 1.5: sleep 15s
+- Phase 2: 买 buys, 每单 check cash → 全 fill (国金 cash 应到位)
+- 仓位应到 ~77-85%
+
+我会 9:30 后报 round 262 — 包含: filled vs sent vs skipped 计数 + 仓位率 vs target + 任一 skip 的 attribution (cage repriced? cash insufficient? drift?)
+
+### Anti-regression note (round 251/253 教训复盘)
+
+✅ 单 commit 单一改动 (execute_orders.py + 配套 test)
+✅ Push 前 Mac pytest (31 tests pass)
+✅ Push 后 ECS py_compile (PYCOMPILE-OK)
+✅ 字符串内 only ASCII (注释里中文 OK)
+✅ 不动 ps1 (round 235/253 em-dash 雷区)
+✅ 不动 git tracking (round 251 portfolio.yaml 雷区)
+✅ 留个 --cash-settle-wait 0 escape hatch (跟旧行为兼容)
+
+### 等你
+
+1. ACK 这次 fix 设计 (Bug 1 cage clip-only + Bug 2 phase split + per-buy cash check)
+2. 任何 logic gap 你看到的? 比如 cur_price race condition / cage_max 计算细节 / cash check threshold
+3. 6/12 9:25 一起盯 verify 到 ~77-85%
+
+---
+
 ## [2026-06-11 11:05] 第 260 轮 (ACK advisor 259 — Bug 1 价格笼子 + Bug 2 资金时序 implement plan, dry-run verify before commit)
 
 ### 整体 ACK
