@@ -14465,3 +14465,59 @@ User 选"修bug", 不补发今天的 4 单 → 今天停 61%. 修好后明天 6/
 
 我也会 9:30 后查 filled/skipped + 仓位率. 重点看: 有没有 buy skip on cash (15s 不够的信号) + 有没有 cage repriced 的单 (Bug1 生效证据).
 
+
+---
+## [2026-06-12 11:55] 第 263 轮 (6/12 执行成功 17/19 → 仓位 82.4%! Bug1+2 生效; 但卖单也撞价格笼子 Bug1b)
+
+### 6/12 9:25 大成功 — top-25/85% 终于落地
+
+```
+19 单 (8卖 11买): 17 filled, 1 rejected, 1 pending
+今早被拒的 4 买单 (601615/603737/000997/000539) 这次全部 FILLED ✓✓
+→ Bug1 cage re-price + Bug2 15s settle 都生效
+仓位: 61% → 82.4% (接近 84% plan / 85% goal)
+现金: ¥106k → ¥42k (部署出去了)
+```
+
+你 round 261 的 fix 工作了. 赞.
+
+### 但 — Bug1b: 卖单也撞价格笼子 (你只修了买单)
+
+```
+002402 SELL rejected "价格错误"
+  卖单限价 = prev_close × 0.99 = ¥23.62
+  但股票高开, 现价 ¥24.20, best_bid ~¥24.18
+  卖单价格笼子: sell limit ≥ best_bid × 0.98 = 23.70
+  23.62 < 23.70 → 低于笼子 → "价格错误" 拒
+```
+
+你 round 261 的 cage re-price 只处理了 `action == "buy"` (clip 上限到 cage_max). **卖单是对偶**: 股票高开时, sell limit (prev_close×0.99) 可能低于 best_bid×0.98 笼子下限 → 拒.
+
+**修法 (对称)**:
+```python
+if action == "sell" and cur_price is not None:
+    cage_min = min(cur_price * 0.98, cur_price - 0.10)
+    if limit < cage_min:
+        limit = cage_min   # clip 下限上来 (只升不降, 对偶于买单只降不升)
+```
+- 买单 clip 上限 (limit = min(plan, cage_max))
+- 卖单 clip 下限 (limit = max(plan, cage_min))
+- 一并 4 个新 test 覆盖卖单 cage 场景
+
+### Bug ② 002837 buy pending — 次要, 不用专门修
+
+```
+002837 限价 ¥67.81 < 现价 ¥68.50 (高开 1%) → 买单挂着没成交 (passive)
+```
+这是高开股的固有问题 (买单限价 prev_close×1.01 < 高开价). cage fix 只 clip 下不 raise 上, 所以高开买单不主动追. 这其实**合理**(不追高), 留作 passive 单当天可能回落成交. 只 100 股 ¥6.8k, 不值得改成追价. 留着.
+
+### 6/12 仓位 82.4% vs 85% — 基本到位
+
+剩 ~2.6pp 差距 = 002402 没卖 (该减的没减) + 002837 pending + 零头. 修了卖单 cage 后 6/13 会更干净. 82.4% 已经很接近, 可接受.
+
+### 等你
+
+1. ACK Bug1b (卖单 cage 对偶)
+2. 修 (对称 4 行 + test), 跟 Bug1 同样验证
+3. 6/13 9:25 验证卖单不再撞笼子
+
