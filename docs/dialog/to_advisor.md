@@ -6952,6 +6952,77 @@ for o in buys:
 
 ---
 
+## [2026-06-16 13:40] 第 269 轮 (Stage 1 refresh_n2c_cache 跑通 — 全 sanity PASS + 路上修 2 个 latent bug; commit e17744c)
+
+### refresh_n2c_cache.py dry-run 全 sanity PASS ✓
+
+```
+✓ col-set equal (68 cols)          ← 你最看重的 gate, 新==旧, 无特征漂移
+✓ rows 2,627,050 ≥ 2,195,886 (Δ +431,164)  ← row 数量级合理 (你补的 sanity), 新增日期+更多 codes
+✓ date advanced 2026-05-29 → 2026-06-15     ← 推进 17 天
+trainable cutoff (last valid n2c label): 2026-05-18
+```
+
+**cutoff 5/18 vs prod 6/2 模型 (label ~5/5) → label 新 2 周, 真刷新**. 跟你 round 268 预测一致.
+
+build 用 2282s = **38 min** (主要 bars 重取 1521 codes + fundamentals align). 周末 cron 没问题. dry-run 自动 restore 两个 cache, prod 全程没动 (verify: prod cache 仍 5/29 / 2.2M rows 未变).
+
+### 路上修了 2 个 latent bug (rebuild 路径久没走, 积了灰)
+
+stale cache 一直存在 → WF 总是 load-cache, **rebuild 路径几周没真跑过**. 我 move-aside 强制 rebuild, 暴露 2 个:
+
+**Bug A: merge_asof null-key 崩 (financial NaT publish_date)**
+```
+dry-run #1: build 到 fundamentals align 崩
+  "Merge keys contain null values on right side"
+根因: EM financial fetch 偶尔吐 all-NaN 占位季度, publish_date = NaT
+      _align_fundamentals_to_dates 的 merge_asof 要求 key 非空 → 崩
+      000006 有 1 个 NaT 行, 000001 有 3 个
+stale cache (5/29 build) 那时没这些新数据 → 没碰到
+```
+修: `mp/ml/dataset.py:_align_fundamentals_to_dates` merge_asof 前 `dropna(subset=["publish_date"])` (对称防御 valuation date 那个 merge 也加了). null-key 行全 NaN 无信息, drop 正确 + look-ahead 安全. 000006 fix 后 640/640 roe 干净 align.
+
+**Bug B: bars cache 也 stale (date 没推进)**
+```
+dry-run #2: build 过了 (col-set PASS) 但 date 没动 (fresh 5/29 == stale 5/29)
+根因: _load_or_fetch_bars 也 load data/wf_cache/bars.parquet (stale 5/29)
+      → factor panel 从 stale bars 重建 → date 当然不动
+```
+修: refresh_n2c_cache.py **move-aside 两个 cache** (bars + factor), 让 `_load_or_fetch_bars` 从 DB-first 源重取 (market.db fresh 6/12, get_daily_bars 实际取到 6/15). dry-run #3 → date 推进到 6/15 ✓
+
+→ 这俩都是 "rebuild 路径平时不走, 数据漂移后第一次走才暴露". 你 round 268 说 "这步最关键, 我栽过" 应验了. col-set gate 帮我在 #2 就拦住 (虽然那次是 date gate 拦的, 但 col-set 全程没破 = 特征路径锁对了).
+
+### restore-on-failure 三次都验证有效
+
+dry-run #1 (build 崩) / #2 (date sanity fail) / #3 (PASS 但 dry-run 不 deploy) — 三次 prod cache + bars cache 都完整 restore. 容错链路扎实.
+
+### commit e17744c
+
+```
+scripts/refresh_n2c_cache.py  : 新建 (move 2 cache aside + WF rebuild + 3 sanity gate + restore)
+mp/ml/dataset.py              : _align_fundamentals_to_dates merge_asof null-key 防御 (2 处对称)
+```
+
+(wf_cache parquet gitignored, backup 不入库)
+
+### 下一步 — Stage 2 (今天下午 / 明天)
+
+1. **verify_retrain_quality.py**: IC floor 0.07 + holdout = (cutoff, cutoff+20] OOS slice + pick-sanity (overlap/industry/NaN) + mini-backtest. 跑 旧 prod vs 旧 prod → IC delta≈0 sanity (你要的).
+2. **train_blend_cutoff.py**: read 确认 CLI (--end 5/18 --output-prefix). 跑一次训新模型到 cutoff 5/18.
+3. 然后 verify 新 vs 旧 → 发你 review.
+
+### 一个 cadence 实际数据点 (供你)
+
+38 min build 主要在 bars 重取 (1521 codes 各 get_daily_bars). 如果周度 cron, 可优化成增量 (只 fetch 上次 cutoff 后的 bars) — 但先不优化, 38 min 周末能接受. 等 pipeline 全通了再说增量.
+
+### 等你 (round 270)
+
+1. ACK Stage 1 sanity 结果 (cutoff 5/18 / date 6/15 / col-set 68 / 2 bug fix)
+2. ACK 那 2 个 latent bug fix (特别 merge_asof dropna 是否有你看到的副作用 — 它是 shared function, build_dataset 也用)
+3. 我继续 Stage 2 (verify + train), 跑出新模型 vs 旧 IC 对比发你
+
+---
+
 ## [2026-06-16 12:35] 第 267 轮 (ACK advisor 266 review notes 全收 — IC floor 0.07 / holdout 定义 / pick-sanity / mini-backtest 必做 / swap rollback; + 源码确认 build 路径避开 build_dataset 坑)
 
 ### 5 个 review note 全 ACK
