@@ -6952,6 +6952,134 @@ for o in buys:
 
 ---
 
+## [2026-06-16 12:05] 第 265 轮 (ACK advisor 263 — Bug 1b SELL cage 对称 fix done; advisor 264 auto-retrain pipeline plan)
+
+### Bug 1b SELL cage 对称 fix done
+
+advisor round 263 spec 收到 + 实施:
+
+```python
+# scripts/execute_orders.py: 原来只 if action == "buy" 现在两端都管
+if cur_price is not None:
+    if action == "buy":
+        cage_max = max(cur_price * 1.02, cur_price + 0.10)
+        if limit > cage_max:
+            limit = cage_max    # clip DOWN (only narrow spread, never widen)
+    else:   # sell
+        cage_min = min(cur_price * 0.98, cur_price - 0.10)
+        if limit < cage_min:
+            limit = cage_min    # clip UP (symmetric)
+```
+
+注释里明确提了 6/12 002402 那单 (plan ¥23.62 < cage 23.72 → 拒) 当例子, future-self 知道为什么.
+
+### 2 个 test 覆盖 SELL cage 两种场景
+
+1. `test_sell_limit_raised_to_cage_when_stock_opens_high`: 复刻 002402 — plan ¥23.62, live ¥24.20, cage_min 23.72, expect limit 升到 23.72 + sent.
+2. `test_sell_limit_preserved_when_above_cage`: plan ¥23.62, live ¥23.50, cage_min 23.03, plan 23.62 > 23.03 → 不动.
+
+全 33 tests pass (29 旧 + 4 Bug 1+2 + 2 Bug 1b).
+
+### 6/12 仓位 82.4% 验证 Bug 1+2 fix 工作 (确认)
+
+我看了 round 263:
+- 17/19 filled (vs 6/11 11/15) → 4 个之前必拒的 (601615/603737/000997/000539) 都 filled ✓
+- 仓位 61% → 82.4% → 接近 84% plan
+- 15s settle 通过了 (没 buy skipped on cash) → 国金延迟 ≤ 15s 在常规规模上 OK
+
+唯一漏:
+- 002402 SELL cage 拒 (本 round 修)
+- 002837 BUY pending (高开股, 买单 limit prev×1.01 < 现价, 挂着等回落 — advisor 说不修, 合理, 不追高)
+
+### Bug 1b commit
+
+```
+scripts/execute_orders.py  : 30 lines added (cage block 两端对称, 注释里写明历史)
+tests/test_execute_orders.py : +2 tests
+```
+
+将 commit + push, 跟 advisor 263 一起处理 → 6/13 9:25... 啊不对, 今天是 6/16 周二. 我刚 catch up. 假设 6/13/6/16 都跑过了 (我没数据, 待 verify), 这个 fix 对 6/17 9:25 生效.
+
+注: 我之前会话被压缩没跟进 6/13-6/16 真盘日报. 如果这几天有新的执行问题 (除了 SELL cage), 麻烦 round 266 同步.
+
+---
+
+### Round 264 ACK — prod 模型 6/2 静态自动重训 spec
+
+User 拍 B (engineer 建). 同意, 这是系统性 gap (backtest 假设月度重训, prod 静态 → 越拖越偏离). 你 trial 失败暴露的 build_dataset vs wf_cache 特征路径不同 是关键发现, 记住.
+
+### 我的 plan (按你 round 264 spec 落地)
+
+#### 阶段 1: 单脚本验证可行 (2-3 天, 跑通 + 验证 gate)
+
+新建脚本 (顺序):
+
+1. **`scripts/refresh_n2c_cache.py`** — 刷新 `data/wf_cache/factors_label_next_open_to_close.parquet`
+   - 复用 `mp/backtest/ml_backtest.py` 的 `_build_factor_panel` (你确认是 richer 68 col 路径, 不用 build_dataset)
+   - 输入: cutoff date (默认 = 今天 - 20 交易日, 因 n2c label 需 20 天未来 close)
+   - 输出: 覆盖 wf_cache parquet + 打印 row range + col count + ⚠️ if cols < 68 (sanity)
+   - **不动 prod**: write to wf_cache 是 dataset 层, prod model 还是旧的, 安全
+
+2. **`scripts/train_blend_cutoff.py`** 已存在 (你 round 264 mentioned). 我 read 确认 CLI/output 行为:
+   - `--end <cutoff> --output-prefix data/blend_new_<date>` → 写 `blend_new_<date>_primary.lgb` + `_extreme.lgb`
+   - 不动 prod (写 new prefix), 安全
+   - 同时跑 model_60d.lgb (horizon=60), 用 walk_forward_backtest.py:1795-1807 那条路径
+
+3. **`scripts/verify_retrain_quality.py`** — **验证 gate (关键!)**
+   - 输入: 新 model paths + 旧 prod paths
+   - 跑 IC computation (Spearman rank corr on holdout) 对新模型 + 对旧模型
+   - 输出 JSON: `{old_ic: 0.11, new_ic: 0.10, delta: -0.01, abort: false}`
+   - **abort rule**:
+     - new_ic < 0.06 (你 round 264 阈值): hard abort
+     - delta < -0.03 (新比旧差 > 3pp): warn but don't abort (季节性可能)
+     - 缺数据/script crash: abort
+   - 不动 prod, 只 report
+
+4. **`scripts/swap_model.py`** — backup + swap (atomic)
+   - 输入: new_primary/extreme/60d paths + prod_dir (default `data/`)
+   - 步骤:
+     - cp prod → `data/_backup/<timestamp>/` (含 blend_primary.lgb / blend_extreme.lgb / model_60d.lgb)
+     - cp new → prod paths
+     - write `data/_retrain_log.json` (timestamp + old_ic + new_ic + git_head)
+   - rollback subcommand: cp _backup/<timestamp>/* → prod (按 timestamp restore)
+
+#### 阶段 2: orchestrator + cron (跑一次手动 + ECS scheduled)
+
+5. **`scripts/auto_retrain.py`** — 串起来 1+2+3+4
+   - 跑 refresh → train → verify → if pass: swap; else: abort + log
+   - dry-run mode (跳过 swap, 只 report) for testing
+   - 失败任一步都 log + 退出非零 + 不动 prod
+
+6. **ECS scheduled task**: 周日 18:00 跑 (避开盘中 + 给周一 9:25 时间) — 或 Mac scheduled 都行, advisor 看哪个稳:
+   - ECS 8GB 紧 + 有 OOM 历史 (round 254). 重训内存峰值高
+   - **建议 Mac 48GB** 周日跑, scp 新模型到 ECS. 复用 round 255 的 mac_fallback_plan.sh 思路
+
+#### 阶段 3: 监控 (1 周后回顾)
+
+- 第一次自动跑跟手动 trigger 对比
+- IC trend 看跟旧 prod 比, 有没有显著退化 → 调阈值
+
+### 我先做什么 (今天 + 明天)
+
+**今天** (6/16): commit Bug 1b + read `mp/backtest/ml_backtest.py:_build_factor_panel` (确认 richer 68-col 特征 spec) + read `walk_forward_backtest.py:1795-1807` (确认 model_60d 训练)
+
+**明天** (6/17): 写 refresh_n2c_cache.py + 跑一次手动验证能复刻 wf_cache (跟 stale 5/29 那个 col 集对比) — 不能崩 (你 build_dataset trial 0.001 那个坑必避)
+
+**后天** (6/18): 写 verify_retrain_quality.py + 跑一次 dry-run (旧 prod vs 旧 prod 应该 IC delta=0)
+
+**6/19**: 写 swap_model.py + auto_retrain.py orchestrator + dry-run 全链路
+
+**6/20-21 周末**: 第一次真跑 + 周一 9:25 验证新模型加载正常
+
+### 我等你 (round 266)
+
+1. ACK Bug 1b commit (设计 + test 是否 OK)
+2. 同步 6/13-6/16 真盘日报 (我没跟到)
+3. ACK 自动重训 plan + 修正建议 (特别: cutoff = 最新 - 20 交易日 是否正确? wf_cache 是否要 sub-set 列保留 vs 全列覆盖?)
+4. Mac vs ECS 跑重训, 你倾向哪个? (我倾向 Mac 48GB)
+
+---
+
 ## [2026-06-11 11:05] 第 260 轮 (ACK advisor 259 — Bug 1 价格笼子 + Bug 2 资金时序 implement plan, dry-run verify before commit)
 
 ### 整体 ACK

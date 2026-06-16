@@ -496,6 +496,88 @@ class TestRunOrchestration:
         assert results[0]["status"] == "skipped"
         assert "insufficient cash" in results[0]["note"]
 
+    def test_sell_limit_raised_to_cage_when_stock_opens_high(self, monkeypatch):
+        """Round 265 Bug 1b (advisor 263): symmetric SELL cage fix.
+
+        Plan limit = prev_close × 0.99. When stock high-opens, cage floor
+        = min(live × 0.98, live - 0.10) may be ABOVE plan → broker rejects.
+        Clip plan limit UP to cage_min.
+
+        Real example (6/12 002402): plan ¥23.62 < cage ¥23.72 (live ¥24.20).
+        """
+        from scripts import execute_orders
+
+        # Plan SELL ¥23.62 (prev_close 23.86 × 0.99), live ¥24.20
+        # cage_min = min(24.20*0.98, 24.20-0.10) = min(23.72, 24.10) = 23.72
+        # 23.62 < 23.72 → raise to 23.72
+        monkeypatch.setattr(execute_orders, "_fetch_current_price",
+                            lambda c: {"002402": 24.20}.get(c))
+        monkeypatch.setattr(execute_orders, "preflight_account_reconcile",
+                            lambda *a, **kw: (True, "ok"))
+
+        # Need an existing position to sell
+        seed_pos = Position(code="002402", name="test",
+                             shares_total=1000, shares_available=1000,
+                             avg_cost=23.86, market_price=24.20,
+                             market_value=24200)
+        broker = DryRunBroker(cash=10000, positions=[seed_pos], autofill=True)
+        plan = {
+            "generated_at": "x",
+            "account_snapshot": {"total_assets": 34200, "cash_available": 10000,
+                                  "market_value": 24200},
+            "holdings_at_plan_time": [],
+            "orders": [
+                {"code": "002402", "name": "test", "action": "sell",
+                 "shares": 100, "limit_price": 23.62, "cost": -2362,
+                 "reason": "test"},
+            ],
+            "alerts": [],
+        }
+
+        results = execute_orders.run(broker, plan, mode="dryrun",
+                                       fill_wait_seconds=0,
+                                       cash_settle_wait_seconds=0)
+        assert results[0]["status"] == "sent"
+        assert abs(results[0]["limit_price"] - 23.72) < 0.01, \
+            f"expected cage ¥23.72, got ¥{results[0]['limit_price']}"
+
+    def test_sell_limit_preserved_when_above_cage(self, monkeypatch):
+        """Round 265 Bug 1b: SELL plan limit ABOVE cage_min → preserved
+        (no downward clipping; cage only raises, never lowers).
+        """
+        from scripts import execute_orders
+
+        # Plan SELL ¥23.62, live ¥23.50 → cage_min = min(23.03, 23.40) = 23.03
+        # plan 23.62 > cage 23.03 → no reprice
+        monkeypatch.setattr(execute_orders, "_fetch_current_price",
+                            lambda c: {"002402": 23.50}.get(c))
+        monkeypatch.setattr(execute_orders, "preflight_account_reconcile",
+                            lambda *a, **kw: (True, "ok"))
+
+        seed_pos = Position(code="002402", name="test",
+                             shares_total=1000, shares_available=1000,
+                             avg_cost=23.86, market_price=23.50,
+                             market_value=23500)
+        broker = DryRunBroker(cash=10000, positions=[seed_pos], autofill=True)
+        plan = {
+            "generated_at": "x",
+            "account_snapshot": {"total_assets": 33500, "cash_available": 10000,
+                                  "market_value": 23500},
+            "holdings_at_plan_time": [],
+            "orders": [
+                {"code": "002402", "name": "test", "action": "sell",
+                 "shares": 100, "limit_price": 23.62, "cost": -2362,
+                 "reason": "test"},
+            ],
+            "alerts": [],
+        }
+
+        results = execute_orders.run(broker, plan, mode="dryrun",
+                                       fill_wait_seconds=0,
+                                       cash_settle_wait_seconds=0)
+        assert results[0]["status"] == "sent"
+        assert results[0]["limit_price"] == 23.62
+
     def test_sells_run_before_buys_with_phase_separation(self, monkeypatch):
         """Round 260 Bug 2: sells/buys split into two phases."""
         from scripts import execute_orders

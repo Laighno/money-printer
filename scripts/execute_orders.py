@@ -309,21 +309,42 @@ def run(
                              "limit_price": limit, "note": msg})
             return
 
-        # Round 260 (advisor 259 Bug 1): re-price buy limit against A-share
-        # price cage. plan's limit_price = prev_close * 1.01 (reconcile_plan
-        # compute_residual line 149/163), but when stock opens LOW the cage
-        # = max(live * 1.02, live + 0.10) can be BELOW prev_close * 1.01 →
-        # broker rejects "价格错误". Cap planned limit at cage_max when live
-        # price is available; otherwise proceed with plan limit (drift gate
-        # already enforced sanity above).
-        if action == "buy" and cur_price is not None:
-            cage_max = max(cur_price * 1.02, cur_price + 0.10)
-            if limit > cage_max:
-                logger.info(
-                    "  re-price buy {}: plan ¥{:.2f} > cage ¥{:.2f} (live ¥{:.2f}); "
-                    "using cage", code, limit, cage_max, cur_price
-                )
-                limit = cage_max
+        # Round 260 (advisor 259 Bug 1) + Round 265 (advisor 263 Bug 1b symmetric):
+        # re-price limit against A-share price cage.
+        #
+        # BUYS: plan limit = prev_close * 1.01. When stock opens LOW the cage
+        # ceiling = max(live * 1.02, live + 0.10) can be BELOW plan → broker
+        # rejects "价格错误". Clip planned limit DOWN to cage_max.
+        #
+        # SELLS: plan limit = prev_close * 0.99 (reconcile_plan sets sell
+        # discount inversely). When stock opens HIGH the cage floor =
+        # min(live * 0.98, live - 0.10) can be ABOVE plan → broker rejects.
+        # Clip planned limit UP to cage_min. (Bug 1b: 6/12 002402 SELL
+        # rejected because plan ¥23.62 < cage floor ¥23.72 when stock high-
+        # opened.)
+        #
+        # Both clip TOWARDS the cage (only narrow the spread plan→live), never
+        # widen it — preserves plan's "conservative limit" intent when live
+        # price is already friendly.
+        if cur_price is not None:
+            if action == "buy":
+                cage_max = max(cur_price * 1.02, cur_price + 0.10)
+                if limit > cage_max:
+                    logger.info(
+                        "  re-price buy {}: plan ¥{:.2f} > cage ¥{:.2f} "
+                        "(live ¥{:.2f}); using cage",
+                        code, limit, cage_max, cur_price,
+                    )
+                    limit = cage_max
+            else:   # sell
+                cage_min = min(cur_price * 0.98, cur_price - 0.10)
+                if limit < cage_min:
+                    logger.info(
+                        "  re-price sell {}: plan ¥{:.2f} < cage ¥{:.2f} "
+                        "(live ¥{:.2f}); using cage",
+                        code, limit, cage_min, cur_price,
+                    )
+                    limit = cage_min
 
         # Concentration check for buys: would this push code past single-cap?
         if action == "buy":
