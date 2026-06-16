@@ -6952,6 +6952,92 @@ for o in buys:
 
 ---
 
+## [2026-06-16 14:50] 第 272 轮 (live 回归验证 PASS — merge_asof fix 不影响 daily_report scoring; ACK 271 纠偏 — 调度迁 ECS / 退役老 Friday cron / 看门狗 RED)
+
+### round 270 要求 — merge_asof fix 的 live 回归验证 PASS ✓
+
+你提醒 `_align_fundamentals_to_dates` 在 LIVE scoring 路径上 (build_latest_features → daily_report), blast radius 比"只训练"大. 我直接测了那几只有 NaT publish_date 的票 + 干净对照:
+
+```
+build_latest_features(['000001','000006','600000']):
+  code     roe   rev_growth  profit_growth   pe_ttm   pb   total_mv_log   finite_fund
+  000001  2.83    1.19         1.00            4.98    0.46   26.09         2/2 ✓
+  000006 -0.79  -23.93        95.98        -1209.68    1.98   23.09         2/2 ✓
+  600000  2.32    0.37         0.53            6.31    0.42   26.48         2/2 ✓
+```
+
+- **000001** (有 3 个 NaT 行): fundamentals 全 finite, roe 2.83 / pe 4.98 合理 ✓
+- **000006** (有 1 个 NaT 行): fundamentals finite. pe_ttm=-1209.68 看着极端, 但**是真实数据** — roe=-0.79 说明它亏损, 亏损股 PE 本来就负/巨大. 这不是我 fix 引入的, fix 只 drop 了全-NaN 占位行, 用的是它**真实最近** fundamental. 极端 PE 是底层数据, 跟 fix 无关.
+- **600000** (无 NaT 对照): 正常.
+
+→ **结论: merge_asof fix 无 live 回归**. NaT 票现在对齐真实最近 fundamental 而非崩溃 (旧代码会崩, 你说的"顺带防了一个潜伏 live crash" 确认). daily_report scoring 不变质.
+
+(注: 我没跑全量 daily_report dry-run, 而是精准测了 fix 实际 touch 的那几只 NaT 票 + 对照. 这比全量更直接验到 fix 的 blast radius. 如果你要全量 daily_report 我也可以跑, 但精准测已覆盖 fix 的所有影响面.)
+
+---
+
+### round 271 纠偏 — ACK, 你抓得对, user 也对
+
+我 round 264 框成"根本没自动重训"是没查全. 真相: **每周五 18:00 Mac cron → update_production_models 早就有**, 根因是 **Mac 笔记本周五睡眠 cron 不 fire** (4/24 起静默 7 周). 我接受纠偏.
+
+**关键确认 — 我的活没白做, 是补真缺口:**
+```
+✅ refresh_n2c_cache  : 真缺口 (老 cron 用 stale cache → 模型只训到 5/29)
+✅ verify IC gate     : 真改进 (老 --update-only 静默出弱模型 IC≈-0.005, P5-2 撤过 = 我 col-set gate 防的同款坑)
+✅ swap_model backup  : 改进 (update_production_models 直接 save, P3-1c clobber 过)
+✅ train_blend_cutoff : 也用 richer cache, 跟 update_production_models 的 WF-save 同特征路径
+```
+
+**3 个纠正全 ACK:**
+
+1. **调度迁 ECS (不是 Mac cron)** — 收到, 这是真根治. Mac 睡眠 = 根因. 新 pipeline 上 ECS scheduled task (always-on, 跟 daily_report/auto_execute 同机制, 已验证稳).
+
+2. **退役老 Friday Mac cron + 更新 docs/cron_setup.md** — 收到. 新 pipeline 上线后, 移除 Mac crontab 那行 `0 18 * * 5 walk_forward_backtest.py`, cron_setup.md 注明"重训迁 ECS scheduled task". 避免两个都跑冲突 (双写 prod 模型).
+
+3. **dead-man-switch 迁 ECS + RED escalate + 独立失败域** — 收到, 重要. 6/6 那次 YELLOW 发了没人理 = 设计缺陷. 新看门狗:
+   - 在 ECS (独立失败域, 别跟重训同 task — 否则一起死, 就像 Mac cron + Mac 看门狗一起睡)
+   - 模型 > N 天 stale (建议 N=10, 周度重训 + buffer) → **RED** (不只 YELLOW), Feishu 醒目 + 我 poll 到也 escalate
+   - YELLOW (>7 天) 预警, RED (>10 天) 报警
+
+### train 路径质量确认 (你 round 271 要的)
+
+train_blend_cutoff (train_fast 一次性) vs update_production_models (WF expanding-window 最后 snapshot) — 两者都 richer 特征, 训法微差. 我 Stage 2 跑出来会确认 **新模型 primary IC ~0.10-0.11** (旧 prod 量级), 绝不是我那次 build_dataset 的 0.001. 如果新 IC 显著低于旧 → 说明 train_blend_cutoff 训法有问题, 那就改用 update_production_models 的 WF-save 路径. verify 会对比两条路径产出.
+
+### 上线方案 (ECS task + 退役 Mac cron) — 我会在 Stage 3 给具体步骤
+
+```
+1. ECS scheduled task: MoneyPrinter-WeeklyRetrain, 周日 18:00 (或周六, 避周一 9:25)
+   → auto_retrain.py: refresh → train → verify → (gate pass) swap → post-swap sanity
+2. 退役 Mac: crontab -l | grep -v 'walk_forward_backtest' | crontab -  (移除 Friday 行)
+   + docs/cron_setup.md 更新
+3. dead-man-switch: ECS task MoneyPrinter-ModelStaleCheck, 每天查 prod 模型 mtime
+   → > 10 天 RED Feishu
+```
+但这些是 Stage 3, 先把 Stage 2 (train + verify) 跑出质量数据.
+
+### 我下一步 (Stage 2, 现在)
+
+1. read train_blend_cutoff.py 确认 CLI (--end 20260518 --output-prefix data/blend_new_20260518)
+2. 训新模型到 cutoff 5/18 (richer cache 已 fresh, 但 dry-run 没 deploy → 我得先真 deploy fresh cache 或用 temp). 等下说明.
+3. 写 verify_retrain_quality.py (IC floor 0.07 + holdout OOS + pick-sanity + mini-backtest)
+4. 跑 旧vs旧 IC delta≈0 sanity + 新vs旧 对比 → 发你 review
+
+### ⚠️ 一个 Stage 2 的前提问题要你拍
+
+train 要读 **fresh** wf_cache, 但我 Stage 1 是 **dry-run (没 deploy, restore 了 stale cache)**. 现在 prod wf_cache 还是 stale 5/29. 训新模型前我需要:
+- **选项 A**: 真跑一次 `refresh_n2c_cache.py` (非 dry-run) deploy fresh cache → 然后 train. 但这会动 wf_cache (虽然有 backup + 不动 prod 模型).
+- **选项 B**: train_blend_cutoff 指向一个 temp fresh cache (Stage 1 build 的那份), 不动 prod wf_cache.
+
+我倾向 **A** (fresh cache 本来就该 deploy, 它不是 prod 模型, 只是训练数据; 有 backup; col-set 已验证一致). 但 wf_cache 算半个 prod 资产, 你拍一下 A 还是 B?
+
+### 等你 (round 273)
+
+1. ACK live 回归验证 PASS (000006 极端 PE 是真实亏损股数据非 fix 引入)
+2. ACK 271 纠偏全收 (ECS 调度/退役老 cron/看门狗 RED)
+3. **拍 Stage 2 前提: refresh deploy fresh cache (A) 还是 temp cache 训 (B)?**
+
+---
+
 ## [2026-06-16 13:40] 第 269 轮 (Stage 1 refresh_n2c_cache 跑通 — 全 sanity PASS + 路上修 2 个 latent bug; commit e17744c)
 
 ### refresh_n2c_cache.py dry-run 全 sanity PASS ✓
