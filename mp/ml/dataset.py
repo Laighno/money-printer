@@ -384,13 +384,25 @@ def _align_fundamentals_to_dates(
     if fin_hist is not None and not fin_hist.empty:
         dates_df = pd.DataFrame({"date": pd.to_datetime(dates)}).sort_values("date")
         fin_hist = fin_hist.copy()
-        fin_hist["publish_date"] = pd.to_datetime(fin_hist["publish_date"])
+        fin_hist["publish_date"] = pd.to_datetime(fin_hist["publish_date"],
+                                                  errors="coerce")
+        # Drop rows with an unparseable / null publish_date: merge_asof
+        # requires non-null keys ("Merge keys contain null values on right
+        # side"), and these rows carry no usable financial data anyway (the
+        # EM financial fetch occasionally emits all-NaN placeholder quarters
+        # with NaT publish_date — surfaced when rebuilding the n2c cache fresh,
+        # round 268). Sort by key for merge_asof.
+        fin_hist = (fin_hist.dropna(subset=["publish_date"])
+                    .sort_values("publish_date"))
 
-        merged = pd.merge_asof(
-            dates_df, fin_hist,
-            left_on="date", right_on="publish_date",
-            direction="backward",
-        )
+        if fin_hist.empty:
+            merged = dates_df.copy()
+        else:
+            merged = pd.merge_asof(
+                dates_df, fin_hist,
+                left_on="date", right_on="publish_date",
+                direction="backward",
+            )
         # Map back to original order
         date_to_idx = {d: i for i, d in enumerate(dates)}
         for _, row in merged.iterrows():
@@ -407,17 +419,22 @@ def _align_fundamentals_to_dates(
     # before it.
     if valuation_hist is not None and not valuation_hist.empty:
         vh = valuation_hist.copy()
-        vh["date"] = pd.to_datetime(vh["date"])
-        vh = vh.sort_values("date").reset_index(drop=True)
+        vh["date"] = pd.to_datetime(vh["date"], errors="coerce")
+        # Drop null-key rows (merge_asof requires non-null keys); symmetric to
+        # the publish_date guard above.
+        vh = vh.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
-        dates_df = pd.DataFrame({
-            "_orig_idx": np.arange(len(dates)),
-            "date": pd.to_datetime(dates),
-        }).sort_values("date").reset_index(drop=True)
+        if not vh.empty:
+            dates_df = pd.DataFrame({
+                "_orig_idx": np.arange(len(dates)),
+                "date": pd.to_datetime(dates),
+            }).sort_values("date").reset_index(drop=True)
 
-        merged = pd.merge_asof(
-            dates_df, vh, on="date", direction="backward",
-        )
+            merged = pd.merge_asof(
+                dates_df, vh, on="date", direction="backward",
+            )
+        else:
+            merged = pd.DataFrame(columns=["_orig_idx"])
 
         if "pe_ttm" in merged.columns:
             pe_vals = merged["pe_ttm"].to_numpy(dtype=float)
