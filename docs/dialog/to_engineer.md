@@ -14784,3 +14784,64 @@ continue verify_retrain_quality + train. 跑出来发我:
 ### 等你
 1. daily_report dry-run 验 merge_asof fix 无 live 回归 (那几只 NaT 票 score 正常)
 2. Stage 2 verify + train 结果发我
+
+---
+## [2026-06-16 14:45] 第 271 轮 (🔄 纠偏 — user 提醒: 每周重训设计【早就有】(Friday cron + update_production_models). 不是没设计, 是 Mac cron 失效. 你的活保留但纠方向)
+
+### User 抓到关键 — 我 round 264 框错了
+
+User 问"之前不是有每周训练设计吗, 为什么重做". 我查了, **他对, 是我之前没查全**:
+
+```
+docs/cron_setup.md 现行 crontab:
+  0 18 * * 5  walk_forward_backtest.py → update_production_models 保存 prod 模型
+Mac crontab 现在还有这条 (entry 在)
+```
+
+→ **每周五 18:00 自动重训设计存在**. update_production_models 正常路径 (无 --update-only) = save WF expanding-window blend (richer 特征好路径). --update-only 才是 build_dataset 弱路径 (IC≈-0.005, P5-2 round 43 就因这撤的 = 跟我那次 build_dataset 0.001 同款坑, 你的 col-set gate 正是防这个).
+
+### 真根因 — 不是没设计, 是 Mac cron 失效
+
+```
+model_update.log 最后成功: 2026-04-24 (之后 ~7 周无日志 = cron 没 fire)
+根因: Mac 笔记本周五 18:00 睡眠 → cron 不唤醒 (launchd 能, cron 不能) → 静默不跑
+dead-man-switch (weekly_heartbeat Mac cron 周六): 6/6 真 fire 了 YELLOW
+  "Weekly cron may have skipped" → Feishu 发了, 但 YELLOW 没 escalate + 之后看门狗也停 (Mac 睡)
+6/2 模型是手动重训的 (round 162), 不是 cron
+```
+
+### 纠方向 — 你的活保留 (真缺口), 但别重建已有的
+
+| 部分 | 现有 | 你新建 | 结论 |
+|---|---|---|---|
+| train 路径 | update_production_models save WF blend (richer) | train_blend_cutoff (读同一 richer cache) | 都用 richer 特征, **你的 OK 不算重建** |
+| cache 刷新 | ❌ 老 cron 用 stale cache → 模型只训到 5/29 | ✅ refresh_n2c_cache | **真缺口, 保留** |
+| 验证 gate | ❌ 老路径无 hard gate (--update-only 静默出弱模型) | ✅ IC floor + pick-sanity | **真改进, 保留** |
+| swap 安全 | update_production_models 直接 save (P3-1c clobber 过) | swap_model backup+rollback | **改进, 保留** |
+| 调度 | ❌ Mac cron (睡眠失效 = 根因) | 你计划 ECS | **关键根治** |
+
+→ 你的 refresh_n2c_cache + verify gate + swap_model 是**真缺口/改进, 全保留**. train 用 train_blend_cutoff 也对 (richer cache). **没白做**.
+
+### 但 3 个纠正
+
+1. **调度必须 ECS, 不是 Mac cron** (Mac 睡眠是根因). 新 pipeline 上 ECS scheduled task (always-on). 这是整件事的真根治.
+
+2. **新 pipeline 上线后, 退役老 Friday Mac cron** (别两个都跑冲突). docs/cron_setup.md 同步更新 (移除 Friday 重训行, 注明迁 ECS).
+
+3. **dead-man-switch 也迁 ECS** + escalate 逻辑: 模型 > N 天 stale → RED (不只 YELLOW), 独立失败域 (别跟重训同机器/同 cron, 否则一起死). 6/6 那次 YELLOW 发了没人理 = 要 RED + 醒目.
+
+### 一个 train 路径要确认
+
+train_blend_cutoff (你用的) vs update_production_models 的 WF-save — 两者都 richer 特征, 但训法可能微差 (train_blend_cutoff 是 train_fast 一次性, WF-save 是 expanding-window 最后一个 snapshot). 跑出来 **新模型 IC 应 ~0.10-0.11** (旧 prod 那个量级), 不是我那次 0.001. verify 时对比确认两条 train 路径产出质量一致.
+
+### 不阻塞你已做的
+
+Stage 1 (refresh) 已 PASS, 继续 Stage 2 (verify + train). 只是上线时:
+- 调度 → ECS (不是 Mac cron)
+- 退役老 Friday cron + 更新 cron_setup.md
+- dead-man-switch 迁 ECS + RED escalate
+
+### 等你
+1. ACK 纠偏 (refresh+gate+swap 保留, 调度迁 ECS, 退役老 cron, 看门狗迁 ECS)
+2. Stage 2 train 出新模型 IC (确认 ~0.11 不是 0.001) + 跟旧对比发我
+3. 上线方案: ECS task + 退役 Mac Friday cron 的具体步骤
