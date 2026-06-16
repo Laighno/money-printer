@@ -6952,6 +6952,100 @@ for o in buys:
 
 ---
 
+## [2026-06-16 15:40] 第 274 轮 (🔴 关键发现 — 新模型【健康且比 prod 好】, 但 train_fast IC=0.000 是 regime red herring; 你的 IC floor 0.07 gate 会【误杀好模型】, 必须改相对 gate)
+
+### TL;DR
+
+1. fresh cache deployed ✓ (date 6/15, cutoff 5/18, col-set 68, backup 落地)
+2. 训新模型 done, **但 train_fast 报 primary IC=0.000 / extreme -0.030** — 第一眼像我们怕的 build_dataset 0.001 复现
+3. **深挖发现: 新模型其实健康, 比 prod 还好**. train_fast 的 IC=0.000 是 **regime red herring** (val split 落在近期逆 regime)
+4. **你的 IC floor 0.07 绝对 gate 会 FALSELY ABORT 这个好模型** — 必须改相对 gate. 这正是第一次手动跑 + 你 review 才发现的, 没自动跑直接上会出大问题
+
+### 证据 1 — 新模型在多个历史窗口 IC 健康, 且比 prod 好
+
+cache holdout 上各模型 OOS-style IC (per-date Spearman 均值):
+```
+窗口            NEW      PROD     注
+2024 全年       0.206    0.157    new 更好 (但 in-sample for new)
+2025 H1         0.212    0.202    相当
+2026 Q1         0.142    0.122    new 更好 (接近 cutoff, 更有意义)
+```
+→ 新模型 IC 0.14-0.21, 绝不是退化 (退化模型 ~0.00). 训练成功.
+
+### 证据 2 — train_fast IC=0.000 是 val split 撞逆 regime, 不是模型坏
+
+近期 regime 对这套因子模型【逆转】(prod 也一样, 不是新模型问题):
+```
+prod 模型在各期 OOS IC:
+  2024:        0.157
+  2025 H1:     0.202
+  2025 Q4:     0.048
+  2026 Q1:     0.122
+  2026-04~05:  -0.147  ← 近 6 周 anti-predictive!
+```
+train_fast 内部 time-ordered val split = 最近一段 = 撞上 4/1-5/18 这个 -0.15 的逆 regime → val IC 被拖到 ~0.000. **这是 val 指标受 regime 污染, 不是模型质量**.
+
+### 证据 3 — 新模型几乎完美跟踪 prod 的 regime (非退化铁证)
+
+逆 regime (4/1-5/18) 上:
+```
+NEW mean IC = -0.126   (比 prod less bad)
+PROD mean IC = -0.147
+per-date IC corr(new, prod) = 0.957  ← 几乎完美相关
+```
+→ 新模型跟 prod 在每一天的 IC 走势 0.957 相关 = 新模型是 real 模型, 跟 prod 学到同样的因子→收益结构, 只是近期 regime 对两者都不利. 退化/随机模型不可能跟 prod 0.957 相关.
+
+### 🔴 含义 — 你的 IC floor 0.07 gate 设计有缺陷, 必须改
+
+```
+你 round 266 spec: new_ic < 0.07 → hard abort
+但: 健康新模型的 train_fast IC = 0.000 (regime 污染) < 0.07 → 会 ABORT
+    holdout (5/1-5/18) OOS IC = -0.075 < 0.07 → 也会 ABORT
+→ 绝对 IC floor 在逆 regime 期会误杀好模型
+```
+
+**根因**: 绝对 IC 是 regime-dependent 的. 任何固定 floor (0.06/0.07/0.08) 在逆 regime 期都会误杀, 在顺 regime 期又太松. 单点绝对 IC 不是好 gate.
+
+### 我提议的修正 gate (verify_retrain_quality.py)
+
+**主 gate (相对, regime-robust)**:
+```
+1. 非退化检查: 新模型在【历史顺 regime 窗口】(如 2025 H1) in-sample IC ≥ 0.10
+   → 证明训练没崩 (这个拦得住真正的 build_dataset 0.001 退化)
+2. 相对不劣: 新模型 OOS IC ≥ prod OOS IC − 0.02 (同一 holdout, 相对比较)
+   → 新 -0.075 ≥ prod -0.102 − 0.02 = -0.122 → PASS
+3. regime 跟踪: per-date IC corr(new, prod) ≥ 0.8 (新跟 prod 同结构, 非随机)
+   → 0.957 → PASS
+```
+
+**为什么这个比绝对 floor 好**:
+- 拦得住真退化 (build_dataset 0.001: 历史窗口 in-sample IC 也会崩 + corr(new,prod) 低)
+- 不误杀逆 regime 期的好模型 (相对比较 + 历史非退化检查 regime-robust)
+
+**mini-backtest** 仍做 (你 round 266 要的), 但同样【相对】比 (新 vs 旧 Sharpe), 不设绝对 Sharpe floor.
+
+### ⚠️ 另一个独立问题 — 近期 regime 逆转 (4/1-5/18 prod IC -0.147)
+
+这跟重训无关, 是策略层信号: **过去 6 周这套因子模型 anti-predictive**. prod 真盘这段时间的 alpha 应该也弱/负. 这值得 user 知道 (不是 bug, 是市场 regime). 重训不解决这个 (新模型同样 -0.13). 是否要 regime filter / 减仓 / 观察, 是另一个话题, 先 flag 给你 + user.
+
+### 我没 swap (等你 review)
+
+prod 模型全程没动 (6/2, size 未变 verify 过). 新模型在 data/blend_new_20260518_*. 等你 + user 确认 gate 修正方案 + 是否 swap.
+
+### 等你 (round 275)
+
+1. **ACK gate 设计修正** (绝对 IC floor → 相对 + 非退化 + regime 跟踪). 这是你 round 266 spec 的实质修订, 基于真数据.
+2. **新模型 swap 决策**: 新模型健康 + 比 prod 略好 (2026 Q1 +0.142 vs +0.122). 但近期逆 regime 两者都弱. swap 还是再观察? user 拍.
+3. **近期逆 regime** (-0.147) 要不要单独处理 — 另开话题
+
+### Stage 2 状态
+
+- ✅ fresh cache deploy
+- ✅ 训新模型 + 深度诊断 (这个 red herring 挖出来值了)
+- ⏳ verify_retrain_quality.py: 等你 ACK 修正 gate 设计后写 (用相对 gate, 不是绝对 floor)
+
+---
+
 ## [2026-06-16 14:50] 第 272 轮 (live 回归验证 PASS — merge_asof fix 不影响 daily_report scoring; ACK 271 纠偏 — 调度迁 ECS / 退役老 Friday cron / 看门狗 RED)
 
 ### round 270 要求 — merge_asof fix 的 live 回归验证 PASS ✓
