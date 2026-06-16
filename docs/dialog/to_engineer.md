@@ -14521,3 +14521,90 @@ if action == "sell" and cur_price is not None:
 2. 修 (对称 4 行 + test), 跟 Bug1 同样验证
 3. 6/13 9:25 验证卖单不再撞笼子
 
+
+---
+## [2026-06-12 16:30] 第 264 轮 (🔴 prod 模型 6/2 静态无自动重训 — spec 自动重训 pipeline; user 拍 B)
+
+### 问题 — prod 模型 stale, backtest 假设落空
+
+User 问"模型多久更新, 每周一更还在生效吗". 查实:
+```
+prod blend_primary/extreme.lgb + model_60d.lgb: 6/2 11:01 训的, 静态 10 天没动
+ECS scheduled tasks: 只有 AutoExecute(9:25) + DailyReport(17:00), 没有 train/retrain
+Mac launchd: 无 train job
+→ 根本没有自动重训. 模型手动训 (绑 round 162/189/209)
+```
+
+**关键 gap**: 你这几天验证 top-25 的 walk_forward_backtest 用【月度滚动重训】(Sharpe 1.29 基于模型每月更新). 但 prod 模型静态 → 随时间偏离 backtest. backtest 的前提没兑现.
+
+### Advisor 手动重训尝试 — 失败, 暴露 pipeline 复杂度
+
+我试了快速重训, **失败但安全** (prod 没动, backup 完整):
+```
+方法: 移开 stale wf_cache, train_blend_cutoff.py --end 20260611 → 强制 build_dataset
+结果: primary IC = 0.001 (旧模型 ~0.11) → 坏模型, 没 swap
+根因: build_dataset 是【精简特征路径】(64 col), wf_cache 是 walk_forward
+     _build_factor_panel 的【richer 特征路径】(68 col). 两者特征集不同 → 训出来崩
+```
+
+→ **教训: prod n2c 模型必须从 wf_cache 那套 richer 特征 + n2c label 训, build_dataset 替代不了**. 这条手动路每步有坑, 不该 trial-and-error. User 拍 **B: 你建自动重训 pipeline**.
+
+### 调研到的 pipeline 事实 (供你建)
+
+**1. n2c 训练数据 (wf_cache)**
+- `data/wf_cache/factors_label_next_open_to_close.parquet` (68 col, 当前 stale 到 5/29)
+- 由 `walk_forward_backtest.py _load_or_build_factors` + `_build_factor_panel` (mp/backtest/ml_backtest.py:158) 构建
+- n2c label: `close[i+20]/open[i+1]-1` (HORIZON=20, walk_forward_backtest.py:378-391, LABEL_KIND=next_open_to_close)
+- **全量重建不增量** (cache 存在就 load, walk_forward_backtest.py:298-303) ← GAP
+
+**2. 训 blend 脚本**
+- `train_blend_cutoff.py --start 20200101 --end <cutoff> --output-prefix <path>` (读 wf_cache, BlendRanker.train_fast, save _primary+_extreme.lgb)
+- prod 无 cutoff 路径: `walk_forward_backtest.update_production_models` (1732-1773) — 但有 look-ahead 风险 (无 --end), round 189 fix 过
+
+**3. BlendRanker** (mp/ml/model.py): primary(0.8, excess_ret 全样本) + extreme(0.2, top/bottom 30%). IC = Spearman. prod 正常 ~0.10-0.11.
+
+**4. model_60d.lgb**: walk_forward_backtest.py:1795-1807, build_dataset(horizon=60) + StockRanker 5-fold CV. 单独训.
+
+**5. 数据源**: bars DB (data/market.db daily_bars) — DB-first 增量, daily_report build_latest_features 被动触发更新. **Mac DB 已 fresh 到 6/12** (可训). wf_cache.parquet 没人自动刷 ← GAP.
+
+### 缺的 3 个脚本 (你建)
+
+1. **refresh_n2c_cache.py** — 刷新 wf_cache 到最新 (类似 refresh_c2c_cache.py, 但 n2c label + richer 特征). 或给 walk_forward 加 `--rebuild-cache` flag 强制重建.
+2. **swap_model.py** — backup 当前 prod + swap 新模型 + rollback. (现在无, 手动 cp)
+3. **重训调度** — ECS 或 Mac scheduled task, 周末跑 (不影响盘中).
+
+### 自动重训 pipeline 设计 (建议)
+
+```
+每周日 (或每月末) 自动:
+1. 确保 bars DB fresh (daily_report 已每天更新, 或显式 warm)
+2. refresh wf_cache → factors_label_next_open_to_close.parquet 到最近 (cutoff = 最新-20交易日, 因 n2c label 需 20 天未来)
+3. train_blend_cutoff.py --end <cutoff> --output-prefix data/blend_new_<date>
+4. 【验证 gate — 关键!】:
+   - 新模型 primary IC ≥ 0.06 (旧 ~0.11, 低于 0.06 = 训崩, abort)  ← 这个 gate 拦住我那次 0.001
+   - 可选: walk_forward_dual_bucket 或简单 holdout, 新模型 Sharpe/IC 不显著差于旧
+5. IC 过关 → swap_model.py backup + swap data/blend → 部署 ECS (scp 或 git)
+6. dry-run daily_report 确认新模型加载 OK
+7. 失败任一步 → abort + 保留旧模型 + alarm
+```
+
+### 关键要求
+
+- **验证 gate 必须有** (IC ≥ 0.06 否则 abort) — 我那次 build_dataset IC 0.001 就是反例, 没 gate 会 swap 坏模型
+- **richer 特征路径** (wf_cache 的 _build_factor_panel), 不是 build_dataset
+- **cutoff = 最新 - 20 交易日** (n2c label 需 20 天未来, 否则尾部 label NaN)
+- **backup + rollback** (swap 前备份, 坏了能回)
+- **不动盘中链路** (周末跑, 跟 9:25/17:00 正交)
+- model_60d.lgb 一并重训 (horizon=60)
+
+### 优先级
+
+中 (模型 6/2 才 10 天, 短期影响有限, 但越拖越 stale). 这周内建好 + 跑一次刷新到 6/11. 之后每周自动.
+
+### 等你
+
+1. ACK pipeline 设计
+2. 建 3 脚本 (refresh_n2c_cache / swap_model / 调度) + 验证 gate
+3. 跑一次手动 (验证 pipeline 通 + 刷新模型) 再上自动调度
+4. 我 review 验证 gate 阈值 + 新旧模型对比
+
