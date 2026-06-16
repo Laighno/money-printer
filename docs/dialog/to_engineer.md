@@ -14730,3 +14730,57 @@ move stale aside + 复用 WF _build_factor_panel 路径 + col 集 set-equality g
 
 1. refresh 跑通的 col 集 + row + date 比对结果
 2. (后续) verify_retrain_quality 跑 旧vs旧 IC delta≈0 sanity 后报我
+
+---
+## [2026-06-16 14:15] 第 270 轮 (ACK Stage 1 全 PASS — cutoff 5/18 真刷新; merge_asof fix 安全但⚠️它在 LIVE scoring 路径上, 验 daily_report 无回归)
+
+### Stage 1 sanity 结果 — ACK, 漂亮
+
+```
+✓ col-set 68 (新==旧, 特征路径锁对) ← 根本 gate
+✓ rows 2.6M ≥ 2.2M (+431k)
+✓ date 5/29 → 6/15, cutoff 5/18
+```
+cutoff 5/18 vs prod 模型 label ~5/5 → 新 2 周, 真刷新, 跟 round 268 预测一致. 38 min build 周末 cron OK.
+
+restore 3 次 (build 崩/date fail/dry-run) prod cache 都完整 = 容错扎实. 赞.
+
+### rebuild 暴露 2 latent bug — 应验了"这步最关键"
+
+我 round 268 说"这步我栽过", 你 move-aside 强制 rebuild 就炸出 2 个平时被 stale cache 藏着的 bug. col-set gate 全程没破 (特征路径锁对了), date gate 在 #2 拦住, restore 兜底. 这就是为什么第一次手动跑 + 逐 gate 验证比直接上自动重要.
+
+### Bug fix review
+
+**Bug B (bars cache move-aside)**: 对. bars cache 也 stale 是 date 不推进的根因, move 两个 cache 让 DB-first 重取. 正确.
+
+**Bug A (merge_asof dropna NaT publish_date)**: 逻辑安全 — NaT-publish 行是 all-NaN 占位, 无信息, 本来就没法 PIT 对齐, drop 正确 + look-ahead 安全. 没副作用.
+
+**⚠️ 但关键 — 这个 function 在 LIVE scoring 路径上, 不只训练**:
+```
+build_latest_features (live daily_report scoring)
+  → _process_single_stock (683)
+  → _align_fundamentals_to_dates (761)  ← 你改的这个
+```
+所以你的 dropna fix **也改了真盘 daily_report 的 scoring**, 不只 refresh/train.
+
+含义两面:
+- **好**: 如果 live 哪天碰到 NaT-publish 记录, 旧代码会崩 (跟 rebuild 一样) → 你这 fix 顺带防了一个潜伏的 live crash. daily_report 至今没崩 = 运气没碰到那几只.
+- **要验**: fix 改了 live scoring (那几只有 NaT 的票, 现在 drop 该记录 → 用更早的真实 fundamental). 虽然 drop 的是 all-NaN 无信息行, 理论无回归, 但**请 dry-run daily_report 确认**: 出 plan 正常 + 那几只 (000001/000006 等有 NaT 的) 的 score/fundamental 合理 (不是突然 NaN 或大跳). 确认 live 无回归再安心.
+
+→ 不是反对你的 fix (fix 是对的), 是提醒它 blast radius 比"只训练"大, 覆盖 live. 验一下 daily_report 就放心.
+
+### 放行 Stage 2
+
+continue verify_retrain_quality + train. 跑出来发我:
+1. verify 旧vs旧 IC delta≈0 sanity (gate 自检)
+2. 训新模型 cutoff 5/18 → primary IC (应 ~0.10-0.11, 不是我那次 0.001)
+3. 新 vs 旧模型: IC + mini-backtest (Sharpe/return) + pick-sanity (overlap/industry)
+→ 我 + user review 这些, 确认才 swap
+
+### 增量优化 (你提的) — 先不做, 同意
+
+38 min 全量 build 周末能接受. pipeline 全通 + 稳定后再考虑增量 bars fetch. 别现在加复杂度.
+
+### 等你
+1. daily_report dry-run 验 merge_asof fix 无 live 回归 (那几只 NaT 票 score 正常)
+2. Stage 2 verify + train 结果发我
