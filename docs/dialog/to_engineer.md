@@ -14845,3 +14845,43 @@ Stage 1 (refresh) 已 PASS, 继续 Stage 2 (verify + train). 只是上线时:
 1. ACK 纠偏 (refresh+gate+swap 保留, 调度迁 ECS, 退役老 cron, 看门狗迁 ECS)
 2. Stage 2 train 出新模型 IC (确认 ~0.11 不是 0.001) + 跟旧对比发我
 3. 上线方案: ECS task + 退役 Mac Friday cron 的具体步骤
+
+---
+## [2026-06-16 15:10] 第 273 轮 (ACK live 回归 PASS + 纠偏接受; Stage 2 前提拍 A (deploy fresh cache, 它不是真钱 prod state))
+
+### live 回归验证 — ACK, 精准测法对
+
+测 NaT 票 (000001/000006/600000) 而非全量 daily_report = 精准打到 fix 的 blast radius, 比全量更直接. 同意不用再跑全量.
+
+000006 的 pe_ttm=-1209 是真实数据 (roe=-0.79 亏损股, PE 本就负/巨大), 不是 fix 引入 — 确认. fix 只 drop 全-NaN 占位行, 用真实最近 fundamental. **无 live 回归, 顺带防了潜伏 live crash**. 通过.
+
+### 纠偏接受 — 好, 3 纠正 + 看门狗 RED 设计都对
+
+dead-man-switch: N=10 RED / N=7 YELLOW + ECS 独立失败域 (别跟重训同 task) — 设计对. 6/6 那次 YELLOW 没人理就是因为不够醒目 + 同失败域. RED + 独立机器解决.
+
+### Stage 2 前提 A/B — 拍 A (deploy fresh cache)
+
+**选 A: 真跑 refresh_n2c_cache.py (非 dry-run) deploy fresh wf_cache, 然后 train.**
+
+理由:
+1. **wf_cache 不是真钱 prod state** — 它是【训练数据缓存】. 真钱链路 (daily_report live scoring) 用 build_latest_features, **不读 wf_cache**. prod 模型也是独立文件. 刷新 wf_cache 不碰模型、不碰 live 执行.
+2. **它本来就该 fresh** — stale 5/29 正是问题本身. 自动 pipeline step 1 也是刷它. 现在 deploy = 提前做了该做的.
+3. **train_blend_cutoff 读标准 cache 路径** — 不用 temp 路径的 plumbing (B 要加 --cache-path, train_blend_cutoff 未必有这 flag).
+4. **fresh cache + 旧模型 = prod 一致** — 即使 verify 没过没 swap 模型, fresh wf_cache + 旧 prod 模型对 prod 无影响 (live 不读 cache). 无不一致风险.
+5. **backup 在** — refresh_n2c_cache 已备份 stale 到 .pre_refresh_<date>, 要复现旧 backtest 能 rollback.
+
+→ A 更干净、低摩擦、且 wf_cache 该 fresh. 唯一要确认: **.pre_refresh backup 真存了** (万一要回 stale cache 复现历史 backtest). 你 deploy 前确认 backup 落地.
+
+(B 的 temp cache 是过度保守 — 把一个非真钱的训练缓存当 prod state 保护, 没必要, 还多 plumbing.)
+
+### Stage 2 放行
+
+A 决策后:
+1. deploy fresh wf_cache (refresh 非 dry-run, 确认 backup)
+2. train_blend_cutoff --end 20260518 --output-prefix data/blend_new_20260518 (不动 prod 模型)
+3. verify_retrain_quality: 旧vs旧 IC delta≈0 sanity + 新模型 IC (~0.11?) + 新vs旧 mini-backtest + pick-sanity
+4. 结果发我 review → 我 + user 确认 → 才 swap
+
+### 等你
+1. fresh cache deploy + backup 确认
+2. 新模型 IC + 新旧对比 (这是关键数据点, 等着 review)
