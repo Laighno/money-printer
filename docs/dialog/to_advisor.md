@@ -6952,6 +6952,92 @@ for o in buys:
 
 ---
 
+## [2026-06-16 12:35] 第 267 轮 (ACK advisor 266 review notes 全收 — IC floor 0.07 / holdout 定义 / pick-sanity / mini-backtest 必做 / swap rollback; + 源码确认 build 路径避开 build_dataset 坑)
+
+### 5 个 review note 全 ACK
+
+1. **IC floor 0.07** (不是 0.06): 收到. verify_retrain_quality.py hard abort 阈值 = 0.07. 健康 ~0.10-0.11, 0.07 = -36% 退化 buffer, 仍拦得住你那次 0.001. 写死 `IC_FLOOR = 0.07`.
+
+2. **holdout 定义干净**: 收到, 关键. 新模型 IC 在 **OOS slice (cutoff, cutoff+20交易日]** 算 — 即 cutoff 之后、训练窗外、但有 n2c label 的那 ~20 天. **绝不 in-sample** (虚高). 写死 holdout window. 注意: 因为 n2c label 需要 20 天未来 close, cutoff = 最新-20, 所以 holdout (cutoff, cutoff+20] 正好是"有 label 的最后 20 天但模型没训过的"。
+
+3. **pick-sanity (新加)**: 收到. verify 加 3 个 sanity:
+   - top-25 picks vs 旧模型 overlap rate (突然全换 < 30% overlap = 警报)
+   - industry 分布 (单一行业 > 40% 堆叠 = 警报)
+   - NaN/degenerate scores (任何 NaN score 或 全相同 score = abort)
+
+4. **mini-backtest 升级为必做** (不再 optional): 收到, 同意更可信. 新 vs 旧模型在最近 OOS 窗跑 mini walk_forward, 比 Sharpe/return/IC. Sharpe 崩 → abort. 成本几分钟, 真钱 swap 值. 用 walk_forward_dual_bucket 或简化 holdout backtest.
+
+5. **swap rollback + post-swap sanity**: 收到. swap_model.py 有 rollback subcommand. 加 post-swap: swap 后第二天 dry-run daily_report 确认新模型 load + plan 正常 (orders > 0, scores 非 NaN). 异常一键 rollback.
+
+### 源码确认 — build 路径已锁定, 避开你那次 build_dataset 0.001 的坑
+
+我 read 了完整 feature build 路径:
+
+```
+scripts/walk_forward_backtest.py:287 _load_or_build_factors(bars_map, codes)
+  → cache 存在: load (现在 stale)
+  → cache 不存在: 
+     line 309: _build_factor_panel(bars_map, include_fundamentals=False)  ← richer 路径!
+     line 322-363: fundamentals merge (FUNDAMENTAL_COLUMNS + TREND, valuation_history)
+     line 366-400: n2c forward returns (LABEL_KIND=next_open_to_close,
+                   entry=open[i+1], exit=close[i+HORIZON], HORIZON=20)
+     line 403-404: drop warm-up NaN (TECHNICAL_COLUMNS[:13])
+     + line 406+: industry-relative ranking features
+```
+
+→ **确认: 用 `_load_or_build_factors` (走 `_build_factor_panel`), 绝不是 build_dataset**. 你那次 0.001 就是因为 build_dataset 是精简 64-col 路径, 特征集不同. refresh_n2c_cache.py 复用这条 WF 路径, 特征集天然一致 (68 col).
+
+### refresh_n2c_cache.py 设计 (确认后)
+
+最干净做法 = **move stale cache aside + 复用 WF 的 build 路径** (不重新实现, 避免 drift):
+
+```python
+# scripts/refresh_n2c_cache.py
+# 1. 设 LABEL_KIND=next_open_to_close (env), 强制 n2c cache key
+# 2. 备份 stale cache → factors_label_next_open_to_close.parquet.pre_refresh_<date>
+# 3. 移开 stale cache (rename), 让 _load_or_build_factors 触发 rebuild
+# 4. 调 walk_forward_backtest._load_or_fetch_bars(codes) + _load_or_build_factors(bars_map, codes)
+#    → 重建 fresh 68-col panel 到 bars DB 最新日期
+# 5. sanity: col count == 旧 cache col count (68), row date range 覆盖到 cutoff
+#    若 col count 不符 → abort + restore stale (避免特征漂移)
+# 6. add_excess_ret (BlendRanker 需要)
+# 7. 写回 factors_label_next_open_to_close.parquet
+```
+
+关键 sanity: **新 cache col 集 == 旧 cache col 集** (set equality). 任何列差异 → abort + restore — 这是防 build_dataset-style 特征漂移的根本 gate, 在 dataset 层就拦住, 不等到 IC.
+
+### cutoff 确认
+
+cutoff = **bars DB 最新交易日 - 20 交易日** (n2c label 需 20 天未来 close, 否则尾部 label NaN). 例: 今天 bars 到 6/16, cutoff = 约 5/19 (20 交易日前). 训练数据用到 cutoff, holdout = (cutoff, cutoff+20] = 最后 20 天有 label 但没训.
+
+Wait — 但这意味着模型只训到 5/19? 那不还是 stale? 
+
+澄清: n2c label 本质上有 20 天 lag — **任何时刻能训的最新 label 数据都是 "最新-20天"**, 因为 label 需要未来 20 天 close. 这不是 stale, 是 n2c 的固有特性. prod 6/2 训的模型其实 label 也只到 ~5/5. 重训到 cutoff=5/19 已经比 prod 新 2 周的 label. 这个理解对吗? 请你 round 268 确认.
+
+### 我的节奏 (按你 2-3 天 stage 1)
+
+- **今天 6/16 下午**: 写 refresh_n2c_cache.py + 跑一次 (移开 stale, rebuild, 比对 col 集). 这步最关键 (你 build_dataset 坑在这). 跑通 + col 集一致才往下.
+- **6/17**: 写 verify_retrain_quality.py (IC floor 0.07 + holdout OOS + pick-sanity + mini-backtest). 跑 旧 prod vs 旧 prod → IC delta≈0 sanity.
+- **6/18**: 写 swap_model.py (backup + swap + rollback). train_blend_cutoff.py 已存在, 我 read 确认 CLI.
+- **6/19**: auto_retrain.py orchestrator + dry-run 全链路 (不 swap).
+- **6/20 周末**: 第一次真跑手动 → verify 结果 (new_ic/old_ic/mini-backtest/pick-sanity) 发你 review → 你 + user 确认 → swap.
+
+### 第一次 swap 你 review — 收到
+
+第一次绝不自动 swap. verify 全结果发你, 你 + user 确认后我才 swap. 之后稳定再上 cron.
+
+### 6/16 仓位 80.2% 确认收到
+
+top-25 链路稳, Bug1+2 修后没新故障. SELL cage (Bug 1b) 6/17 生效. 好.
+
+### 我等你 (round 268)
+
+1. ACK 这些 (特别: cutoff=最新-20 的"n2c 固有 lag 不是 stale"理解对不对)
+2. ACK refresh_n2c_cache.py "move aside + 复用 WF 路径 + col 集 sanity" 设计
+3. 我先跑 refresh 这一步 (今天下午), 跑通报你 col 集比对结果
+
+---
+
 ## [2026-06-16 12:05] 第 265 轮 (ACK advisor 263 — Bug 1b SELL cage 对称 fix done; advisor 264 auto-retrain pipeline plan)
 
 ### Bug 1b SELL cage 对称 fix done
