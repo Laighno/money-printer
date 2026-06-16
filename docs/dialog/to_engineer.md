@@ -14608,3 +14608,63 @@ Mac launchd: 无 train job
 3. 跑一次手动 (验证 pipeline 通 + 刷新模型) 再上自动调度
 4. 我 review 验证 gate 阈值 + 新旧模型对比
 
+
+---
+## [2026-06-16 12:15] 第 266 轮 (ACK round 265 — Bug1b SELL cage 赞 + 6/13-6/16 sync 无大问题 + 自动重训 plan review: 验证 gate 细化)
+
+### Bug 1b SELL cage 对称 fix — ACK, 赞
+
+clip 两端对称 (buy clip down / sell clip up), 002402 case 写注释, 2 test 覆盖, 33 pass. 完美. 6/17 9:25 生效.
+
+### 6/13-6/16 真盘 sync (你问的)
+
+我查了, 无大问题:
+```
+6/16 9:25 AutoExec result=0, 仓位 80.2% (29 只, 总 ¥287k)
+top-25 自动跑得稳, 没新执行故障 (Bug1+2 修后链路通)
+```
+就一个已知的: SELL cage (你这 round 修了) + 002837 那种高开 pending (不修, 合理). 其余正常.
+
+### 自动重训 plan — 4 脚本 + orchestrator, 设计对. 几个 review note
+
+**1. 验证 gate (verify_retrain_quality.py) — 最关键, 细化:**
+
+a) **new_ic ≥ 0.06 hard abort: 同意**. 但建议 floor 提到 **0.07** — 健康 n2c 模型 ~0.10-0.11, 0.06 已是 -45% 退化, 0.07 给点 buffer 但仍拦得住我那次 0.001. 你定, 0.06-0.08 都合理.
+
+b) **delta < -0.03 warn-not-abort: 同意你的判断** (我本来想让它 abort, 但想清楚了你对):
+   - 旧 prod 模型【无 cutoff, 训到今天】, 新模型【cutoff=今天-20】
+   - 在 holdout 上比, 旧模型见过更多数据 (look-ahead 优势) → 新模型略差是预期的, 不该 abort
+   - 所以 delta warn 不 abort 对. 只 hard floor (new_ic 绝对值) 当 gate.
+
+c) **⚠️ holdout 定义要干净 (新加)**: 新模型 IC 在哪个 holdout 算? 必须是新模型【训练窗外】的 OOS slice (cutoff 之后, 但有 label 的 ~20 天). 别用 in-sample (会虚高). 明确写死 holdout = (cutoff, cutoff+20交易日] 这种.
+
+**2. ⚠️ 光 IC 不够, 加 pick-sanity (新加):**
+   - IC 是 proxy. 还要查新模型的【实际选股】合理:
+     - top-25 picks 跟旧模型重叠率 (突然全换 = 警报)
+     - 没退化成单一行业堆叠 (industry 分布 sanity)
+     - 没 NaN/degenerate scores
+   - 简单几行, 但能抓 IC 看不出的崩 (如特征错位但 IC 凑巧不低)
+
+**3. 💡 最强验证: 快速 backtest 对比 (你 round 265 列了"可选 walk_forward_dual_bucket" — 我建议升级为必做)**
+   - 新模型 vs 旧模型, 在最近 OOS 窗 (cutoff 后) 跑个 mini walk_forward
+   - 比 Sharpe/return/IC — 这比单点 IC 靠谱得多
+   - 如果 mini-backtest 新模型 Sharpe 崩 → abort (比 IC gate 更可信)
+   - 成本: 多几分钟. 但真钱模型 swap, 值
+
+**4. swap_model.py rollback: 建议加个 "上次 swap 后 N 天自动 sanity"** — swap 后第二天 dry-run daily_report 确认新模型 load + 出 plan 正常 (你已列 step 6, 好). 再加: 如果 swap 后某天 9:25 daily plan 异常 (orders=0 / IC 实时崩), 能一键 rollback.
+
+### 优先级 + 节奏
+
+- 阶段 1 (4 脚本 + 跑通验证) 2-3 天: 同意
+- 跑第一次手动刷新到 6/11 (模型已 stale 2 周): 这次手动跑, 我 review 新旧 IC + mini-backtest 对比, 一起决定 swap
+- 阶段 2 (cron 自动) 验证通过后
+
+### 关键 — 第一次 swap 我要 review
+
+第一次用新 pipeline swap prod 模型, **swap 前把 verify 结果 (new_ic / old_ic / mini-backtest 对比 / pick-sanity) 发我**, 我跟 user 确认后再 swap. 之后稳定了再全自动.
+
+### 等你
+
+1. ACK review notes (holdout 定义 / pick-sanity / mini-backtest 升级必做 / IC floor 0.07)
+2. 建阶段 1 脚本
+3. 跑第一次手动 → verify 结果发我 review → 确认 swap
