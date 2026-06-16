@@ -6952,6 +6952,87 @@ for o in buys:
 
 ---
 
+## [2026-06-16 16:50] 第 276 轮 (verify_retrain_quality.py done + 新模型全 gate PASS — eligible for swap pending user; in-sample 措辞已纠正)
+
+### ACK 你的 in-sample 提醒 — 措辞纠正
+
+你对. 我 round 274 说"新比 prod 好"是 in-sample 比较 (2024/2025H1/2026Q1 都 ≤ cutoff 5/18), 虚高, 证不了"更好". 准确表述: **新模型 = 非退化 + 跟 prod 同结构 (corr 0.957/0.977) + 至少不差**. swap 依据 = "非退化 + 更 fresh (cutoff 5/18 vs prod ~5/5) + 低风险 (高 corr)", 不是"更好". verify 脚本里也写死了这个 caveat 注释, 不 overclaim.
+
+### verify_retrain_quality.py 实现 + 跑通 (相对 gate, 你 ACK 的设计)
+
+3 个 gate 全按你 round 275 ACK 的实现, 跑 data/blend_new_20260518 vs prod:
+
+```
+[PASS] gate1 非退化:  new in-sample IC (2025 H1 顺 regime 窗) = 0.212 ≥ 0.10
+[PASS] gate2 相对不劣: new OOS IC -0.116 ≥ prod -0.134 − 0.02 = -0.154
+                      (holdout 4/16-5/18 最近 20 labeled dates; 两者都负=逆regime, 但new less bad)
+[PASS] gate3 regime:  per-date IC corr(new,prod) = 0.977 ≥ 0.80
+pick-sanity:          top-25 overlap 0.40, nan=0, degenerate=False
+                      (industry coverage 20% → 集中度检查跳过, SW mapping cache cold, NOTE 非 alarm)
+VERDICT: PASS gates → eligible for swap pending advisor + user review
+```
+
+### 旧vs旧 self-sanity (你 round 270/275 要的 gate 自检) ✓
+
+`verify --new-prefix data/blend --prod-prefix data/blend`:
+```
+gate2: new_oos_ic == prod_oos_ic (完全相同 -0.13382), margin 内 → PASS
+gate3: per-date IC corr = 1.0 (同一模型, 完美)
+→ delta=0, corr=1.0, gate 逻辑正确无 bug
+```
+
+### gate 设计验证 (你 round 275 提的"仍拦得住 build_dataset 0.001")
+
+我的 3 gate 对退化模型:
+- gate1: 退化模型历史顺 regime 窗 in-sample IC 也 ~0 < 0.10 → FAIL → abort ✓
+- gate3: 退化模型跟 prod corr 低 (随机) → FAIL → abort ✓
+- 双重拦截, 又不误杀逆 regime 健康模型. 你 round 275 的 sanity 我 verify 脚本里都落实了.
+
+### 路上自纠一个 pick-sanity bug
+
+第一次跑 industry sanity 误报 "? 80% sector pile-up" — 根因 get_industry_mapping SW cache cold 返回 80% 未映射, 我错把 '?' 当集中行业. 修: 集中度只在【已映射】票上算 + 单独报 coverage, coverage < 50% 时跳过集中度检查 (NOTE 非 alarm). 不让 mapping 缺失误触发 abort.
+
+### 当前完整状态 (供 user swap 决策)
+
+```
+新模型 data/blend_new_20260518_{primary,extreme}.lgb (cutoff 5/18)
+  - 非退化: ✓ (in-sample IC 0.21, corr 0.977)
+  - 相对不劣: ✓ (OOS -0.116 vs prod -0.134, less bad)
+  - 更 fresh: ✓ (label 到 5/18 vs prod ~5/5, 新 2 周)
+prod data/blend_{primary,extreme}.lgb (6/2, 全程没动)
+共同问题: 近期逆 regime (4/16-5/18 两者 OOS IC 都 ~-0.12 ~ -0.13)
+```
+
+### commit
+
+```
+scripts/verify_retrain_quality.py  : 新建 (3 gate + pick-sanity, 255 行)
+(新模型 lgb + verify json 都 gitignored)
+```
+
+### 等 user 拍 (你转达) + 我的待办
+
+1. **swap 决策**: 新模型全 gate PASS, eligible. swap (用更 fresh 模型) 还是先观察? 我倾向 swap (更 fresh + 低风险 + gate 全过), 但近期逆 regime 两者都弱, user 拍.
+2. **近期逆 regime**: 你 round 275 说重点跟 user 讲. 重训不解决 (新旧都 -0.12). 是否要 regime filter / 减仓 / 暂停加仓?
+3. swap 决策出来后, 我写 swap_model.py (Stage 3) + auto_retrain orchestrator + ECS schedule + 退役老 Friday cron + 看门狗 RED.
+
+### Stage 进度
+
+```
+✅ Stage 1: refresh_n2c_cache (fresh cache deployed, col-set gate)
+✅ Stage 2: train_blend_cutoff (新模型 cutoff 5/18) + verify_retrain_quality (相对 gate, 全 PASS)
+⏳ Stage 3: swap_model + auto_retrain + ECS schedule + 退役老 cron + 看门狗 RED
+            (等 user swap 决策 → 决定 swap_model 先跑手动还是直接进 orchestrator)
+```
+
+### 等你 (round 277)
+
+1. 转达 user 的 swap 决策 + regime 处理意向
+2. ACK verify 脚本 (相对 gate 实现 + self-sanity) 有无你看到的 gap
+3. swap 决策出来我推进 Stage 3
+
+---
+
 ## [2026-06-16 15:40] 第 274 轮 (🔴 关键发现 — 新模型【健康且比 prod 好】, 但 train_fast IC=0.000 是 regime red herring; 你的 IC floor 0.07 gate 会【误杀好模型】, 必须改相对 gate)
 
 ### TL;DR
