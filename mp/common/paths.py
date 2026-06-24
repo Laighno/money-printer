@@ -54,6 +54,13 @@ PROTECTED_PROD_PATHS: list[Path] = [
     Path("data/.real_money_frozen"),
     Path("data/arm_b_budget_state.json"),
     Path("data/account_nav_history.json"),
+    # live model weights (Group C) — the highest-stakes prod artifact: every
+    # 9:25 plan ranks off these. Overwriting them outside the gated swap path
+    # (scripts/swap_model.py --allow-prod-write) is forbidden. Added by the
+    # auto-retrain pipeline (advisor, user 拍 ①B/②B) after discovering the
+    # prod blend files were unprotected while orders/yaml were guarded.
+    Path("data/blend_primary.lgb"),
+    Path("data/blend_extreme.lgb"),
 ]
 
 

@@ -7,6 +7,43 @@ Reason for not auto-applying: macOS requires Full Disk Access for
 
 ---
 
+## ⚠️ RETRAIN MIGRATED Mac → ECS (2026-06-24, advisor; user 拍 ①B/②B)
+
+**The Mac `Friday 18:00 walk_forward_backtest.py` retrain below is RETIRED.**
+Root cause: it silently died ~4/24 when the laptop slept → prod blend froze at
+6/2 for 3 weeks (nobody noticed until the user asked "模型还在每周更吗"). It also
+saved prod models with **no verify gate** (any weak retrain overwrote prod).
+
+Replacement runs on **ECS (always-on)** via Task Scheduler, gated:
+
+| Task | When | Script | Purpose |
+|---|---|---|---|
+| `MP-AutoRetrain` | Fri 18:30 | `scripts/ecs_auto_retrain.ps1` → `auto_retrain.py --auto-swap --allow-prod-write` | refresh cache → train(current cutoff) → **verify gate** → swap (only on PASS; first swap manual per ②B) |
+| `MP-RetrainDeadman` | Sat 09:00 | `scripts/monitor/retrain_freshness_check.py` | RED Feishu if `data/auto_retrain_last.json` >8d stale or gate keeps failing |
+
+Register on ECS (PowerShell, once):
+```powershell
+$py = "C:\money-printer\.venv\Scripts\python.exe"
+# weekly retrain
+schtasks /Create /TN "MP-AutoRetrain" /SC WEEKLY /D FRI /ST 18:30 /RU SYSTEM ^
+  /TR "powershell -ExecutionPolicy Bypass -File C:\money-printer\scripts\ecs_auto_retrain.ps1"
+# dead-man-switch (independent failure domain, next morning)
+schtasks /Create /TN "MP-RetrainDeadman" /SC WEEKLY /D SAT /ST 09:00 /RU SYSTEM ^
+  /TR "$py -X utf8 C:\money-printer\scripts\monitor\retrain_freshness_check.py"
+```
+
+First-swap approval (②B, run once on ECS after the first gate-PASS stages
+`data/retrain_pending_swap.json`): `.venv\Scripts\python.exe scripts\swap_model.py
+--new-prefix <staged> --allow-prod-write --reason "first manual swap"`. This
+creates `data/.first_swap_done`; thereafter weekly gate-PASS swaps auto-apply.
+
+**Mac action:** remove the `Friday 18:00 walk_forward_backtest.py` line from the
+Mac crontab (block below kept for history/rollback only). The Saturday
+`weekly_heartbeat.py` may stay (it watches backtest_history.json, now a
+secondary signal) but the authoritative dead-man-switch is `MP-RetrainDeadman`.
+
+---
+
 ## Current crontab (post P6-X3, 2026-05-24)
 
 ```cron
