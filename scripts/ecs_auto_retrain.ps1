@@ -39,10 +39,16 @@ Log "==================== ECS auto-retrain start ===================="
 $env:MP_ALLOW_PROD_WRITE = "1"
 
 Set-Location $REPO
-Log "Step 1: git pull origin $BRANCH"
+# git pull is BEST-EFFORT: the SYSTEM service account lacks the github SSH
+# known_hosts/keys that the interactive Administrator user has, so pull fails
+# under the scheduler. That must NOT block the retrain -- the daily execute
+# task keeps the repo current, and running last-pulled code is acceptable.
+# We log a warning and proceed (abort-on-pull-fail would mean NO retrain, which
+# is strictly worse than retraining on slightly older code).
+Log "Step 1: git pull origin $BRANCH (best-effort)"
 $pullOutput = & git pull origin $BRANCH 2>&1 | Out-String
 $pullOutput.Trim().Split("`n") | ForEach-Object { Log "  git: $_" }
-if ($LASTEXITCODE -ne 0) { Log "ABORT: git pull failed (exit $LASTEXITCODE)"; exit 1 }
+if ($LASTEXITCODE -ne 0) { Log "WARN: git pull failed (exit $LASTEXITCODE) -- proceeding on already-deployed code" }
 
 $pythonExe = "$REPO\.venv\Scripts\python.exe"
 
