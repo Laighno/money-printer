@@ -7,40 +7,62 @@ Reason for not auto-applying: macOS requires Full Disk Access for
 
 ---
 
-## ⚠️ RETRAIN MIGRATED Mac → ECS (2026-06-24, advisor; user 拍 ①B/②B)
+## ⚠️ RETRAIN = Mac-compute hybrid (2026-06-24, advisor; user 拍 ①B/②B)
 
-**The Mac `Friday 18:00 walk_forward_backtest.py` retrain below is RETIRED.**
-Root cause: it silently died ~4/24 when the laptop slept → prod blend froze at
-6/2 for 3 weeks (nobody noticed until the user asked "模型还在每周更吗"). It also
+**The Mac `Friday 18:00 walk_forward_backtest.py` retrain below is REPLACED.**
+Two faults: (1) it silently died ~4/24 when the laptop slept → prod blend froze
+at 6/2 for 3 weeks (caught only when the user asked "模型还在每周更吗"); (2) it
 saved prod models with **no verify gate** (any weak retrain overwrote prod).
 
-Replacement runs on **ECS (always-on)** via Task Scheduler, gated:
+**Why NOT pure-ECS:** first ECS run (6/24) hit a memory wall — the n2c factor
+cache is ~1GB on disk → multi-GB in RAM to rebuild+train, OOMs ECS's 8GB (same
+wall as `scripts/mac_fallback_plan.sh`). Only Mac (48GB) can do the compute. So
+the root cause (Mac sleep) is fixed with `pmset repeat wake`, NOT by relocating
+compute.
 
-| Task | When | Script | Purpose |
+**Architecture — Mac computes, ECS holds prod + watches:**
+
+| Where | When | Script | Purpose |
 |---|---|---|---|
-| `MP-AutoRetrain` | Fri 18:30 | `scripts/ecs_auto_retrain.ps1` → `auto_retrain.py --auto-swap --allow-prod-write` | refresh cache → train(current cutoff) → **verify gate** → swap (only on PASS; first swap manual per ②B) |
-| `MP-RetrainDeadman` | Sat 09:00 | `scripts/monitor/retrain_freshness_check.py` | RED Feishu if `data/auto_retrain_last.json` >8d stale or gate keeps failing |
+| **Mac** cron | Fri 18:30 | `scripts/mac_auto_retrain.sh` → `auto_retrain.py` (no swap) | refresh cache → train(cutoff) → **verify gate**; on PASS scp candidate + freshness to ECS, then swap on ECS (first swap manual ②B, then auto) |
+| **Mac** pmset | Fri 18:25 | `pmset repeat wake` | wake the laptop 5 min before the cron so sleep can't kill it (THE root-cause fix) |
+| **ECS** Task Sched | Sat 09:00 | `scripts/monitor/retrain_freshness_check.py` (`MP-RetrainDeadman`) | always-on RED Feishu if `data/auto_retrain_last.json` >8d stale or gate keeps failing |
 
-Register on ECS (PowerShell, once):
-```powershell
-$py = "C:\money-printer\.venv\Scripts\python.exe"
-# weekly retrain
-schtasks /Create /TN "MP-AutoRetrain" /SC WEEKLY /D FRI /ST 18:30 /RU SYSTEM ^
-  /TR "powershell -ExecutionPolicy Bypass -File C:\money-printer\scripts\ecs_auto_retrain.ps1"
-# dead-man-switch (independent failure domain, next morning)
-schtasks /Create /TN "MP-RetrainDeadman" /SC WEEKLY /D SAT /ST 09:00 /RU SYSTEM ^
-  /TR "$py -X utf8 C:\money-printer\scripts\monitor\retrain_freshness_check.py"
+Mac crontab line (replaces the `walk_forward_backtest.py` line below):
+```cron
+# Friday 18:30 — Mac-compute auto-retrain (gated) → swap on ECS
+30 18 * * 5 /Users/laighno/laighno/money-printer/scripts/mac_auto_retrain.sh >> /Users/laighno/laighno/money-printer/data/logs/mac_auto_retrain_cron.log 2>&1
 ```
 
-First-swap approval (②B, run once on ECS after the first gate-PASS stages
-`data/retrain_pending_swap.json`): `.venv\Scripts\python.exe scripts\swap_model.py
---new-prefix <staged> --allow-prod-write --reason "first manual swap"`. This
-creates `data/.first_swap_done`; thereafter weekly gate-PASS swaps auto-apply.
+Mac wake-from-sleep (run ONCE, needs sudo — THE fix for the original incident):
+```bash
+sudo pmset repeat wake MTWRF 18:25:00   # wake weekdays 18:25 so Fri cron fires
+pmset -g sched                          # verify the schedule
+```
+
+ECS dead-man-switch (already registered 6/24):
+```powershell
+schtasks /Create /F /TN MP-RetrainDeadman /SC WEEKLY /D SAT /ST 09:00 /RU SYSTEM ^
+  /TR "C:\money-printer\.venv\Scripts\python.exe -X utf8 C:\money-printer\scripts\monitor\retrain_freshness_check.py"
+```
+
+First-swap approval (②B): the first gate-PASS stages `data/retrain_pending_swap.json`
+on ECS but does NOT swap. Approve once on ECS:
+```powershell
+cd C:\money-printer; $env:MP_ALLOW_PROD_WRITE='1'
+.venv\Scripts\python.exe scripts\swap_model.py --new-prefix <staged> --allow-prod-write --reason "first manual swap"
+```
+This creates `data/.first_swap_done` on ECS; thereafter `mac_auto_retrain.sh`
+auto-swaps on every gate PASS. Rollback anytime: `swap_model.py --rollback --allow-prod-write`.
 
 **Mac action:** remove the `Friday 18:00 walk_forward_backtest.py` line from the
 Mac crontab (block below kept for history/rollback only). The Saturday
-`weekly_heartbeat.py` may stay (it watches backtest_history.json, now a
-secondary signal) but the authoritative dead-man-switch is `MP-RetrainDeadman`.
+`weekly_heartbeat.py` may stay (watches backtest_history.json, secondary signal);
+the authoritative dead-man-switch is `MP-RetrainDeadman` on ECS.
+
+> NOTE: `scripts/ecs_auto_retrain.ps1` is retained for the future case where ECS
+> RAM is upgraded to ≥16GB (then re-register `MP-AutoRetrain` and drop the Mac
+> hybrid). It is NOT scheduled today.
 
 ---
 
