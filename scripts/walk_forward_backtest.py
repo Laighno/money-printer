@@ -1709,6 +1709,15 @@ def update_production_models(
     from mp.ml.dataset import build_dataset
     from mp.ml.model import BlendRanker
 
+    # Prod-write gate (2026-06-24): this overwrites data/blend_*.lgb via
+    # BlendRanker.save() (which bypasses assert_prod_write_allowed). The RETIRED
+    # Friday cron called walk_forward ungated; block it here so a stray run can't
+    # clobber prod without MP_ALLOW_PROD_WRITE. The gated auto-retrain pipeline
+    # (train_blend_cutoff → verify → swap_model) writes data/blend_auto_* + swaps
+    # separately and never reaches this function. Backtests pass --skip-update.
+    from mp.common.paths import assert_prod_write_allowed
+    assert_prod_write_allowed("data/blend_primary.lgb")
+
     logger.info("=" * 60)
     logger.info("Updating production models...")
     logger.info("=" * 60)

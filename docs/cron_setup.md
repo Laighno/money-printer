@@ -24,21 +24,21 @@ compute.
 
 | Where | When | Script | Purpose |
 |---|---|---|---|
-| **Mac** cron | Fri 18:30 | `scripts/mac_auto_retrain.sh` → `auto_retrain.py` (no swap) | refresh cache → train(cutoff) → **verify gate**; on PASS scp candidate + freshness to ECS, then swap on ECS (first swap manual ②B, then auto) |
-| **Mac** pmset | Fri 18:25 | `pmset repeat wake` | wake the laptop 5 min before the cron so sleep can't kill it (THE root-cause fix) |
+| **Mac** launchd | Fri 18:30 | `com.moneyprinter.autoretrain` → `scripts/mac_auto_retrain.sh` | refresh cache → train(cutoff) → **verify gate**; on PASS scp candidate + freshness to ECS, then swap on ECS (first swap manual ②B, then auto) |
 | **ECS** Task Sched | Sat 09:00 | `scripts/monitor/retrain_freshness_check.py` (`MP-RetrainDeadman`) | always-on RED Feishu if `data/auto_retrain_last.json` >8d stale or gate keeps failing |
 
-Mac crontab line (replaces the `walk_forward_backtest.py` line below):
-```cron
-# Friday 18:30 — Mac-compute auto-retrain (gated) → swap on ECS
-30 18 * * 5 /Users/laighno/laighno/money-printer/scripts/mac_auto_retrain.sh >> /Users/laighno/laighno/money-printer/data/logs/mac_auto_retrain_cron.log 2>&1
-```
-
-Mac wake-from-sleep (run ONCE, needs sudo — THE fix for the original incident):
+**Mac scheduling = launchd, NOT cron+pmset (2026-06-24, user 拍 "睡过等醒来补跑").**
+launchd `StartCalendarInterval` re-runs a MISSED job when the Mac wakes — so no
+`pmset` forced-wake is needed; if the laptop is asleep Fri 18:30 the retrain runs
+on next wake. Agent `~/Library/LaunchAgents/com.moneyprinter.autoretrain.plist`
+(loaded 6/24, same convention as the other `com.moneyprinter.*` agents):
 ```bash
-sudo pmset repeat wake MTWRF 18:25:00   # wake weekdays 18:25 so Fri cron fires
-pmset -g sched                          # verify the schedule
+launchctl load ~/Library/LaunchAgents/com.moneyprinter.autoretrain.plist
+launchctl list | grep autoretrain   # verify
 ```
+plist: `StartCalendarInterval {Weekday=5,Hour=18,Minute=30}`, runs
+`/bin/bash scripts/mac_auto_retrain.sh`, PATH includes `/sbin` (needs `md5`),
+logs → `data/logs/mac_auto_retrain_launchd.log`.
 
 ECS dead-man-switch (already registered 6/24):
 ```powershell
@@ -55,10 +55,14 @@ cd C:\money-printer; $env:MP_ALLOW_PROD_WRITE='1'
 This creates `data/.first_swap_done` on ECS; thereafter `mac_auto_retrain.sh`
 auto-swaps on every gate PASS. Rollback anytime: `swap_model.py --rollback --allow-prod-write`.
 
-**Mac action:** remove the `Friday 18:00 walk_forward_backtest.py` line from the
-Mac crontab (block below kept for history/rollback only). The Saturday
-`weekly_heartbeat.py` may stay (watches backtest_history.json, secondary signal);
-the authoritative dead-man-switch is `MP-RetrainDeadman` on ECS.
+**Old Friday cron — NEUTERED, removal optional.** The `0 18 * * 5
+walk_forward_backtest.py` line still in the Mac crontab is now harmless:
+`update_production_models()` gained an `assert_prod_write_allowed("data/blend_primary.lgb")`
+gate (2026-06-24), so an ungated walk_forward run raises before it can clobber
+prod (it runs the backtest, then aborts at the prod-write step). Removing the
+crontab line is tidy-up, not urgent (crontab edit needs Full Disk Access, left to
+the user). The Saturday `weekly_heartbeat.py` may stay (secondary signal); the
+authoritative dead-man-switch is `MP-RetrainDeadman` on ECS.
 
 > NOTE: `scripts/ecs_auto_retrain.ps1` is retained for the future case where ECS
 > RAM is upgraded to ≥16GB (then re-register `MP-AutoRetrain` and drop the Mac
