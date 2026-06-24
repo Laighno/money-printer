@@ -57,6 +57,9 @@ def main() -> int:
                      "(Rule #4). Use a distinct --output-prefix.")
         return 1
 
+    t0 = time.time()  # whole-run timer; must precede both panel paths (the
+    # wf_cache fast path skips the build branch where t0 used to be set, which
+    # left line "Total time" crashing on UnboundLocalError — 2026-06-24 fix).
     logger.info("=" * 60)
     logger.info("Training cutoff BlendRanker")
     logger.info("=" * 60)
