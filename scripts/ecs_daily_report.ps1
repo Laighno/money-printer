@@ -33,6 +33,12 @@ function Abort { param([string]$msg)
 Log "==================== ECS daily-report start ===================="
 Set-Location $REPO
 
+# Cap scoring parallelism so daily_report.py fits ECS 8GB RAM (2026-07-01 fix).
+# Default in code is 8 ProcessPool workers -> OOM-killed daily_report on 6/22,
+# 6/25, 6/30 (each worker loads ~800 stocks' data; 8x peak > free RAM). 3
+# workers fit; slower (~2.5x) but the 17:00 batch has time. Mac keeps default 8.
+$env:MP_SCORE_WORKERS = "3"
+
 $pythonExe = "$REPO\.venv\Scripts\python.exe"
 if (-not (Test-Path $pythonExe)) { Abort "python not found: $pythonExe" }
 

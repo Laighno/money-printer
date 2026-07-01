@@ -346,6 +346,17 @@ def run(
                     )
                     limit = cage_min
 
+        # Round to a valid A-share tick (0.01) in the cage-safe direction —
+        # buy floors, sell ceils — so the limit never re-violates the cage and
+        # never trips 校验最小价差失败 (2026-07-01: 000933 buy rejected at
+        # ¥21.3078 = live 20.89 * 1.02, an unrounded cage_max). Idempotent for
+        # already-aligned prices.
+        import math
+        if action == "buy":
+            limit = math.floor(limit * 100 + 1e-9) / 100
+        else:
+            limit = math.ceil(limit * 100 - 1e-9) / 100
+
         # Concentration check for buys: would this push code past single-cap?
         if action == "buy":
             cur_pos = next((p for p in broker.get_positions() if p.code == code), None)

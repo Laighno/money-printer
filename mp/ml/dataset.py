@@ -1212,7 +1212,12 @@ def build_latest_features(
     # ThreadPool is already effective there — measurement evidence).
     from concurrent.futures import ProcessPoolExecutor
 
-    _WORKERS = 8
+    # round: worker count env-configurable (2026-07-01). Hardcoded 8 OOM-killed
+    # daily_report on ECS (8GB): 8 ProcessPool workers each load ~800 stocks'
+    # bars/fundamentals → peak > free RAM → silent OS kill → no plan → stale
+    # latest.json → tiny 9:25 residual (6/22, 6/25, 6/30 all failed). ECS sets
+    # MP_SCORE_WORKERS=3 to fit; Mac (48GB) leaves the default 8.
+    _WORKERS = max(1, int(os.environ.get("MP_SCORE_WORKERS", "8")))
 
     valuation_map: Dict[str, Dict[str, float]] = {}
     fin_hist_map: Dict[str, Optional[pd.DataFrame]] = {}
