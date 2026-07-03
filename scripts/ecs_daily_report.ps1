@@ -33,11 +33,11 @@ function Abort { param([string]$msg)
 Log "==================== ECS daily-report start ===================="
 Set-Location $REPO
 
-# Cap scoring parallelism so daily_report.py fits ECS 8GB RAM (2026-07-01 fix).
-# Default in code is 8 ProcessPool workers -> OOM-killed daily_report on 6/22,
-# 6/25, 6/30 (each worker loads ~800 stocks' data; 8x peak > free RAM). 3
-# workers fit; slower (~2.5x) but the 17:00 batch has time. Mac keeps default 8.
-$env:MP_SCORE_WORKERS = "3"
+# Cap scoring parallelism so daily_report.py fits ECS 8GB RAM (2026-07-01;
+# lowered 3->2 on 2026-07-03). QMT permanently holds ~3GB (miniquote+XtMiniQmt)
+# of the 8GB, leaving ~3.5GB; 3 workers was marginal (7/1 ok, 7/2 died). 2
+# workers verified to complete (inline test 7/3). Mac keeps default 8.
+$env:MP_SCORE_WORKERS = "2"
 
 $pythonExe = "$REPO\.venv\Scripts\python.exe"
 if (-not (Test-Path $pythonExe)) { Abort "python not found: $pythonExe" }
@@ -68,11 +68,27 @@ if ($LASTEXITCODE -ne 0) {
     Log "  WARNING: collector failed (exit $LASTEXITCODE); proceeding (daily_report may be partial)"
 }
 
-# Step 4: daily_report.py (generates plan + Feishu)
-Log "Step 4: daily_report.py"
-$reportOutput = & $pythonExe -X utf8 scripts\daily_report.py --allow-prod-write 2>&1 | Out-String
-$reportOutput.Trim().Split("`n") | ForEach-Object { Log "  report: $_" }
-if ($LASTEXITCODE -ne 0) { Abort "daily_report.py failed (exit $LASTEXITCODE)" }
+# Step 4: daily_report.py with retry (2026-07-03). Root failure mode (7/2, and
+# 6/22/6/25/6/30): on fetch-heavy / flaky-network evenings the per-stock bars
+# fetch hangs or the scoring OOMs -> Step 4 dies silently -> no plan -> tiny
+# 9:25 residual. Mitigations: (1) MP_SCORE_WORKERS=2 caps memory; (2) retry once
+# after a pause to ride out a transient network blip; (3) on final failure fire
+# the plan-freshness Feishu RED instead of a silent Abort so it never goes
+# unnoticed (belt to MP-PlanFreshness's 18:00 suspenders).
+$reportOK = $false
+for ($attempt = 1; $attempt -le 2; $attempt++) {
+    Log "Step 4: daily_report.py (attempt $attempt/2, workers=$($env:MP_SCORE_WORKERS))"
+    $reportOutput = & $pythonExe -u -X utf8 scripts\daily_report.py --allow-prod-write 2>&1 | Out-String
+    $reportOutput.Trim().Split("`n") | Select-Object -Last 15 | ForEach-Object { Log "  report: $_" }
+    if ($LASTEXITCODE -eq 0) { $reportOK = $true; break }
+    Log "  attempt $attempt failed (exit $LASTEXITCODE)"
+    if ($attempt -lt 2) { Log "  retry in 90s (transient network?)"; Start-Sleep -Seconds 90 }
+}
+if (-not $reportOK) {
+    Log "Step 4: daily_report FAILED after 2 attempts -- firing plan-freshness alert"
+    & $pythonExe -X utf8 scripts\monitor\plan_freshness_check.py 2>&1 | ForEach-Object { Log "  alert: $_" }
+    Abort "daily_report.py failed after 2 attempts (plan-freshness alert sent)"
+}
 
 # Step 5: Arm B shadow recorder (non-fatal, research; 10 min timeout)
 # Shadow re-fetches 60-day daily bars for 615 codes (~30-60 min on slow
