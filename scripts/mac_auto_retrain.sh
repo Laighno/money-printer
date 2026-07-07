@@ -52,19 +52,39 @@ echo "[1] git pull (Mac) ..."
 git pull origin main 2>&1 | tail -2 || echo "  WARN: git pull failed, proceeding on local code"
 
 # ── Step 2: Mac prod blend == ECS prod blend (swap baseline must match) ──
+# 2026-07-07 fix: the ECS md5 fetch is over flaky SSH. The old code read a
+# single empty/dropped result as "mismatch" and ABORTED the whole retrain —
+# 6/26 + 7/3 both died here (one md5 came back empty) → model frozen at 6/24.
+# Now: retry 3x; and if ECS is genuinely unreachable, DON'T abort — still
+# train+verify (compute isn't wasted) and only DEFER the swap (which needs ECS
+# anyway). Only a real reachable-but-different md5 aborts.
 echo "[2] verify Mac prod blend == ECS prod blend ..."
 mac_p=$(md5 -q data/blend_primary.lgb 2>/dev/null || echo MAC_MISSING)
 mac_e=$(md5 -q data/blend_extreme.lgb 2>/dev/null || echo MAC_MISSING)
-ecs_p=$(ssh -o ConnectTimeout=45 "$ECS" "powershell -Command \"(Get-FileHash $ECS_REPO/data/blend_primary.lgb -Algorithm MD5).Hash\"" 2>/dev/null | tr -d '\r' | tr 'A-Z' 'a-z' | grep -oE '^[0-9a-f]{32}')
-ecs_e=$(ssh -o ConnectTimeout=45 "$ECS" "powershell -Command \"(Get-FileHash $ECS_REPO/data/blend_extreme.lgb -Algorithm MD5).Hash\"" 2>/dev/null | tr -d '\r' | tr 'A-Z' 'a-z' | grep -oE '^[0-9a-f]{32}')
-if [ "$mac_p" != "$ecs_p" ] || [ "$mac_e" != "$ecs_e" ]; then
-  echo "  ⚠ PROD MISMATCH Mac vs ECS — gate baseline != swap target."
+ecs_md5() {  # $1 = data-relative filename; echoes lowercase md5 or empty
+  local f="$1" h="" i
+  for i in 1 2 3; do
+    h=$(ssh -o ConnectTimeout=45 -o ServerAliveInterval=10 "$ECS" "powershell -Command \"(Get-FileHash $ECS_REPO/data/$f -Algorithm MD5).Hash\"" 2>/dev/null | tr -d '\r' | tr 'A-Z' 'a-z' | grep -oE '^[0-9a-f]{32}')
+    [ -n "$h" ] && break
+    sleep 5
+  done
+  echo "$h"
+}
+ecs_p=$(ecs_md5 blend_primary.lgb)
+ecs_e=$(ecs_md5 blend_extreme.lgb)
+SKIP_SWAP=0
+if [ -z "$ecs_p" ] || [ -z "$ecs_e" ]; then
+  echo "  ⚠ ECS unreachable (md5 empty after 3 retries) — train+verify anyway, DEFER swap."
+  SKIP_SWAP=1
+elif [ "$mac_p" != "$ecs_p" ] || [ "$mac_e" != "$ecs_e" ]; then
+  echo "  ⚠ PROD MISMATCH Mac vs ECS (reachable but different) — gate baseline != swap target."
   echo "    primary: mac=$mac_p ecs=$ecs_p"
   echo "    extreme: mac=$mac_e ecs=$ecs_e"
   echo "    Sync prod blend Mac<->ECS before trusting the swap. ABORT."
   exit 2
+else
+  echo "  ✓ prod blend matches (primary=$mac_p extreme=$mac_e)"
 fi
-echo "  ✓ prod blend matches (primary=$mac_p extreme=$mac_e)"
 
 # ── Step 3: compute + gate (never touches prod) ──
 echo "[3] auto_retrain.py (refresh → train(cutoff) → verify gate; stage only) ..."
@@ -90,6 +110,16 @@ fi
 
 # ── Step 5: gate PASS → deliver candidate to ECS + swap (or stage first-swap) ──
 echo "[5] gate PASS: new=$new_prefix cutoff=$cutoff"
+
+# ECS was unreachable in Step 2 → can't scp/swap now. Candidate is trained +
+# gate-passed + staged on Mac; the NEXT reachable run swaps the latest. Not an
+# error — prod just stays put this cycle (dead-man-switch tracks staleness).
+if [ "$SKIP_SWAP" = "1" ]; then
+  echo "  ECS unreachable this run — candidate $new_prefix staged on Mac, swap DEFERRED."
+  echo "  (next reachable run, or manual: scp candidate + swap_model.py on ECS)"
+  exit 0
+fi
+
 echo "  scp candidate model → ECS ..."
 scp -o ConnectTimeout=60 "${new_prefix}_primary.lgb" "$ECS:$ECS_REPO/${new_prefix}_primary.lgb"
 scp -o ConnectTimeout=60 "${new_prefix}_extreme.lgb" "$ECS:$ECS_REPO/${new_prefix}_extreme.lgb"
