@@ -120,12 +120,30 @@ if [ "$SKIP_SWAP" = "1" ]; then
   exit 0
 fi
 
+# scp/swap over the flaky ECS SSH — RETRY + check exit (2026-07-08 fix: a
+# dropped scp used to still print "✓ uploaded" and a dropped swap ssh silently
+# left prod unchanged, so 7/8 the whole delivery failed while claiming success).
+scp_retry() {  # $1 local, $2 remote
+  local i
+  for i in 1 2 3 4; do
+    scp -o ConnectTimeout=45 -o ServerAliveInterval=10 "$1" "$2" 2>/dev/null && return 0
+    echo "    scp $(basename "$1") attempt $i failed, retry"; sleep 5
+  done
+  return 1
+}
 echo "  scp candidate model → ECS ..."
-scp -o ConnectTimeout=60 "${new_prefix}_primary.lgb" "$ECS:$ECS_REPO/${new_prefix}_primary.lgb"
-scp -o ConnectTimeout=60 "${new_prefix}_extreme.lgb" "$ECS:$ECS_REPO/${new_prefix}_extreme.lgb"
+if ! scp_retry "${new_prefix}_primary.lgb" "$ECS:$ECS_REPO/${new_prefix}_primary.lgb" \
+   || ! scp_retry "${new_prefix}_extreme.lgb" "$ECS:$ECS_REPO/${new_prefix}_extreme.lgb"; then
+  echo "  ✗ candidate upload FAILED after retries — prod unchanged; candidate staged on Mac for next run."
+  exit 3
+fi
 echo "  ✓ model uploaded"
 
-first_done=$(ssh -o ConnectTimeout=45 "$ECS" "powershell -Command \"Test-Path $ECS_REPO/data/.first_swap_done\"" 2>/dev/null | tr -d '\r' | tail -1)
+first_done=""
+for i in 1 2 3; do
+  first_done=$(ssh -o ConnectTimeout=45 -o ServerAliveInterval=10 "$ECS" "powershell -Command \"Test-Path $ECS_REPO/data/.first_swap_done\"" 2>/dev/null | tr -d '\r' | grep -iE 'True|False' | tail -1)
+  [ -n "$first_done" ] && break; sleep 5
+done
 
 if [ "$NO_SWAP" = "--no-swap" ]; then
   echo "  --no-swap: candidate on ECS, NOT swapping."
@@ -133,9 +151,19 @@ if [ "$NO_SWAP" = "--no-swap" ]; then
 fi
 
 if [ "$first_done" = "True" ]; then
-  echo "  ECS first-swap sentinel present → AUTO-SWAP on ECS ..."
-  ssh -o ConnectTimeout=60 "$ECS" "powershell -Command \"cd C:\\money-printer; \$env:MP_ALLOW_PROD_WRITE='1'; .venv\\Scripts\\python.exe -X utf8 scripts\\swap_model.py --new-prefix $new_prefix --prod-prefix data/blend --allow-prod-write --reason 'mac_auto_retrain cutoff $cutoff'\"" 2>&1 | tail -8
-  echo "  (verify swapped: ECS blend md5 should now match candidate)"
+  echo "  ECS first-swap sentinel present → AUTO-SWAP on ECS (retry) ..."
+  swapped_ok=0
+  for i in 1 2 3; do
+    swap_out=$(ssh -o ConnectTimeout=60 -o ServerAliveInterval=10 "$ECS" "powershell -Command \"cd C:\\money-printer; \$env:MP_ALLOW_PROD_WRITE='1'; .venv\\Scripts\\python.exe -X utf8 scripts\\swap_model.py --new-prefix $new_prefix --prod-prefix data/blend --allow-prod-write --reason 'mac_auto_retrain cutoff $cutoff'\"" 2>&1)
+    echo "$swap_out" | grep -iE "backed up|swapped|SWAP DONE" | tail -4
+    if echo "$swap_out" | grep -qiE "SWAP DONE|swapped"; then swapped_ok=1; break; fi
+    echo "    swap attempt $i failed, retry"; sleep 6
+  done
+  if [ "$swapped_ok" != "1" ]; then
+    echo "  ✗ swap FAILED after retries — model uploaded but NOT swapped; run swap_model.py on ECS manually."
+    exit 4
+  fi
+  echo "  ✓ swapped on ECS (cutoff $cutoff)"
 else
   echo "  ECS first-swap sentinel ABSENT → ②B: first swap needs MANUAL approval."
   scp -o ConnectTimeout=45 data/retrain_pending_swap.json "$ECS:$ECS_REPO/data/retrain_pending_swap.json" 2>/dev/null || true
