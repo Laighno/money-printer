@@ -1143,16 +1143,22 @@ def generate_order_list(
     rebalance_tolerance = float(account.get("rebalance_tolerance", 0.02))
     min_delta_value = total_assets * rebalance_tolerance
 
-    # Filter out HS300 stocks: model is trained on ZZ500 only, predictions
-    # on HS300 names are out-of-distribution extrapolations.  Surface them
-    # in the report (with ⚠️ marker) but do NOT auto-include in orders.
-    hs300 = _hs300_set()
+    # HS300 recs are now INCLUDED in orders (2026-07-17 fix). The old exclusion
+    # ("model trained on ZZ500 only → HS300 is OOD extrapolation") was FALSE:
+    # the prod BlendRanker is retrained on the merged HS300+ZZ500 universe (all
+    # 300 HS300 names, ~16% of training rows), and the strategy's alpha is
+    # concentrated in HS300. Excluding it collapsed the walk-forward Sharpe from
+    # 1.24 → 0.11 (annual 32.9% → 2.3%, below the ZZ500 benchmark); allowing it
+    # restores 1.18 / 28.8%. The exclusion was a stale guard left over from the
+    # ZZ500-only era — it was added in the SAME commit (94c93f5) that expanded
+    # training to HS300, i.e. self-contradicting, and its own removal condition
+    # ("after HS300 backfill + retrain") was already met in that commit.
     all_rec_codes = [str(c).zfill(6) for c in recommendations["code"].tolist()]
-    rec_codes = [c for c in all_rec_codes if c not in hs300]
-    if len(rec_codes) < len(all_rec_codes):
-        skipped = [c for c in all_rec_codes if c in hs300]
-        logger.info("Order list: skipped {} HS300 recs (extrapolation): {}",
-                    len(skipped), skipped)
+    rec_codes = list(all_rec_codes)
+    _n_hs300 = sum(1 for c in all_rec_codes if c in _hs300_set())
+    if _n_hs300:
+        logger.info("Order list: including {} HS300 recs (2026-07-17 fix: HS300 is in-universe)",
+                    _n_hs300)
     held_shares = {str(h["code"]).zfill(6): int(h.get("shares", 0) or 0) for h in holdings_full}
     held_names = {str(h["code"]).zfill(6): h.get("name", h["code"]) for h in holdings_full}
 
@@ -1832,11 +1838,11 @@ def _format_markdown(
 _INTRADAY_TITLE = {"midday": "📊 午间快报", "2pm": "⏰ 盘中快报 14:00"}
 
 
-# Extrapolation marker: HS300 stocks are in the inference universe (since
-# 2026-05-14 widening) but the production BlendRanker was trained on ZZ500
-# only.  Predictions on HS300 names are out-of-distribution extrapolations
-# until Layer 2 (HS300 historical constituent backfill) + Layer 3 (retrain)
-# complete.  Mark them in reports and exclude from automated order lists.
+# HS300 marker: HS300 stocks are in BOTH the inference AND training universe
+# (backfill + merged-universe retrain completed 2026-05-15). They are traded
+# normally as of 2026-07-17 (the old "OOD / exclude from orders" treatment was
+# a stale ZZ500-only-era guard — see the order-list section). The marker is now
+# only an informational "large-cap HS300" tag, not a warning.
 # Low-liquidity marker — shown next to recommendations whose 20-day average
 # daily turnover is below LOW_LIQUIDITY_WARN_AMOUNT.  Stocks below
 # LOW_LIQUIDITY_FILTER_AMOUNT are dropped from top-N entirely (see
@@ -1879,9 +1885,8 @@ def _recent_amount_avg(codes: list[str], days: int = 20) -> dict[str, float]:
 
 _EXTRAPOLATION_MARK = " ⚠️*"
 _EXTRAPOLATION_FOOTNOTE = (
-    "> ⚠️* 标记：该股属于 HS300 大盘股，模型当前训练池只覆盖 ZZ500，"
-    "对它的预测是**外推**——仅供参考，不进入换仓建议/订单清单。"
-    "HS300 历史成分股 backfill + 模型重训完成后会移除此标记。"
+    "> ⚠️* 标记：该股属于 HS300 大盘股。模型已在 HS300+ZZ500 合并池上训练，"
+    "**现已正常纳入订单清单**（2026-07-17 起）。此标记仅作大盘股信息提示。"
 )
 
 
