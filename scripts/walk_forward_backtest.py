@@ -244,6 +244,57 @@ INDUSTRY_CAP = os.environ.get("INDUSTRY_CAP")
 INDUSTRY_CAP = int(INDUSTRY_CAP) if INDUSTRY_CAP else None
 _INDUSTRY_MAP: dict = {}  # lazy-loaded in run_walk_forward when INDUSTRY_CAP set
 
+# Live-fidelity knobs (advisor 2026-07-17, "realistic backtest" to separate
+# optimistic-backtest cost from regime). Match what the LIVE system actually
+# does vs the idealized sim:
+#   LIVE_UNIVERSE=1  → restrict the top-K candidate pool to what daily_report
+#     actually trades: drop 创业板/科创板 (300/301/688/689), drop HS300 members
+#     (live drops them as OOD extrapolation), drop illiquid (<¥LIVE_ILLIQ_AMOUNT
+#     20-day ADV). HS300 uses a static current-membership snapshot (approx).
+#   GROSS_EXPOSURE<1 → size buys to this fraction of NAV, leaving the rest in
+#     cash (live target_position_pct ~0.85, realized ~0.75; sim is fully invested).
+#     NOTE: gross scaling is ~Sharpe-neutral (mean & vol scale together); it
+#     mainly lowers TOTAL RETURN + adds cash drag in up-markets.
+LIVE_UNIVERSE = os.environ.get("LIVE_UNIVERSE", "0") == "1"
+LIVE_ILLIQ_AMOUNT = float(os.environ.get("LIVE_ILLIQ_AMOUNT", "1e8"))  # ¥1亿
+GROSS_EXPOSURE = float(os.environ.get("GROSS_EXPOSURE", "1.0"))
+# Per-exclusion toggles so the LIVE_UNIVERSE collapse can be attributed to ONE
+# cause (advisor A/B decomposition 2026-07-17). Default all on when LIVE_UNIVERSE.
+EXCL_CHINEXT = os.environ.get("EXCL_CHINEXT", "1") == "1"  # 300/301/688/689
+EXCL_HS300 = os.environ.get("EXCL_HS300", "1") == "1"
+EXCL_ILLIQ = os.environ.get("EXCL_ILLIQ", "1") == "1"
+_LIVE_HS300: set | None = None  # lazy static HS300 exclusion set
+
+
+def _apply_live_universe(df, dt, adv_lk):
+    """Restrict a scored-candidate frame to what LIVE actually trades (LIVE_UNIVERSE).
+
+    Drops 创业板/科创板 (300/301/688/689 prefixes), HS300 members (live treats
+    them as OOD), and illiquid names (< LIVE_ILLIQ_AMOUNT 20-day ADV). HS300 uses
+    a static current-membership snapshot (approximation — membership is stable).
+    """
+    global _LIVE_HS300
+    codes = df["code"].astype(str).str.zfill(6)
+    keep = np.ones(len(df), dtype=bool)
+    if EXCL_CHINEXT:
+        keep &= ~codes.str.startswith(("300", "301", "688", "689")).to_numpy()
+    if EXCL_HS300:
+        if _LIVE_HS300 is None:
+            try:
+                from mp.data.fetcher import get_index_constituents
+                _LIVE_HS300 = {str(c).zfill(6) for c in get_index_constituents("hs300")}
+                logger.info("LIVE_UNIVERSE: HS300 exclusion set = {} names", len(_LIVE_HS300))
+            except Exception as e:
+                logger.warning("LIVE_UNIVERSE: HS300 fetch failed ({}); skipping HS300 filter", e)
+                _LIVE_HS300 = set()
+        if _LIVE_HS300:
+            keep &= ~codes.isin(_LIVE_HS300).to_numpy()
+    out = df[keep]
+    if EXCL_ILLIQ and not out.empty and LIVE_ILLIQ_AMOUNT > 0:
+        liq = out["code"].map(lambda c: adv_lk.get((c, dt), 0.0))
+        out = out[liq.values >= LIVE_ILLIQ_AMOUNT]
+    return out
+
 CACHE_DIR = Path("data/wf_cache")
 REPORT_PATH = Path(os.environ.get(
     "WF_REPORT_PATH", "data/reports/walk_forward_result.md"))
@@ -1201,6 +1252,10 @@ def run_walk_forward():
         today_valid = today_df.dropna(subset=core)
         if today_valid.empty:
             return None, {}
+        if LIVE_UNIVERSE:
+            today_valid = _apply_live_universe(today_valid, dt, adv_lk)
+            if today_valid.empty:
+                return None, {}
         codes_in = today_valid["code"].tolist()
         scores = current_ranker.predict(today_valid)
         if hasattr(current_ranker, "predict_raw"):
@@ -1387,7 +1442,7 @@ def run_walk_forward():
                 # (a) For drift rebalance (names unchanged): trim overweights
                 # first so broker.buy() has cash to top up underweights.
                 if drift_triggered and not selection_changed:
-                    total_value_now = broker.total_value
+                    total_value_now = broker.total_value * GROSS_EXPOSURE  # cash buffer if <1
                     target_per_stock = total_value_now / TOP_K
                     for code in list(broker.positions.keys()):
                         price_raw = _entry_price(code, dt)
@@ -1411,7 +1466,7 @@ def run_walk_forward():
 
                 # (c) Buy new / adjust positions at today's open.
                 #     Position weights per POSITION_SIZING setting.
-                total_value_now = broker.total_value
+                total_value_now = broker.total_value * GROSS_EXPOSURE  # cash buffer if <1
                 weights = _compute_position_weights(
                     [c for c, _ in pending_selection], dt, panel_by_date,
                     POSITION_SIZING,
