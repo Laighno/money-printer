@@ -158,6 +158,35 @@ def validate_snapshot(snapshot: Dict[str, Any]) -> None:
             f"snapshot.total_assets ({ta}) < market_value ({mv}) — impossible, refusing."
         )
 
+    # 2026-08-06 incident: a live QMT snapshot returned account.market_value =
+    # total_assets (196,618) / cash_available = 0 while the real account was
+    # 113,980 held + 69,440 cash. get_account_info was glitched but get_positions
+    # was correct — so the reported market_value did NOT match the sum of the
+    # individual position market_values. Writing it to portfolio.yaml would size
+    # the next order plan on ~70k of phantom holdings + zero cash. Cross-check
+    # the aggregate against the per-position sum and refuse on divergence.
+    positions = snapshot.get("positions") or []
+    pos_mv_sum = sum(
+        float(p.get("market_value") or 0)
+        for p in positions if int(p.get("shares") or 0) > 0
+    )
+    _MV_CHECK_FLOOR = 1_000.0  # ignore all-cash / tiny accounts
+    if mv > _MV_CHECK_FLOOR:
+        if pos_mv_sum <= 0:
+            raise ValueError(
+                f"snapshot.market_value ({mv:.0f}) > 0 but positions sum to 0 "
+                "— inconsistent (get_account_info vs get_positions mismatch). "
+                "Refusing (2026-08-06 QMT glitch signature)."
+            )
+        rel_diff = abs(mv - pos_mv_sum) / pos_mv_sum
+        if rel_diff > 0.02:  # >2% is beyond rounding / intraday price lag
+            raise ValueError(
+                f"snapshot.market_value ({mv:.0f}) != sum of position "
+                f"market_values ({pos_mv_sum:.0f}), rel_diff {rel_diff:.1%} — "
+                "internally inconsistent QMT snapshot (2026-08-06 glitch). "
+                "Refusing to write corrupt account state."
+            )
+
 
 # round 168 (c) — the placeholder comment line above `account:` MUST be unique.
 # extract_header() prior to this fix kept everything above `account:`, so each
