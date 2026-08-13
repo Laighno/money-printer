@@ -1242,17 +1242,27 @@ def generate_order_list(
         if delta_value > 0:
             # ADD: need to BUY (delta_value worth)
             limit = round(close * 1.01, 2)
+            lot_cost = limit * 100
             shares = int(delta_value / limit / 100) * 100
             if shares < 100:
-                # Not enough room for 1 lot — alert if model strongly wants it
-                if ex_pp >= 3.0:
+                # Buy gap is below 1 lot. User rule (2026-08-13): a small account
+                # can't reach the per-name target on high-priced names (1 lot >
+                # target). If 1 lot is within 2× the target gap, buy 1 lot anyway
+                # (accept the mild over-allocation so top-conviction high-priced
+                # picks aren't skipped); if 1 lot exceeds 2× the target, keep
+                # status quo (skip + alert).
+                if lot_cost <= 2.0 * delta_value:
+                    shares = 100
+                elif ex_pp >= 3.0:
                     alerts.append(
                         f"模型建议加仓 **{rec_name_map.get(c, c)} ({c})**"
                         f"（{rank_str}, 超额 {ex_pp:+.2f}%, "
                         f"目标 {target_w_pct:.1f}% → 当前 {current_w_pct:.1f}%）"
-                        f"但缺口 ¥{delta_value:,.0f} < 1 手 ¥{limit*100:,.0f}。"
+                        f"但 1 手 ¥{lot_cost:,.0f} > 缺口 ¥{delta_value:,.0f} 的 2 倍，暂不建仓。"
                     )
-                continue
+                    continue
+                else:
+                    continue
             money = shares * limit
             action = "加仓" if held_shares.get(c, 0) > 0 else "买入"
             rebalance_orders.append({
