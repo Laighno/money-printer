@@ -82,13 +82,49 @@ def _plain(code_suffixed):
     return code_suffixed.split(".")[0]
 
 
+INIT_MARKER = os.path.join(BRIDGE_DIR, "init_marker.json")
+_last_tick = [0.0]
+
+
 def init(C):
-    C.set_account(ACCOUNT)
+    # Write the marker FIRST so we can tell "init ran" from "timer dead" when
+    # debugging from outside (2026-08-31: first paste produced an empty bridge
+    # dir — init never proved it ran).
     if not os.path.isdir(BRIDGE_DIR):
         os.makedirs(BRIDGE_DIR)
-    # timer: every 2 seconds, trading session only handled by QMT scheduling
-    C.run_time("bridge_tick", "2nSecond", "2026-08-31 09:15:00")
-    print("bridge init ok, dir=" + BRIDGE_DIR)
+    marker = {"ts": time.time(), "stage": "init-entered", "timer": None,
+              "errors": []}
+    _atomic_write(INIT_MARKER, marker)
+    try:
+        C.set_account(ACCOUNT)
+    except Exception as e:
+        marker["errors"].append("set_account: " + str(e))
+    # run_time signature differs across QMT builds; try 4-arg then 3-arg.
+    # handlebar() below is the always-works fallback driver either way.
+    try:
+        C.run_time("bridge_tick", "2nSecond", "2026-08-31 09:15:00", "SH")
+        marker["timer"] = "4arg"
+    except Exception as e1:
+        marker["errors"].append("run_time 4arg: " + str(e1))
+        try:
+            C.run_time("bridge_tick", "2nSecond", "2026-08-31 09:15:00")
+            marker["timer"] = "3arg"
+        except Exception as e2:
+            marker["errors"].append("run_time 3arg: " + str(e2))
+            marker["timer"] = "none-handlebar-only"
+    marker["stage"] = "init-done"
+    _atomic_write(INIT_MARKER, marker)
+    print("bridge init done, timer=" + str(marker["timer"]))
+
+
+def handlebar(C):
+    # Bar-driven fallback driver: fires on every bar/tick of the strategy's
+    # benchmark instrument even when run_time is unsupported. Rate-limit to
+    # one bridge pass per second.
+    now = time.time()
+    if now - _last_tick[0] >= 1.0:
+        _last_tick[0] = now
+        bridge_tick(C)
 
 
 def _snapshot(C):
