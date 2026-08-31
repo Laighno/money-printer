@@ -89,7 +89,7 @@ _last_tick = [0.0]
 def init(C):
     # Write the marker FIRST so we can tell "init ran" from "timer dead" when
     # debugging from outside (2026-08-31: first paste produced an empty bridge
-    # dir — init never proved it ran).
+    # dir -- init never proved it ran).
     if not os.path.isdir(BRIDGE_DIR):
         os.makedirs(BRIDGE_DIR)
     marker = {"ts": time.time(), "stage": "init-entered", "timer": None,
