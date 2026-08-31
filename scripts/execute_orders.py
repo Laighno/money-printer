@@ -511,7 +511,8 @@ def _run_emergency(args) -> int:
         if not args.qmt_account or not args.qmt_userdata:
             logger.error("--qmt-account and --qmt-userdata are required for live --emergency")
             return 1
-        broker = QMTBroker(
+        from mp.execution.broker_factory import make_broker
+        broker = make_broker(
             account_id=args.qmt_account,
             qmt_userdata_path=args.qmt_userdata,
         )
@@ -668,7 +669,8 @@ def main() -> int:
         if not args.qmt_account or not args.qmt_userdata:
             logger.error("--qmt-account and --qmt-userdata are required for live modes")
             return 1
-        broker = QMTBroker(
+        from mp.execution.broker_factory import make_broker
+        broker = make_broker(
             account_id=args.qmt_account,
             qmt_userdata_path=args.qmt_userdata,
         )

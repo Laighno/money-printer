@@ -196,8 +196,8 @@ def fetch_live(account_id: str, userdata: str) -> Tuple[Dict[str, int], dict, Di
 
     Raises on connect/query failure (caller maps to exit 2).
     """
-    from mp.execution.qmt_broker import QMTBroker
-    broker = QMTBroker(account_id=account_id, qmt_userdata_path=userdata)
+    from mp.execution.broker_factory import make_broker
+    broker = make_broker(account_id=account_id, qmt_userdata_path=userdata)
     if not broker.connect():
         raise RuntimeError("QMT connect returned False")
     try:

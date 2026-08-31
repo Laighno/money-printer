@@ -43,8 +43,8 @@ def fetch_qmt_snapshot_local() -> Dict[str, Any]:
     Use when running ON ECS (e.g. from scheduled task) — SSH self-loop would
     hang. Mirrors qmt_snapshot.py logic, returns dict (not stdout-marker form).
     """
-    from mp.execution.qmt_broker import QMTBroker
-    broker = QMTBroker(account_id="8886933837", qmt_userdata_path=r"C:\guojin\userdata_mini")
+    from mp.execution.broker_factory import make_broker
+    broker = make_broker(account_id="8886933837", qmt_userdata_path=r"C:\guojin\userdata_mini")
     broker.connect()
     try:
         info = broker.get_account_info()
