@@ -157,11 +157,21 @@ def _snapshot(C):
             52: "pending", 53: "cancelled", 54: "cancelled", 55: "partial",
             56: "filled", 57: "rejected"}
     for o in ord_rows:
-        side = "buy" if int(o.m_nOffsetFlag) == 48 else "sell"
+        # Direction mapping calibrated 2026-09-01 against a real SELL order that
+        # the first cut misreported as buy: m_nDirection is NOT the stock
+        # buy/sell flag (it overrode m_nOffsetFlag wrongly). Use m_nOffsetFlag
+        # as primary and carry raw values in _dbg for recalibration.
+        _off = None
+        _dir = None
         try:
-            side = "buy" if int(o.m_nDirection) == 48 else "sell"
+            _off = int(o.m_nOffsetFlag)
         except Exception:
             pass
+        try:
+            _dir = int(o.m_nDirection)
+        except Exception:
+            pass
+        side = "buy" if _off == 48 else "sell"
         orders.append({
             "order_id": str(o.m_strOrderSysID),
             "code": _plain(o.m_strInstrumentID),
@@ -172,6 +182,8 @@ def _snapshot(C):
             "status": smap.get(int(o.m_nOrderStatus), "pending"),
             "error_msg": None,
             "remark": getattr(o, "m_strRemark", ""),
+            "_dbg": {"offset_flag": _off, "direction": _dir,
+                     "opt_name": str(getattr(o, "m_strOptName", ""))},
         })
     return {"account": acct, "positions": positions, "orders": orders,
             "ts": time.time()}
