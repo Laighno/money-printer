@@ -78,6 +78,21 @@ class FileBridgeBroker:
     def disconnect(self) -> None:
         self._connected = False
 
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def emergency_liquidate_all(self, confirm_string: str,
+                                mode: str = "limit",
+                                limit_offset_pct: float = -0.5,
+                                prev_close: Optional[dict] = None):
+        """Same contract as QMTBroker: delegates to the shared duck-typed impl,
+        which only uses methods this class implements (get_positions /
+        place_limit_order / cancel_order / get_orders)."""
+        from mp.execution.qmt_broker import _emergency_liquidate_impl
+        return _emergency_liquidate_impl(
+            self, confirm_string, mode, limit_offset_pct, prev_close,
+        )
+
     def _require_connected(self) -> None:
         if not self._connected:
             raise RuntimeError("FileBridgeBroker not connected — call connect()")
