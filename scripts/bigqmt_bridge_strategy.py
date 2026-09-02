@@ -195,15 +195,24 @@ def _handle_order(C, seq, args):
     shares = int(args["shares"])
     price = float(args["limit_price"])
     remark = "mpseq" + str(seq)
+    # Record the order ids that already exist BEFORE submitting, so the pending
+    # resolver can identify our order as "the new id that appeared with matching
+    # code/action/shares" (2026-09-02: live QMT strips userOrderId/remark from
+    # order rows -- m_strRemark comes back empty -- so remark-scan cannot work).
+    try:
+        pre = _snapshot(C)
+        known_ids = [o["order_id"] for o in pre["orders"]]
+    except Exception:
+        known_ids = []
     optype = OPTYPE_BUY if action == "buy" else OPTYPE_SELL
     # passorder 11-arg form: opType, orderType, account, code, prType, price,
     # volume, strategyName, quickTrade(1), userOrderId/remark, C
     passorder(optype, ORDERBY_VOLUME, ACCOUNT, code, PRTYPE_LIMIT, price,
               shares, "money-printer", 1, remark, C)
-    # order id resolves next tick by remark scan
     pend = _load_pending()
     pend.append({"seq": seq, "remark": remark, "code": args["code"],
                  "action": action, "shares": shares, "limit_price": price,
+                 "known_ids": known_ids,
                  "submitted_ts": time.time()})
     _save_pending(pend)
 
@@ -218,8 +227,21 @@ def _resolve_pending(C, snap):
         r = o.get("remark") or ""
         if r:
             by_remark[r] = o
+
+    def _match_new(p):
+        # Fallback matcher: the new order id (not in known_ids) whose
+        # code/action/shares match what we submitted.
+        known = set(p.get("known_ids") or [])
+        for o in snap["orders"]:
+            if (o["order_id"] not in known
+                    and o["code"] == p["code"]
+                    and o["action"] == p["action"]
+                    and int(o["shares_submitted"]) == int(p["shares"])):
+                return o
+        return None
+
     for p in pend:
-        o = by_remark.get(p["remark"])
+        o = by_remark.get(p["remark"]) or _match_new(p)
         if o is not None:
             resp = {"seq": p["seq"], "ok": True, "error": None,
                     "data": {"order_id": o["order_id"], "code": p["code"],
