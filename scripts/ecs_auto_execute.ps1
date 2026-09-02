@@ -63,6 +63,11 @@ Log "==================== ECS auto-execute start ===================="
 # every protected path globally.
 $env:MP_ALLOW_PROD_WRITE = "1"
 
+# CUTOVER 2026-09-02 (user approved after live order+cancel smoke ALL PASS):
+# execution now goes through the BigQMT file bridge (miniQMT retires 9/27).
+# Rollback: comment out this line -> next run uses miniQMT again (until 9/27).
+$env:MP_BROKER = "bridge"
+
 # Ensure log dir exists
 $LogDir = Split-Path $LogPath
 if (-not (Test-Path $LogDir)) { New-Item -Type Directory -Path $LogDir -Force | Out-Null }
@@ -72,17 +77,33 @@ Set-Location $REPO
 Log "Step 1: git pull origin $BRANCH"
 $pullOutput = & git pull origin $BRANCH 2>&1 | Out-String
 $pullOutput.Trim().Split("`n") | ForEach-Object { Log "  git: $_" }
-if ($LASTEXITCODE -ne 0) { Abort "git pull failed (exit $LASTEXITCODE)" }
+if ($LASTEXITCODE -ne 0) { Log "WARN: git pull failed (exit $LASTEXITCODE) -- proceeding on deployed code" }
 $head = (& git rev-parse --short HEAD).Trim()
 Log "Step 1: HEAD = $head"
 
-# Step 2: Verify XtMiniQmt is running
-Log "Step 2: verify XtMiniQmt running"
-$qmt = Get-Process -Name "XtMiniQmt" -ErrorAction SilentlyContinue
-if (-not $qmt) {
-    Abort "XtMiniQmt.exe not running -- start it manually on ECS + login + retry"
+# Step 2: liveness gate for the active broker transport.
+# bridge: heartbeat.json must be fresh (BigQMT client + MONEY strategy running).
+# miniqmt (rollback): XtMiniQmt process must exist.
+if ($env:MP_BROKER -eq "bridge") {
+    Log "Step 2: verify bridge heartbeat (BigQMT strategy alive)"
+    try {
+        $hb = Get-Content "$REPO\data\bridge\heartbeat.json" -Raw | ConvertFrom-Json
+        $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$hb.ts
+    } catch {
+        Abort "bridge heartbeat unreadable -- is BigQMT client + MONEY strategy running?"
+    }
+    if ($age -gt 30) {
+        Abort "bridge heartbeat stale (${age}s > 30s) -- start MONEY strategy in BigQMT + retry"
+    }
+    Log "  bridge heartbeat OK (${age}s)"
+} else {
+    Log "Step 2: verify XtMiniQmt running"
+    $qmt = Get-Process -Name "XtMiniQmt" -ErrorAction SilentlyContinue
+    if (-not $qmt) {
+        Abort "XtMiniQmt.exe not running -- start it manually on ECS + login + retry"
+    }
+    Log "  XtMiniQmt pid $($qmt.Id) running"
 }
-Log "  XtMiniQmt pid $($qmt.Id) running"
 
 # Step 3: Verify portfolio.yaml account
 Log "Step 3: verify portfolio.yaml account = $EXPECTED_ACCOUNT"

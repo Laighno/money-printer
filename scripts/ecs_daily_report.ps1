@@ -39,6 +39,10 @@ Set-Location $REPO
 # workers verified to complete (inline test 7/3). Mac keeps default 8.
 $env:MP_SCORE_WORKERS = "2"
 
+# CUTOVER 2026-09-02: portfolio sync (Step 2) reads the account via the BigQMT
+# file bridge (miniQMT retires 9/27). Rollback: comment out.
+$env:MP_BROKER = "bridge"
+
 $pythonExe = "$REPO\.venv\Scripts\python.exe"
 if (-not (Test-Path $pythonExe)) { Abort "python not found: $pythonExe" }
 
