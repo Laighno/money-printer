@@ -182,6 +182,7 @@ def _snapshot(C):
             "status": smap.get(int(o.m_nOrderStatus), "pending"),
             "error_msg": None,
             "remark": getattr(o, "m_strRemark", ""),
+            "limit_price": float(getattr(o, "m_dLimitPrice", 0) or 0),
             "_dbg": {"offset_flag": _off, "direction": _dir,
                      "opt_name": str(getattr(o, "m_strOptName", ""))},
         })
@@ -230,15 +231,29 @@ def _resolve_pending(C, snap):
 
     def _match_new(p):
         # Fallback matcher: the new order id (not in known_ids) whose
-        # code/action/shares match what we submitted.
+        # code/action/shares match what we submitted. Price participates too
+        # (2026-09-02: a same-code same-size older pending order nearly
+        # confused attribution on the first live bridge trade) -- but only
+        # when the row carries a usable price field; tolerance 1 fen.
         known = set(p.get("known_ids") or [])
+        want_px = float(p.get("limit_price") or 0)
+        best = None
         for o in snap["orders"]:
-            if (o["order_id"] not in known
-                    and o["code"] == p["code"]
-                    and o["action"] == p["action"]
-                    and int(o["shares_submitted"]) == int(p["shares"])):
-                return o
-        return None
+            if (o["order_id"] in known
+                    or o["code"] != p["code"]
+                    or o["action"] != p["action"]
+                    or int(o["shares_submitted"]) != int(p["shares"])):
+                continue
+            row_px = 0.0
+            try:
+                row_px = float(o.get("limit_price") or 0)
+            except Exception:
+                pass
+            if want_px > 0 and row_px > 0 and abs(row_px - want_px) > 0.015:
+                continue
+            best = o
+            break
+        return best
 
     for p in pend:
         o = by_remark.get(p["remark"]) or _match_new(p)
