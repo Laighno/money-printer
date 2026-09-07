@@ -164,6 +164,19 @@ if [ "$first_done" = "True" ]; then
     exit 4
   fi
   echo "  ✓ swapped on ECS (cutoff $cutoff)"
+  # 2026-09-07 fix: ALSO swap Mac prod to the same candidate. The original flow
+  # only swapped ECS, so the very next weekly run failed the Step-2 parity gate
+  # (Mac stale vs ECS fresh) and EVERY subsequent retrain aborted — prod froze
+  # on cutoff 20260611 for 8 weeks before anyone noticed.
+  echo "  syncing Mac prod = candidate (keep parity for next week's Step 2) ..."
+  MP_ALLOW_PROD_WRITE=1 .venv/bin/python scripts/swap_model.py \
+    --new-prefix "$new_prefix" --prod-prefix data/blend --allow-prod-write \
+    --reason "sync Mac prod after ECS auto-swap (cutoff $cutoff)" 2>&1 | tail -2
+  if [ "${PIPESTATUS[0]}" != "0" ]; then
+    echo "  ⚠ Mac prod sync FAILED — next week's parity gate will abort; fix manually."
+    exit 5
+  fi
+  echo "  ✓ Mac prod synced"
 else
   echo "  ECS first-swap sentinel ABSENT → ②B: first swap needs MANUAL approval."
   scp -o ConnectTimeout=45 data/retrain_pending_swap.json "$ECS:$ECS_REPO/data/retrain_pending_swap.json" 2>/dev/null || true
