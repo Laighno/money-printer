@@ -83,7 +83,9 @@ while ($true) {
     try { [Microsoft.VisualBasic.Interaction]::AppActivate($p.Id) } catch { }
     Start-Sleep -Milliseconds 600
 
-    if ($wdt -ge 700 -and $wdt -le 1600 -and $hgt -ge 450 -and $hgt -le 1050) {
+    # login dialog measured 624x419 live (screenshots were scaled); accept the
+    # whole small-window band -- the main terminal is far larger than 1600 wide.
+    if ($wdt -ge 450 -and $wdt -le 1600 -and $hgt -ge 300 -and $hgt -le 1050) {
         # login dialog geometry
         $pwd = Get-TradePwd
         if ($pwd) {
