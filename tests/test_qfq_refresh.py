@@ -201,3 +201,99 @@ def test_universe_includes_holdings(tmp_path, monkeypatch):
     universe = qfq._build_universe()
     assert "999999" in universe
     assert len(universe) == 1   # board entry must be skipped (no code)
+
+
+# ---------------------------------------------------------------------------
+# Default start date: per-code earliest DB date (2026-09 fix).
+# The old fixed default 20230101 never re-anchored the ~54% of rows dated
+# before 2023, so those rows stayed at whatever qfq factor they were first
+# fetched under.
+# ---------------------------------------------------------------------------
+
+def _make_isolated_store(tmp_path, monkeypatch):
+    """Fresh SQLite under tmp_path; MP_DB_PATH + chdir so nothing touches
+    data/market.db (Rule #4.1 prod-state protection)."""
+    monkeypatch.setenv("MP_DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.chdir(tmp_path)
+    import scripts.qfq_refresh as qfq
+    importlib.reload(qfq)
+    from sqlalchemy import text
+    from mp.data.store import DataStore
+    store = DataStore()
+    with store.engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS daily_bars (
+                code TEXT, date TEXT, open REAL, high REAL, low REAL,
+                close REAL, volume REAL, amount REAL, turnover REAL,
+                PRIMARY KEY (code, date)
+            )
+        """))
+        conn.execute(text(
+            "INSERT INTO daily_bars VALUES ('300033', '2015-03-02', "
+            "1, 1, 1, 1, 1.0, 1.0, 0.01)"
+        ))
+        conn.execute(text(
+            "INSERT INTO daily_bars VALUES ('300033', '2026-04-08', "
+            "1, 1, 1, 1, 1.0, 1.0, 0.01)"
+        ))
+    return qfq, store
+
+
+def test_resolve_start_uses_earliest_db_date(tmp_path, monkeypatch):
+    qfq, store = _make_isolated_store(tmp_path, monkeypatch)
+    assert qfq._resolve_start(store, "300033") == "20150302"
+    # No rows for this code -> global floor, not 20230101
+    assert qfq._resolve_start(store, "999999") == qfq.GLOBAL_START_FLOOR == "20140101"
+    # Explicit --since wins
+    assert qfq._resolve_start(store, "300033", since="20230101") == "20230101"
+
+
+def test_refresh_qfq_default_start_is_per_code_not_2023(tmp_path, monkeypatch):
+    """refresh_qfq(start=None) must fetch each code from its earliest DB
+    date (floor 20140101), never from the old fixed 20230101."""
+    qfq, _ = _make_isolated_store(tmp_path, monkeypatch)
+
+    calls: list[tuple[str, str, str]] = []
+
+    def _fake_fetch(code, start, end):
+        calls.append((code, start, end))
+        return None   # counted as failed -> no upsert, no diff
+
+    monkeypatch.setattr(qfq, "_force_fetch_full_history", _fake_fetch)
+
+    summary = qfq.refresh_qfq(["300033", "999999"], start=None, end="20260507")
+    assert summary["total"] == 2
+    assert calls == [
+        ("300033", "20150302", "20260507"),
+        ("999999", "20140101", "20260507"),
+    ]
+    assert all(s != "20230101" for _, s, _ in calls)
+
+    # Legacy fixed start still honoured when given explicitly
+    calls.clear()
+    qfq.refresh_qfq(["300033", "999999"], start="20230101", end="20260507")
+    assert [s for _, s, _ in calls] == ["20230101", "20230101"]
+
+
+def test_cli_default_since_is_none_and_start_alias(tmp_path, monkeypatch):
+    """CLI: no flag -> start=None (per-code); --since / --start both set it."""
+    qfq, _ = _make_isolated_store(tmp_path, monkeypatch)
+
+    seen: list = []
+
+    def _fake_refresh(codes, start, end):
+        seen.append(start)
+        return {"total": 0, "processed": 0, "failed": 0, "with_changes": 0,
+                "rows_changed": 0, "biggest_delta_code": "", "biggest_delta_pct": 0.0,
+                "elapsed_seconds": 0}
+
+    monkeypatch.setattr(qfq, "refresh_qfq", _fake_refresh)
+
+    for argv, expected in [
+        (["qfq_refresh.py", "--codes", "300033"], None),
+        (["qfq_refresh.py", "--codes", "300033", "--since", "20230101"], "20230101"),
+        (["qfq_refresh.py", "--codes", "300033", "--start", "20240101"], "20240101"),
+    ]:
+        monkeypatch.setattr(sys, "argv", argv)
+        assert qfq.main() == 0
+        assert seen[-1] == expected, argv

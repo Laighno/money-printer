@@ -35,11 +35,26 @@ no other collector running, ~30-90 min runtime depending on akshare.
 Idempotent: safe to run multiple times.  Uses save_bars_upsert which
 INSERT OR REPLACE — no duplicates.
 
+Start date
+----------
+Default (no ``--since``): each code is re-pulled from **its earliest date
+already in DB** (``MIN(date) FROM daily_bars WHERE code=?``), falling back
+to ``GLOBAL_START_FLOOR`` (20140101) for codes with no rows yet.  This is
+the only way every stored row gets re-anchored to the current qfq factor —
+the old fixed default of 20230101 left ~54% of DB rows (everything before
+2023) permanently at whatever factor they were first fetched under.
+
+``--since YYYYMMDD`` (alias ``--start``) restores the legacy behaviour: a
+single fixed start for all codes.  Use it for a quick partial refresh.
+Runtime note: Sina (primary source) returns the full history regardless
+of the requested range, so the default full re-pull costs roughly the same
+per code as the old 2023-only pull; EM fallback does scale with range.
+
 Usage
 -----
-    python scripts/qfq_refresh.py                # full universe
+    python scripts/qfq_refresh.py                # full universe, per-code earliest DB date
     python scripts/qfq_refresh.py --codes 000539,300033   # specific
-    python scripts/qfq_refresh.py --start 20240101        # custom start
+    python scripts/qfq_refresh.py --since 20240101        # fixed start (legacy behaviour)
 """
 
 from __future__ import annotations
@@ -49,7 +64,7 @@ import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import pandas as pd
 import yaml
@@ -64,7 +79,31 @@ from mp.data.fetcher import (
     _with_retry,
     get_index_constituents,
 )
-from mp.data.store import DataStore, DEFAULT_DB_URL
+from mp.data.store import DataStore
+
+# Fallback start for codes with no rows in DB.  Earlier than every training
+# window in the repo (walk_forward_backtest.TRAIN_START=20160501,
+# prediction_diagnostics.TRAIN_START=20150101), so a freshly added code gets
+# full usable history on its first refresh.
+GLOBAL_START_FLOOR = "20140101"
+
+
+def _resolve_start(store: DataStore, code: str, since: Optional[str] = None) -> str:
+    """Start date (YYYYMMDD) for *code*.
+
+    ``since`` (explicit CLI value) wins.  Otherwise the earliest date stored
+    for the code, so the whole stored series is re-anchored; codes with no
+    rows fall back to :data:`GLOBAL_START_FLOOR`.
+    """
+    if since:
+        return since
+    with store.engine.connect() as conn:
+        first = conn.execute(
+            text("SELECT MIN(date) FROM daily_bars WHERE code = :c"), {"c": code}
+        ).scalar()
+    if not first:
+        return GLOBAL_START_FLOOR
+    return str(first)[:10].replace("-", "")
 
 
 def _force_fetch_full_history(code: str, start: str, end: str) -> pd.DataFrame | None:
@@ -168,12 +207,17 @@ def _count_diffs(
     return n_changed, max_change
 
 
-def refresh_qfq(codes: List[str], start: str, end: str) -> dict:
+def refresh_qfq(codes: List[str], start: Optional[str], end: str) -> dict:
     """Re-fetch full qfq history for each code and overwrite DB rows.
+
+    ``start`` = None → per-code earliest DB date (see :func:`_resolve_start`);
+    a YYYYMMDD string → that fixed start for every code (legacy ``--since``).
 
     Returns summary stats.
     """
-    store = DataStore(db_url=DEFAULT_DB_URL)
+    # No explicit URL: honours MP_DB_PATH (tests), falls back to the
+    # production default — identical prod behaviour to the old explicit arg.
+    store = DataStore()
 
     n_total = len(codes)
     n_processed = 0
@@ -183,13 +227,15 @@ def refresh_qfq(codes: List[str], start: str, end: str) -> dict:
     biggest_change = ("", 0.0)
 
     t0 = time.time()
-    logger.info("qfq_refresh: {} codes, {} → {}", n_total, start, end)
+    logger.info("qfq_refresh: {} codes, {} → {}", n_total,
+                start or f"<per-code earliest DB date, floor {GLOBAL_START_FLOOR}>", end)
 
     for i, code in enumerate(codes, 1):
         try:
+            code_start = _resolve_start(store, code, since=start)
             # Bypass get_daily_bars freshness shortcut — we WANT to re-pull
             # everything to capture qfq adjustment changes.
-            new_df = _force_fetch_full_history(code, start, end)
+            new_df = _force_fetch_full_history(code, code_start, end)
             if new_df is None or new_df.empty:
                 n_failed += 1
                 continue
@@ -244,8 +290,11 @@ def main() -> int:
         help="Comma-separated codes to refresh (default: full universe)",
     )
     parser.add_argument(
-        "--start", default="20230101",
-        help="Start date (YYYYMMDD); default 20230101 matches build_latest_features",
+        "--since", "--start", dest="since", default=None,
+        help="Fixed start date (YYYYMMDD) for ALL codes — legacy behaviour "
+             "(old default was 20230101). Default: none, i.e. each code is "
+             f"re-pulled from its earliest date in DB (floor {GLOBAL_START_FLOOR} "
+             "for codes with no rows) so every stored row gets re-anchored.",
     )
     parser.add_argument(
         "--end", default=None,
@@ -263,7 +312,7 @@ def main() -> int:
         codes = _build_universe()
 
     end = args.end or date.today().strftime("%Y%m%d")
-    summary = refresh_qfq(codes, start=args.start, end=end)
+    summary = refresh_qfq(codes, start=args.since, end=end)
 
     # Pretty-print summary
     lines = [
