@@ -7,7 +7,7 @@
 # built-in APIs (passorder / cancel / get_trade_detail_data), writes response
 # JSON. All heavy logic (models, plans, reconcile, price rules) stays external.
 #
-# PROTOCOL (all files UTF-8 JSON, atomic write = tmp then os.rename):
+# PROTOCOL (all files UTF-8 JSON, atomic write = tmp then os.replace):
 #   req_<seq>.json  : {"seq": int, "cmd": "snapshot"|"order"|"cancel", "args": {...}}
 #     order args : {"code":"600000","action":"buy"|"sell","shares":100,
 #                   "limit_price":12.34,"remark":"mp-xxxx"}
@@ -43,15 +43,20 @@ PRTYPE_LIMIT = 11
 
 
 def _atomic_write(path, obj):
+    # tmp -> flush+fsync -> os.replace. os.replace (3.3+) is MoveFileEx
+    # REPLACE_EXISTING on Windows, so the target never goes missing. The old
+    # remove()+rename() pair left a "deleted, not yet created" window that the
+    # external FileBridgeBroker.connect() heartbeat read could hit
+    # (FileNotFoundError -> false "bridge down" verdict).
     tmp = path + ".tmp"
     f = open(tmp, "w")
     try:
         f.write(json.dumps(obj))
+        f.flush()
+        os.fsync(f.fileno())
     finally:
         f.close()
-    if os.path.exists(path):
-        os.remove(path)
-    os.rename(tmp, path)
+    os.replace(tmp, path)
 
 
 def _load_pending():
@@ -218,6 +223,59 @@ def _handle_order(C, seq, args):
     _save_pending(pend)
 
 
+def _match_new(p, orders, claimed=None):
+    # Fallback matcher: the new order id (not in known_ids) whose
+    # code/action/shares match what we submitted. Price participates too
+    # (2026-09-02: a same-code same-size older pending order nearly
+    # confused attribution on the first live bridge trade) -- but only
+    # when both sides carry a usable price; tolerance 1 fen. When either
+    # side lacks a price the check degrades to "not compared" and the log
+    # line is tagged price_unchecked.
+    #
+    # Returns the single matching order row, or None when there is no
+    # candidate OR more than one (ambiguous). Ambiguity is NOT resolved by
+    # picking the first row: two pending orders with identical
+    # code/action/shares would otherwise both claim the same order_id.
+    # The caller keeps the pending entry and retries next tick; the 20s
+    # timeout in _resolve_pending still applies.
+    #
+    # claimed: set of order_ids already attributed to another pending entry
+    # in this resolve pass; those rows are skipped.
+    if claimed is None:
+        claimed = set()
+    known = set(p.get("known_ids") or [])
+    want_px = float(p.get("limit_price") or 0)
+    cands = []
+    price_unchecked = False
+    for o in orders:
+        if (o["order_id"] in known
+                or o["order_id"] in claimed
+                or o["code"] != p["code"]
+                or o["action"] != p["action"]
+                or int(o["shares_submitted"]) != int(p["shares"])):
+            continue
+        row_px = 0.0
+        try:
+            row_px = float(o.get("limit_price") or 0)
+        except Exception:
+            pass
+        if want_px > 0 and row_px > 0:
+            if abs(row_px - want_px) > 0.015:
+                continue
+        else:
+            price_unchecked = True
+        cands.append(o)
+    if len(cands) == 1:
+        return cands[0]
+    if len(cands) > 1:
+        print("bridge match ambiguous seq=%s code=%s action=%s shares=%s "
+              "candidates=%s%s" % (
+                  p.get("seq"), p["code"], p["action"], p["shares"],
+                  ",".join(str(c["order_id"]) for c in cands),
+                  " price_unchecked" if price_unchecked else ""))
+    return None
+
+
 def _resolve_pending(C, snap):
     pend = _load_pending()
     if not pend:
@@ -228,36 +286,18 @@ def _resolve_pending(C, snap):
         r = o.get("remark") or ""
         if r:
             by_remark[r] = o
-
-    def _match_new(p):
-        # Fallback matcher: the new order id (not in known_ids) whose
-        # code/action/shares match what we submitted. Price participates too
-        # (2026-09-02: a same-code same-size older pending order nearly
-        # confused attribution on the first live bridge trade) -- but only
-        # when the row carries a usable price field; tolerance 1 fen.
-        known = set(p.get("known_ids") or [])
-        want_px = float(p.get("limit_price") or 0)
-        best = None
-        for o in snap["orders"]:
-            if (o["order_id"] in known
-                    or o["code"] != p["code"]
-                    or o["action"] != p["action"]
-                    or int(o["shares_submitted"]) != int(p["shares"])):
-                continue
-            row_px = 0.0
-            try:
-                row_px = float(o.get("limit_price") or 0)
-            except Exception:
-                pass
-            if want_px > 0 and row_px > 0 and abs(row_px - want_px) > 0.015:
-                continue
-            best = o
-            break
-        return best
+    # order ids attributed in THIS pass; a later pending entry must not
+    # re-claim an id an earlier one already took.
+    claimed = set()
 
     for p in pend:
-        o = by_remark.get(p["remark"]) or _match_new(p)
+        o = by_remark.get(p["remark"])
+        if o is not None and o["order_id"] in claimed:
+            o = None
+        if o is None:
+            o = _match_new(p, snap["orders"], claimed)
         if o is not None:
+            claimed.add(o["order_id"])
             resp = {"seq": p["seq"], "ok": True, "error": None,
                     "data": {"order_id": o["order_id"], "code": p["code"],
                              "action": p["action"], "shares": p["shares"],
@@ -266,7 +306,8 @@ def _resolve_pending(C, snap):
         elif time.time() - p["submitted_ts"] > 20:
             resp = {"seq": p["seq"], "ok": False,
                     "error": "order not visible in today orders after 20s "
-                             "(likely rejected pre-exchange)", "data": None}
+                             "(likely rejected pre-exchange, or ambiguous "
+                             "match never resolved)", "data": None}
             _atomic_write(os.path.join(BRIDGE_DIR, "resp_%d.json" % p["seq"]), resp)
         else:
             remain.append(p)
