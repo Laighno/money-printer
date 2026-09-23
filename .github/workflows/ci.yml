@@ -1,0 +1,29 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (undefined names / redefinitions / syntax)
+        run: ruff check mp scripts tests --select F821,F811,E9
+
+      - name: Test
+        env:
+          # Keep any accidental DataStore() default away from a real DB path.
+          MP_DB_PATH: /tmp/mp-ci-none.db
+        run: pytest tests

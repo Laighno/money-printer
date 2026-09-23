@@ -12,7 +12,15 @@ import inspect
 import os
 import re
 
+from pathlib import Path
+
 import pytest
+
+# Production sentinel tests need the real data/market.db; skip when absent (CI).
+_MARKET_DB = Path(__file__).resolve().parent.parent / "data" / "market.db"
+_needs_market_db = pytest.mark.skipif(
+    not _MARKET_DB.exists(), reason="data/market.db not present (CI / fresh checkout)"
+)
 
 
 def test_datastore_signature_supports_optional_url():
@@ -76,6 +84,7 @@ def test_datastore_falls_back_to_default_when_no_env(monkeypatch):
     assert _resolve_db_url() == DEFAULT_DB_URL
 
 
+@_needs_market_db
 def test_no_test_pollution_in_market_db():
     """Ensure no test-only fake codes (111111-444444) leak into market.db.
 

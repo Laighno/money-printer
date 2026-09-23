@@ -93,6 +93,14 @@ _PRODUCTION_DATES = ["20260521", "20260522", "20260525"]
 def _build_cases() -> list[tuple]:
     cases: list[tuple] = []
     for i, date in enumerate(_PRODUCTION_DATES, start=1):
+        plan_path = ROOT / f"data/orders/orders_{date}.json"
+        if not plan_path.exists():
+            # Production plans are untracked local data; skip (not fail) in CI.
+            cases.append(pytest.param(
+                (i, f"production_{date}", "production", 0.0, [], []),
+                marks=pytest.mark.skip(reason=f"{plan_path.name} not present (CI / fresh checkout)"),
+            ))
+            continue
         cash, positions, orders = _load_production_plan(date)
         orders_sorted = sorted(orders, key=lambda o: 0 if o[1] == "sell" else 1)
         cases.append((i, f"production_{date}", "production", cash, positions, orders_sorted))
@@ -131,6 +139,11 @@ def _build_cases() -> list[tuple]:
 
 
 CASES = _build_cases()
+
+
+def _case_tuple(c) -> tuple:
+    """Unwrap ``pytest.param`` (skipped production cases) to the raw tuple."""
+    return c.values[0] if hasattr(c, "values") else c
 
 
 # ─── Execution + scoring ──────────────────────────────────────────
@@ -196,7 +209,7 @@ def fidelity_score(
 @pytest.mark.parametrize(
     "case",
     CASES,
-    ids=[f"{c[0]:02d}_{c[1]}" for c in CASES],
+    ids=[f"{c[0]:02d}_{c[1]}" for c in map(_case_tuple, CASES)],
 )
 def test_fidelity_case(case):
     """Rule #8 three-constraint per case (see ``docs/TODO.md::教训::#8``)."""

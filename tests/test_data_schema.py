@@ -11,7 +11,15 @@ History of bugs these tests prevent:
 from __future__ import annotations
 
 import pandas as pd
+from pathlib import Path
+
 import pytest
+
+# Production sentinel tests need the real data/market.db; skip when absent (CI).
+_MARKET_DB = Path(__file__).resolve().parent.parent / "data" / "market.db"
+_needs_market_db = pytest.mark.skipif(
+    not _MARKET_DB.exists(), reason="data/market.db not present (CI / fresh checkout)"
+)
 
 
 # ── normalize_bars: source registry enforcement ─────────────────────────────
@@ -264,6 +272,7 @@ def test_etf_fetcher_uses_normalize_bars(monkeypatch):
 
 # ── Sentinel: production DB invariants ──────────────────────────────────────
 
+@_needs_market_db
 def test_no_turnover_pollution_in_production_db():
     """Fail if any row in market.db has turnover > 1.0 — would re-trigger
     the Yue-Dianli prediction-swing bug."""
@@ -280,6 +289,7 @@ def test_no_turnover_pollution_in_production_db():
     )
 
 
+@_needs_market_db
 def test_no_amount_volume_inconsistency_in_production_db():
     """Fail if production DB has rows where amount/(volume*close) > 50,
     which is the unmistakable 100× volume unit bug signature.  Bounds

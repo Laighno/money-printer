@@ -17,7 +17,15 @@ from __future__ import annotations
 
 import os
 import pandas as pd
+from pathlib import Path
+
 import pytest
+
+# Production sentinel tests need the real data/market.db; skip when absent (CI).
+_MARKET_DB = Path(__file__).resolve().parent.parent / "data" / "market.db"
+_needs_market_db = pytest.mark.skipif(
+    not _MARKET_DB.exists(), reason="data/market.db not present (CI / fresh checkout)"
+)
 
 
 # ── Source-level normalization (fetcher) ────────────────────────────────────
@@ -140,6 +148,7 @@ def test_save_bars_upsert_passes_through_decimal_turnover(tmp_path, monkeypatch)
 
 # ── Sentinel: production DB must never contain turnover > 1.0 ───────────────
 
+@_needs_market_db
 def test_no_turnover_pollution_in_production_db():
     """Guards against silent regression — fail if any row has turnover > 1.0
     in the production market.db, which would re-trigger the prediction
