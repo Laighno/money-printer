@@ -109,11 +109,25 @@ def _format_summary(results: list[dict], mode: str = "dryrun") -> str:
     sent = sum(1 for r in results if r["status"] == "sent")
     skipped = sum(1 for r in results if r["status"] == "skipped")
     failed = sum(1 for r in results if r["status"] == "failed")
+    dup = sum(1 for r in results if r["status"] == "skipped_duplicate")
+    unknown = [r for r in results if r["status"] == "unknown_submitted"]
+    blocked = sum(1 for r in results if r["status"] == "blocked_after_unknown")
     title = "# 实盘执行汇报" if mode != "dryrun" else "# 🧪 DRYRUN — 真单未发 (预览模式)"
     lines = [
         title,
-        f"已发 {sent} / 跳过 {skipped} / 失败 {failed}",
+        f"已发 {sent} / 跳过 {skipped} / 失败 {failed}"
+        + (f" / 重复跳过 {dup}" if dup else "")
+        + (f" / **状态未知 {len(unknown)}** / 阻断 {blocked}" if unknown else ""),
     ]
+    if unknown:
+        lines.append("")
+        lines.append("> 🚨 **UNKNOWN_SUBMITTED**: 下单调用返回失败, 但复核 get_orders 发现"
+                     "同键委托已出现在券商侧 (可能是超时/回包丢失)。后续买单已全部阻断。"
+                     "请人工核对 QMT 委托列表后再决定是否补单/撤单:")
+        for r in unknown:
+            lines.append(f"> - {r['name']} ({r['code']}) {r['action']} "
+                         f"{r['shares']:,} @ ¥{r['limit_price']:.2f} "
+                         f"order_id={r.get('order_id')}")
     if mode == "dryrun":
         lines.append("")
         lines.append("> ⚠️ 这是预览模式 (execute-preview launchd 9:25 触发)。"
@@ -125,7 +139,11 @@ def _format_summary(results: list[dict], mode: str = "dryrun") -> str:
         "|---|---|---:|---:|---|---|",
     ]
     for r in results:
-        status_emoji = {"sent": "✅", "skipped": "⚪", "failed": "❌"}[r["status"]]
+        status_emoji = {
+            "sent": "✅", "skipped": "⚪", "failed": "❌",
+            "skipped_duplicate": "🔁", "unknown_submitted": "🚨",
+            "blocked_after_unknown": "⛔",
+        }.get(r["status"], "❔")
         lines.append(
             f"| {r['name']} ({r['code']}) | {r['action']} | {r['shares']:,} | "
             f"¥{r['limit_price']:.2f} | {status_emoji}{r['status']} | "
@@ -215,6 +233,64 @@ def preflight_price_drift(
 
 
 # ──────────────────────────────────────────────────────────────────
+# Idempotency helpers (2026-09-23): same-day duplicate detection
+# ──────────────────────────────────────────────────────────────────
+
+# Statuses that mean "the broker still holds / has acted on this order".
+# cancelled + rejected are terminal-without-exposure and may be re-sent.
+_ACTIVE_ORDER_STATUSES = {"pending", "partial", "filled"}
+DUP_PRICE_TOL = 0.015   # +-1.5 fen around round(limit, 2)
+
+
+def _order_key(code: str, action: str, shares: int, limit_price: float) -> tuple:
+    """Canonical key for "is this the same order": (code, action, shares, price@2dp)."""
+    return (str(code).zfill(6), action, int(shares), round(float(limit_price), 2))
+
+
+def _fetch_today_orders(broker) -> list:
+    """``broker.get_orders(only_today=True)``; brokers without the method
+    yield [] (logged). Exceptions propagate -- caller decides."""
+    fn = getattr(broker, "get_orders", None)
+    if fn is None:
+        logger.warning("broker {} has no get_orders(); idempotency check "
+                       "degraded to no-op", type(broker).__name__)
+        return []
+    return list(fn(only_today=True) or [])
+
+
+def _find_matching_order(orders, code: str, action: str, shares: int,
+                         limit_prices, *, exclude_ids=(),
+                         tol: float = DUP_PRICE_TOL):
+    """First order in ``orders`` that matches (code, action, shares) with an
+    active status and a limit within ``tol`` of ANY of ``limit_prices``.
+
+    An order whose ``limit_price`` is None (broker cannot report it) matches
+    on the first three fields only -- conservative: better to skip / block
+    than to double-send real money.
+    """
+    want_code = str(code).zfill(6)
+    prices = [round(float(x), 2) for x in limit_prices if x is not None]
+    for o in orders:
+        if getattr(o, "order_id", None) in exclude_ids:
+            continue
+        if str(getattr(o, "code", "")).zfill(6) != want_code:
+            continue
+        if getattr(o, "action", None) != action:
+            continue
+        if int(getattr(o, "shares_submitted", -1)) != int(shares):
+            continue
+        if getattr(o, "status", None) not in _ACTIVE_ORDER_STATUSES:
+            continue
+        lp = getattr(o, "limit_price", None)
+        if lp is None:
+            return o
+        lp = round(float(lp), 2)
+        if any(abs(lp - p) <= tol + 1e-9 for p in prices):
+            return o
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────
 # Main orchestration
 # ──────────────────────────────────────────────────────────────────
 
@@ -236,6 +312,25 @@ def run(
     When ``arm_b_tracker`` is non-None (typically auto-engaged for the
     14:30 OOS bucket — see ``main()``), each buy is gated by the tracker's
     daily 20,000 RMB cap (round 159 / round 161 guardrail (a)).
+
+    Live-mode safety (2026-09-23; NOT applied in ``mode="dryrun"``):
+
+    (a) Idempotency -- before the first order, ``broker.get_orders(
+        only_today=True)`` is snapshotted. A plan order whose key
+        ``(code, action, shares, round(limit, 2))`` already exists as an
+        active (pending/partial/filled) same-day order is NOT re-sent and is
+        recorded as ``status="skipped_duplicate"``. Guards against a re-run
+        of the same plan (task retry, manual re-invoke) doubling exposure.
+        If the snapshot itself cannot be fetched the run aborts (PREFLIGHT
+        failed) -- we cannot prove we are not duplicating.
+
+    (b) Timeout re-check -- when ``place_limit_order`` reports failure, the
+        broker is re-queried; if a NEW order with the same key now exists
+        the submission is deemed to have gone through despite the error
+        (timeout / lost ack) -> ``status="unknown_submitted"`` with its
+        order_id, and every subsequent BUY is refused as
+        ``status="blocked_after_unknown"`` (sells still run: they reduce
+        exposure). ``main()`` exits non-zero so the PS1 wrapper alerts.
     """
     orders = plan.get("orders", [])
     if not orders:
@@ -289,6 +384,29 @@ def run(
 
     results: list[dict] = []
 
+    # (a) same-day order snapshot for idempotency; live modes only.
+    live_guard = mode != "dryrun"
+    existing_orders: list = []
+    known_order_ids: set = set()
+    if live_guard:
+        try:
+            existing_orders = _fetch_today_orders(broker)
+        except Exception as e:
+            msg = (f"get_orders(only_today=True) failed: {e!r}; cannot verify "
+                   f"idempotency -- aborting before any order is sent")
+            logger.error("Pre-flight failed — {}", msg)
+            return [{"status": "failed", "note": msg, "code": "-",
+                      "name": "PREFLIGHT", "action": "-", "shares": 0,
+                      "limit_price": 0}]
+        known_order_ids = {str(getattr(o, "order_id", "")) for o in existing_orders}
+        n_active = sum(1 for o in existing_orders
+                       if getattr(o, "status", None) in _ACTIVE_ORDER_STATUSES)
+        logger.info("Idempotency snapshot: {} same-day orders on broker "
+                    "({} active)", len(existing_orders), n_active)
+
+    # (b) once a submission is in an unknown state, refuse further buys.
+    state = {"unknown_submitted": False}
+
     def _run_one(o, idx, total):
         code, action, shares, limit = (
             o["code"],
@@ -296,9 +414,20 @@ def run(
             int(o["shares"]),
             float(o["limit_price"]),
         )
+        plan_limit = limit
         name = o.get("name", code)
         logger.info("--- [{}/{}] {} {} {} 股 @ ¥{:.2f} ---",
                     idx, total, action.upper(), code, shares, limit)
+
+        if live_guard and state["unknown_submitted"] and action == "buy":
+            msg = ("blocked: an earlier submission is in UNKNOWN state "
+                   "(see unknown_submitted); refusing further buys until "
+                   "the broker order list is reconciled by a human")
+            logger.error("BLOCK {}: {}", code, msg)
+            results.append({"status": "blocked_after_unknown", "code": code,
+                             "name": name, "action": action, "shares": shares,
+                             "limit_price": limit, "note": msg})
+            return
 
         # Price drift gate (also returns cur_price used below for re-price + cash check)
         ok, msg, cur_price = preflight_price_drift(code, limit, action, price_drift_pct)
@@ -356,6 +485,26 @@ def run(
             limit = math.floor(limit * 100 + 1e-9) / 100
         else:
             limit = math.ceil(limit * 100 - 1e-9) / 100
+
+        # (a) Idempotency: same key already active on the broker today?
+        # Match against both the plan limit and the re-priced limit -- a
+        # previous run may have re-priced against a slightly different live
+        # price, and either variant means "this order already went out".
+        if live_guard:
+            dup = _find_matching_order(existing_orders, code, action, shares,
+                                       (plan_limit, limit))
+            if dup is not None:
+                msg = (f"duplicate of same-day order id={dup.order_id} "
+                       f"status={dup.status} limit=" +
+                       (f"¥{dup.limit_price:.2f}" if dup.limit_price is not None
+                        else "n/a") +
+                       f" (key {_order_key(code, action, shares, limit)}); not re-sent")
+                logger.warning("SKIP-DUP {}: {}", code, msg)
+                results.append({"status": "skipped_duplicate", "code": code,
+                                 "name": name, "action": action,
+                                 "shares": shares, "limit_price": limit,
+                                 "order_id": dup.order_id, "note": msg})
+                return
 
         # Concentration check for buys: would this push code past single-cap?
         if action == "buy":
@@ -430,9 +579,52 @@ def run(
                              "note": f"current ¥{cur_price:.2f}" if cur_price else ""})
         else:
             logger.error("  ❌ {}", result.error)
-            results.append({"status": "failed", "code": code, "name": name,
-                             "action": action, "shares": shares,
-                             "limit_price": limit, "note": result.error or "?"})
+            ghost = None
+            if live_guard:
+                # (b) Did the order actually reach the broker despite the
+                # error (timeout / lost ack)? Re-query and look for a NEW
+                # same-key order that was not in the pre-run snapshot.
+                if fill_wait_seconds > 0:
+                    time.sleep(fill_wait_seconds)
+                try:
+                    now_orders = _fetch_today_orders(broker)
+                except Exception as e:
+                    # Cannot prove it did NOT go through -> treat as unknown.
+                    logger.error("re-check get_orders failed after order "
+                                 "error: {!r}; treating submission as UNKNOWN", e)
+                    ghost = "recheck_failed"
+                else:
+                    ghost = _find_matching_order(now_orders, code, action, shares,
+                                                 (plan_limit, limit),
+                                                 exclude_ids=known_order_ids)
+            if ghost is not None:
+                oid = None if ghost == "recheck_failed" else ghost.order_id
+                msg = (f"place_limit_order returned error ({result.error or '?'}) "
+                       f"BUT " +
+                       ("the broker order list could not be re-queried"
+                        if ghost == "recheck_failed" else
+                        f"a same-key order id={oid} status={ghost.status} "
+                        f"now exists on the broker") +
+                       "; submission state UNKNOWN -- subsequent buys blocked")
+                logger.critical("UNKNOWN_SUBMITTED {}: {}", code, msg)
+                state["unknown_submitted"] = True
+                if oid is not None:
+                    known_order_ids.add(str(oid))
+                    if arm_b_tracker is not None and action == "buy":
+                        try:
+                            arm_b_tracker.commit_buy(code, shares, limit,
+                                                      order_id=str(oid))
+                        except ValueError as e:
+                            logger.error("Arm B commit failed for unknown-"
+                                         "submitted order: {}", e)
+                results.append({"status": "unknown_submitted", "code": code,
+                                 "name": name, "action": action,
+                                 "shares": shares, "limit_price": limit,
+                                 "order_id": oid, "note": msg})
+            else:
+                results.append({"status": "failed", "code": code, "name": name,
+                                 "action": action, "shares": shares,
+                                 "limit_price": limit, "note": result.error or "?"})
 
         # Brief pause to let broker register state
         if mode != "dryrun" and fill_wait_seconds > 0:
@@ -737,7 +929,21 @@ def main() -> int:
 
     if broker.is_connected():
         broker.disconnect()
+
+    n_unknown = sum(1 for r in results if r.get("status") == "unknown_submitted")
+    if n_unknown:
+        logger.critical(
+            "{} order(s) in UNKNOWN_SUBMITTED state -- exiting 12 so the "
+            "scheduled-task wrapper raises the alarm. Reconcile the broker "
+            "order list by hand before the next run.", n_unknown,
+        )
+        return EXIT_UNKNOWN_SUBMITTED
     return 0
+
+
+# Exit code for main() when any order ended in unknown_submitted state.
+# Distinct from 1 (arg/plan errors), 4 (frozen), 11 (non-prod plan).
+EXIT_UNKNOWN_SUBMITTED = 12
 
 
 if __name__ == "__main__":

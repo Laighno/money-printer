@@ -155,6 +155,7 @@ class DryRunBroker:
             shares_filled=shares if self.autofill else 0,
             avg_fill_price=limit_price if self.autofill else 0.0,
             status=status,
+            limit_price=float(limit_price),
         ))
 
         # If autofill, mutate account/positions to reflect "fill"

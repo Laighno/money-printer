@@ -103,6 +103,9 @@ class OrderStatus:
     avg_fill_price: float
     status: Literal["pending", "partial", "filled", "cancelled", "rejected"]
     error_msg: Optional[str] = None
+    # Submitted limit price (idempotency key in execute_orders.run; 2026-09-23).
+    # None when the broker cannot report it -> matched as wildcard.
+    limit_price: Optional[float] = None
 
 
 @dataclass
@@ -484,6 +487,7 @@ class QMTBroker:
                 avg_fill_price=float(o.traded_price) if o.traded_volume else 0.0,
                 status=_status_map.get(int(o.order_status), "pending"),
                 error_msg=getattr(o, "status_msg", None),
+                limit_price=float(getattr(o, "price", 0) or 0) or None,
             ))
         return out
 

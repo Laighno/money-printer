@@ -220,6 +220,7 @@ class QMTMockBroker(DryRunBroker):
             shares_filled=0,
             avg_fill_price=0.0,
             status="pending",
+            limit_price=float(limit_price),
         ))
 
         fill_plan = self._build_fill_plan(code, shares)
@@ -415,6 +416,7 @@ class QMTMockBroker(DryRunBroker):
             shares_submitted=shares, shares_filled=0,
             avg_fill_price=0.0,
             status="rejected", error_msg=reason,
+            limit_price=float(limit_price),
         ))
         logger.warning(
             "[QMT-MOCK] REJECT {} {} {} @ ¥{:.2f}: {}",
