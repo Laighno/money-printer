@@ -61,7 +61,19 @@ def main() -> int:
               f"(常见原因:客户端夜间自动重启后策略未能继续运行)")
         return 0
     sys.stdout.write(f"[bridge_hb] OK age={age:.1f}s\n")
+    _prune()
     return 0
+
+
+def _prune() -> None:
+    """Housekeeping: drop done_req_*/resp_* older than 24h (audit M3). Lazy
+    import + broad except so housekeeping can never break the alert path."""
+    try:
+        from mp.execution.bridge_broker import prune_bridge_dir
+        n = prune_bridge_dir(HB.parent, max_age_hours=24.0)
+        sys.stdout.write(f"[bridge_hb] pruned {n} stale bridge files\n")
+    except Exception as e:  # noqa: BLE001
+        sys.stdout.write(f"[bridge_hb] prune skipped: {e}\n")
 
 
 if __name__ == "__main__":

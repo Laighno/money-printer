@@ -70,6 +70,40 @@ def _read_json_retry(path: Path, what: str,
     return None
 
 
+def prune_bridge_dir(bridge_dir: Path, max_age_hours: float = 24.0) -> int:
+    """Delete processed request archives and orphaned responses older than
+    ``max_age_hours`` from the bridge directory. Returns the number removed.
+
+    The strategy renames every handled ``req_<seq>.json`` to
+    ``done_req_<seq>.json`` (audit trail only; nothing reads them back) and
+    ``resp_<seq>.json`` is normally unlinked by ``_rpc`` within seconds, so
+    anything a day old is dead weight. ``bridge_tick`` does ``os.listdir``
+    every 2 s, so an unbounded directory slowly degrades the strategy
+    (2026-09-23: 309 files after 3 weeks). heartbeat / init_marker /
+    _pending_orders are never touched.
+    """
+    cutoff = time.time() - max_age_hours * 3600.0
+    removed = 0
+    try:
+        entries = list(Path(bridge_dir).iterdir())
+    except OSError as e:
+        logger.warning("prune_bridge_dir: cannot list {}: {}", bridge_dir, e)
+        return 0
+    for p in entries:
+        name = p.name
+        if not (name.startswith("done_req_") or name.startswith("resp_")) or not name.endswith(".json"):
+            continue
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except OSError as e:
+            logger.debug("prune_bridge_dir: skip {} ({})", name, e)
+    if removed:
+        logger.info("prune_bridge_dir: removed {} stale bridge files from {}", removed, bridge_dir)
+    return removed
+
+
 class FileBridgeBroker:
     """Drop-in replacement for QMTBroker over the BigQMT file bridge."""
 

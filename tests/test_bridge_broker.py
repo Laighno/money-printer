@@ -120,3 +120,20 @@ def test_rpc_timeout(tmp_path, fast_retry):
     assert b.connect()
     with pytest.raises(TimeoutError):
         b._rpc("snapshot", timeout=0.1)
+
+
+def test_prune_bridge_dir_removes_only_stale_archives(tmp_path):
+    import os
+    import time as _t
+    from mp.execution.bridge_broker import prune_bridge_dir
+    old = _t.time() - 30 * 3600
+    for name in ["done_req_1.json", "resp_1.json", "done_req_2.json", "resp_2.json",
+                 "heartbeat.json", "init_marker.json", "_pending_orders.json", "req_3.json"]:
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    for name in ["done_req_1.json", "resp_1.json", "heartbeat.json", "_pending_orders.json"]:
+        os.utime(tmp_path / name, (old, old))
+    removed = prune_bridge_dir(tmp_path, max_age_hours=24.0)
+    assert removed == 2
+    remaining = sorted(p.name for p in tmp_path.iterdir())
+    assert remaining == sorted(["done_req_2.json", "resp_2.json", "heartbeat.json",
+                                "init_marker.json", "_pending_orders.json", "req_3.json"])
