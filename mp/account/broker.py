@@ -318,3 +318,123 @@ class SimulatedBroker:
                 "entry_date": pos.entry_date,
             })
         return pd.DataFrame(rows)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# A-share price-limit / suspension fill rules (2026-09-23 limit-lock)
+# ──────────────────────────────────────────────────────────────────────
+# Pure helpers shared by backtests. A Top-K momentum picker frequently
+# selects names that open 一字涨停 next day; assuming 100% fills there
+# systematically overstates returns. ``fill_blocked`` says whether a
+# buy/sell at the modelled fill time could actually have been filled.
+
+from decimal import Decimal, ROUND_HALF_UP  # noqa: E402
+
+# 创业板 20% band started with the registration reform on 2020-08-24
+# (10% before). 科创板 (688/689) has been 20% since inception (2019-07-22).
+CHINEXT_20PCT_START = "2020-08-24"
+STAR_20PCT_START = "2019-07-22"
+
+LIMIT_PCT_MAIN = 0.10
+LIMIT_PCT_GROWTH = 0.20
+LIMIT_PCT_ST = 0.05
+
+
+def board_of(code: str) -> str:
+    """Map a 6-digit A-share code to its board: main / chinext / star / bse."""
+    c = str(code).zfill(6)
+    if c.startswith(("300", "301", "302")):
+        return "chinext"
+    if c.startswith(("688", "689")):
+        return "star"
+    if c.startswith(("4", "8", "92")):
+        return "bse"
+    return "main"
+
+
+def limit_pct(board: str, dt=None, *, is_st: bool = False) -> float | None:
+    """Daily price-limit band for ``board`` on date ``dt`` (None = latest).
+
+    Returns None for boards we deliberately do not model (北交所 30%, not in
+    the ZZ500/HS300 universe) — callers then skip the limit check.
+    ``is_st`` (5%) is only honoured when the caller has an ST flag; the
+    walk-forward bars carry no ST marker so it defaults to False.
+    """
+    d = None if dt is None else str(pd.Timestamp(dt).date())
+    if board == "bse":
+        return None
+    if board == "star":
+        return LIMIT_PCT_GROWTH if (d is None or d >= STAR_20PCT_START) else LIMIT_PCT_MAIN
+    if board == "chinext":
+        if d is None or d >= CHINEXT_20PCT_START:
+            return LIMIT_PCT_GROWTH
+        return LIMIT_PCT_ST if is_st else LIMIT_PCT_MAIN
+    return LIMIT_PCT_ST if is_st else LIMIT_PCT_MAIN
+
+
+def round_cent(x: float) -> float:
+    """Round to 分 with 四舍五入 (exchange convention), immune to binary
+    float artefacts such as 9.99 * 1.1 == 10.989000000000001."""
+    return float(Decimal(repr(float(x) + 1e-9)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def fill_blocked(action: str, bar, prev_close: float | None, *,
+                 board: str = "main", dt=None, price: float | None = None,
+                 strict: bool = False, is_st: bool = False,
+                 tol_cents: int = 1) -> str | None:
+    """Return why a fill is impossible, or None when it can fill.
+
+    Parameters
+    ----------
+    action : "buy" | "sell"
+    bar : mapping with open/high/low (and optionally volume) for the fill
+        day, or None when the day's bar is missing (= suspended).
+    prev_close : previous trading day's close (limit reference). None →
+        limit check skipped (only the suspension check applies).
+    board : from :func:`board_of`; drives the band via :func:`limit_pct`.
+    dt : fill date, for the 创业板 10%→20% regime switch.
+    price : the modelled fill price. Defaults to ``bar["open"]`` (T+1 open
+        entry). Pass the 14:29 close for ENTRY_TIME=14_30.
+    strict : when True, a fill price AT the limit is blocked outright
+        (LIMIT_STRICT=1). When False, "open at limit but the day traded a
+        range (high > low)" is treated as fillable — only a 一字板
+        (high == low) blocks.
+    tol_cents : the cached bars are 前复权 and re-rounded to 分, so the
+        reconstructed limit price can be off by one tick; a price within
+        ``tol_cents`` of the band counts as at-limit.
+
+    Returns "suspended" | "limit_up" | "limit_down" | None.
+    """
+    if action not in ("buy", "sell"):
+        raise ValueError(f"action must be buy/sell, got {action!r}")
+    if bar is None:
+        return "suspended"
+    vol = bar.get("volume") if hasattr(bar, "get") else None
+    if vol is not None and not pd.isna(vol) and float(vol) <= 0:
+        return "suspended"
+    if price is None:
+        price = bar.get("open") if hasattr(bar, "get") else None
+    if price is None or pd.isna(price) or float(price) <= 0:
+        return "suspended"
+    if prev_close is None or pd.isna(prev_close) or float(prev_close) <= 0:
+        return None
+    pct = limit_pct(board, dt, is_st=is_st)
+    if pct is None:
+        return None
+
+    p = round_cent(price)
+    hi = bar.get("high", None)
+    lo = bar.get("low", None)
+    one_word = (hi is not None and lo is not None and not pd.isna(hi) and not pd.isna(lo)
+                and round_cent(hi) == round_cent(lo))
+    tol = tol_cents / 100.0 + 1e-9
+
+    if action == "buy":
+        up = round_cent(float(prev_close) * (1.0 + pct))
+        if p >= up - tol and (strict or one_word):
+            return "limit_up"
+        return None
+    down = round_cent(float(prev_close) * (1.0 - pct))
+    if p <= down + tol and (strict or one_word):
+        return "limit_down"
+    return None

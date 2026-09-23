@@ -50,7 +50,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
         "See P7-3 docs/dialog/ rounds 50-51 + rule #7 in docs/TODO.md.\n"
     )
 
-from mp.account.broker import FeeSchedule, SimulatedBroker
+from mp.account.broker import FeeSchedule, SimulatedBroker, board_of, fill_blocked
 from mp.backtest.engine import calc_performance
 from mp.backtest.ml_backtest import _build_factor_panel, _prefetch_bars
 from mp.data.fetcher import get_daily_bars, get_index_constituents, get_index_constituents_at
@@ -198,6 +198,22 @@ INTRADAY_DIR = os.environ.get("INTRADAY_DIR", "data/intraday_1m")
 # Only affects ENTRY_TIME=14_30; baseline + ③(t_plus_1_open) are untouched.
 INTRADAY_NEXT_DAY = os.environ.get("INTRADAY_NEXT_DAY", "0") == "1"
 SAME_DAY_14_30 = (ENTRY_TIME == "14_30") and not INTRADAY_NEXT_DAY
+
+# 2026-09-23 limit-lock: model 涨跌停 / 停牌 non-fills (see mp.account.broker
+# .fill_blocked). LIMIT_LOCK=1 (default) blocks buys of 一字涨停 names and
+# sells of 一字跌停 names at the modelled fill time, and blocks both sides
+# when the day's bar is missing / volume==0 (suspended). LIMIT_LOCK=0
+# restores the legacy 100%-fill behaviour for A/B.
+#   LIMIT_STRICT=1: "fill price AT the limit" blocks regardless of intraday
+#     range (default 0: only 一字板 high==low blocks; open-at-limit with a
+#     traded range is treated as fillable). ENTRY_TIME=14_30 always uses
+#     strict semantics (a name pinned at the limit at 14:29 is sealed).
+#   LIMIT_LOCK_MAX_SUSPEND_DAYS: after this many consecutive suspended days
+#     a blocked sell falls back to the legacy stale-price liquidation, so a
+#     delisted / dropped-from-cache name cannot become a zombie holding.
+LIMIT_LOCK = os.environ.get("LIMIT_LOCK", "1") == "1"
+LIMIT_STRICT = os.environ.get("LIMIT_STRICT", "0") == "1"
+LIMIT_LOCK_MAX_SUSPEND_DAYS = int(os.environ.get("LIMIT_LOCK_MAX_SUSPEND_DAYS", "20"))
 
 # P11-4 Phase C (round 91): INTRADAY_HYBRID enables hybrid feature compute
 # when RANKER_KIND=intraday_blend. 1 → 2025-09+ dates use real intraday
@@ -670,6 +686,47 @@ def _build_price_adv_lookup(
     return close_lk, open_lk, adv_lk
 
 
+def _build_bar_lookup(bars_map: Dict[str, pd.DataFrame]) -> Dict[tuple, tuple]:
+    """(code, date) -> (open, high, low, volume, prev_close) for limit-lock.
+
+    prev_close is the previous ROW's close for that code (bars are already
+    per-code sorted); a missing (code, date) key means no bar that day —
+    i.e. suspended / not yet listed / delisted.
+    """
+    bar_lk: Dict[tuple, tuple] = {}
+    for code, df in bars_map.items():
+        df = df.sort_values("date").reset_index(drop=True)
+        vol = df["volume"].to_numpy(float) if "volume" in df.columns else np.full(len(df), np.nan)
+        prev_close = df["close"].shift(1).to_numpy(float)
+        for d, o, h, l, v, pc in zip(df["date"], df["open"].to_numpy(float),
+                                     df["high"].to_numpy(float), df["low"].to_numpy(float),
+                                     vol, prev_close):
+            bar_lk[(code, d)] = (o, h, l, v, pc)
+    return bar_lk
+
+
+def _trade_cost_stats(trade_log: List[dict], nav_df: pd.DataFrame,
+                      initial_capital: float, final_value: float) -> Dict[str, float]:
+    """Audit M6: annualised one-way turnover and total friction vs final NAV.
+
+    turnover_annual = (Σ|buy notional| + Σ|sell notional|) / 2 / mean equity
+                      × 252 / n_days
+    friction_pct_of_final_nav = Σ trade["total_friction"] / final equity
+    """
+    n_days = int(len(nav_df)) if nav_df is not None else 0
+    gross = float(sum(abs(float(t.get("shares", 0)) * float(t.get("price", 0.0)))
+                      for t in trade_log))
+    friction = float(sum(float(t.get("total_friction", 0.0) or 0.0) for t in trade_log))
+    if n_days > 0 and nav_df is not None and "nav" in nav_df.columns:
+        avg_equity = float(initial_capital) * float(nav_df["nav"].mean())
+    else:
+        avg_equity = float(initial_capital)
+    turnover_annual = (gross / 2.0 / avg_equity * 252.0 / n_days) if (n_days > 0 and avg_equity > 0) else float("nan")
+    friction_pct = friction / final_value if final_value > 0 else float("nan")
+    return {"turnover_annual": turnover_annual, "friction_total": friction,
+            "friction_pct_of_final_nav": friction_pct, "gross_traded": gross}
+
+
 def _build_entry_lk_14_30(close_lk: Dict[tuple, float]) -> Dict[tuple, float]:
     """P11-4 Phase C: per (code, date) lookup for T 14:30 entry price.
 
@@ -1077,6 +1134,63 @@ def run_walk_forward():
                     "SAME-DAY D 14:30 (decision ≤14:29 → fill D 14:29-close)"
                     if SAME_DAY_14_30 else "legacy NEXT-DAY D+1 14:30 (INTRADAY_NEXT_DAY=1)")
 
+    # 2026-09-23 limit-lock: 涨跌停 / 停牌 fill blocking at the modelled fill
+    # time. bar_lk is only built when enabled (LIMIT_LOCK=0 → _fill_block is a
+    # no-op and every code path below reduces to the legacy behaviour).
+    bar_lk: Dict[tuple, tuple] = _build_bar_lookup(bars_map) if LIMIT_LOCK else {}
+    lock_stats: Dict[str, int] = {
+        "buy_attempts": 0, "blocked_buys": 0, "blocked_buys_limit_up": 0,
+        "blocked_buys_suspended": 0, "blocked_topups": 0,
+        "sell_attempts": 0, "blocked_sells": 0, "blocked_sells_limit_down": 0,
+        "blocked_sells_suspended": 0, "forced_sells_after_suspend": 0,
+    }
+    suspend_days: Dict[str, int] = {}  # consecutive suspended-blocked sell days per code
+
+    def _fill_block(action: str, code: str, dt) -> Optional[str]:
+        """None when fillable; else 'limit_up' / 'limit_down' / 'suspended'."""
+        if not LIMIT_LOCK:
+            return None
+        b = bar_lk.get((code, dt))
+        if b is None:
+            return "suspended"
+        o, h, l, v, pc = b
+        bar = {"open": o, "high": h, "low": l, "volume": v}
+        if ENTRY_TIME == "14_30":
+            # fill = 14:29 close (or T close fallback): pinned at the limit
+            # at 14:29 ⇒ sealed, so strict semantics irrespective of LIMIT_STRICT.
+            return fill_blocked(action, bar, pc, board=board_of(code), dt=dt,
+                                price=_entry_price(code, dt), strict=True)
+        return fill_blocked(action, bar, pc, board=board_of(code), dt=dt,
+                            strict=LIMIT_STRICT)
+
+    def _sell_blocked(code: str, dt) -> bool:
+        """Sell-side gate with counters. Suspended names are held until they
+        trade again, but after LIMIT_LOCK_MAX_SUSPEND_DAYS consecutive blocked
+        days the legacy stale-price liquidation is allowed (delist guard)."""
+        lock_stats["sell_attempts"] += 1
+        reason = _fill_block("sell", code, dt)
+        if reason is None:
+            suspend_days.pop(code, None)
+            return False
+        if reason == "suspended":
+            suspend_days[code] = suspend_days.get(code, 0) + 1
+            if suspend_days[code] > LIMIT_LOCK_MAX_SUSPEND_DAYS:
+                lock_stats["forced_sells_after_suspend"] += 1
+                suspend_days.pop(code, None)
+                return False
+            lock_stats["blocked_sells_suspended"] += 1
+        else:
+            lock_stats["blocked_sells_limit_down"] += 1
+        lock_stats["blocked_sells"] += 1
+        return True
+
+    if LIMIT_LOCK:
+        logger.info("LIMIT_LOCK=1 — 涨跌停/停牌 fill blocking ON (strict={}, "
+                    "max_suspend_days={}, bar_lk={} rows)",
+                    LIMIT_STRICT or ENTRY_TIME == "14_30", LIMIT_LOCK_MAX_SUSPEND_DAYS, len(bar_lk))
+    else:
+        logger.info("LIMIT_LOCK=0 — legacy 100%-fill behaviour (A/B baseline)")
+
     # All trading dates in the BT window
     bt_start_ts = pd.Timestamp(BT_START)
     bt_end_ts = pd.Timestamp(BT_END)
@@ -1407,6 +1521,8 @@ def run_walk_forward():
                 if px is None or pd.isna(px) or px <= 0:
                     continue
                 if (px - pos.avg_cost) / pos.avg_cost <= sl_thresh:
+                    if _sell_blocked(code, dt):
+                        continue  # 跌停封板 / 停牌: cannot exit today, retry tomorrow
                     broker.sell(code, px, date=dt_str_sl, action="SELL (stoploss)",
                                 adv=adv_lk.get((code, dt)))
 
@@ -1453,6 +1569,8 @@ def run_walk_forward():
                         if excess > target_per_stock * 0.01:  # >1pp over target
                             sell_shares = int(excess / price_raw)
                             if sell_shares > 0:
+                                if _sell_blocked(code, dt):
+                                    continue  # 跌停封板: trim deferred
                                 broker.sell(code, price_raw, shares=sell_shares,
                                             date=dt_str, action="SELL (drift)",
                                             adv=adv_lk.get((code, dt)))
@@ -1460,6 +1578,11 @@ def run_walk_forward():
                 # (b) Sell positions not in new selection at today's open
                 for code in list(broker.positions.keys()):
                     if code not in sel_codes:
+                        if _sell_blocked(code, dt):
+                            # 跌停封板 / 停牌: keep holding. Tomorrow the name is
+                            # still held-but-unselected ⇒ selection_changed ⇒
+                            # this loop retries the exit at the next fill time.
+                            continue
                         sell_price = _entry_price(code, dt) or broker.positions[code].current_price
                         broker.sell(code, sell_price, date=dt_str,
                                     adv=adv_lk.get((code, dt)))
@@ -1473,6 +1596,20 @@ def run_walk_forward():
                     raw_scores=pending_raw_scores,
                 )
                 for code, score in pending_selection:
+                    is_new = code not in broker.positions
+                    if is_new:
+                        lock_stats["buy_attempts"] += 1
+                    block_reason = _fill_block("buy", code, dt)
+                    if block_reason is not None:
+                        # 涨停封板 / 停牌: skip this name for today. Cash is NOT
+                        # redistributed to the other picks (conservative).
+                        if is_new:
+                            lock_stats["blocked_buys"] += 1
+                            lock_stats["blocked_buys_limit_up" if block_reason == "limit_up"
+                                       else "blocked_buys_suspended"] += 1
+                        else:
+                            lock_stats["blocked_topups"] += 1
+                        continue
                     price_raw = _entry_price(code, dt)
                     if price_raw is None or pd.isna(price_raw) or price_raw <= 0:
                         continue
@@ -1543,6 +1680,38 @@ def run_walk_forward():
     metrics["selected_topk_alpha"] = tail_q["selected_topk_fwd_mean"]
     metrics["topk_alpha_capture_rate"] = tail_q["alpha_capture_rate"]
     metrics["tail_q_n_days"] = tail_q["n_days"]
+
+    # 2026-09-23 limit-lock fill stats + audit M6 turnover / friction.
+    _lock_mode = ("off" if not LIMIT_LOCK
+                  else "on(strict)" if (LIMIT_STRICT or ENTRY_TIME == "14_30") else "on")
+    metrics["limit_lock"] = _lock_mode
+    metrics["blocked_buys"] = lock_stats["blocked_buys"]
+    metrics["buy_attempts"] = lock_stats["buy_attempts"]
+    metrics["blocked_buy_ratio"] = (
+        f"{lock_stats['blocked_buys'] / lock_stats['buy_attempts']:.2%}"
+        if lock_stats["buy_attempts"] > 0 else "n/a")
+    metrics["blocked_buys_limit_up"] = lock_stats["blocked_buys_limit_up"]
+    metrics["blocked_buys_suspended"] = lock_stats["blocked_buys_suspended"]
+    metrics["blocked_topups"] = lock_stats["blocked_topups"]
+    metrics["blocked_sells"] = lock_stats["blocked_sells"]
+    metrics["blocked_sells_limit_down"] = lock_stats["blocked_sells_limit_down"]
+    metrics["blocked_sells_suspended"] = lock_stats["blocked_sells_suspended"]
+    metrics["forced_sells_after_suspend"] = lock_stats["forced_sells_after_suspend"]
+    _cost = _trade_cost_stats(broker.trade_log, nav_df, INITIAL_CAPITAL, broker.total_value)
+    metrics["turnover_annual"] = f"{_cost['turnover_annual']:.2f}x"
+    metrics["friction_total"] = f"{_cost['friction_total']:,.0f}"
+    metrics["friction_pct_of_final_nav"] = f"{_cost['friction_pct_of_final_nav']:.2%}"
+    logger.info("Limit-lock [{}]: blocked_buys={}/{} ({}) [limit_up={}, suspended={}], "
+                "blocked_topups={}, blocked_sells={} [limit_down={}, suspended={}], "
+                "forced_sells_after_suspend={}",
+                _lock_mode, lock_stats["blocked_buys"], lock_stats["buy_attempts"],
+                metrics["blocked_buy_ratio"], lock_stats["blocked_buys_limit_up"],
+                lock_stats["blocked_buys_suspended"], lock_stats["blocked_topups"],
+                lock_stats["blocked_sells"], lock_stats["blocked_sells_limit_down"],
+                lock_stats["blocked_sells_suspended"], lock_stats["forced_sells_after_suspend"])
+    logger.info("Turnover annual (one-way) = {:.2f}x | friction total = {:,.0f} "
+                "({:.2%} of final NAV)", _cost["turnover_annual"], _cost["friction_total"],
+                _cost["friction_pct_of_final_nav"])
     logger.info("Tail quality ({} days @ K={}):  Hit Rate={:.1%}  NDCG={:.3f}  "
                 "Selected alpha={:.3%}  Realistic top-K alpha={:.3%}  Capture={:.1%}",
                 tail_q["n_days"], TOP_K, tail_q["hit_rate"], tail_q["ndcg"],

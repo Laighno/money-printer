@@ -270,6 +270,18 @@ def _limit_locked(price: float, prev_close: Optional[float],
     direction ∈ {'buy', 'sell'}:
       - 'buy' blocked if price ≥ prev_close × (1 + threshold)  (limit-up封板)
       - 'sell' blocked if price ≤ prev_close × (1 - threshold) (limit-down封板)
+
+    NOTE (2026-09-23): the main walk-forward now uses the shared
+    ``mp.account.broker.fill_blocked`` instead. It is deliberately NOT wired
+    in here because the semantics differ and this arm's A/B history would
+    shift: this helper (a) is price-only / strict (no 一字板 high==low test),
+    (b) uses a flat 9.95% fuzz threshold for every board (创业板/科创板 20%
+    names are therefore over-blocked at +10%), (c) does no 分-rounding, so a
+    limit price that rounds DOWN (e.g. 3.54 → 3.89 = +9.89%) is missed, and
+    (d) has no suspension (volume==0 / missing bar) rule. Migrate by calling
+    ``fill_blocked(direction, {"open": price, "high": ..., "low": ...},
+    prev_close, board=board_of(code), dt=sim_date, price=price, strict=True)``
+    if this arm is ever re-based.
     """
     if prev_close is None or prev_close <= 0:
         return False
