@@ -164,14 +164,22 @@ def test_paper_trade_uses_conviction_sizing():
 # ──────────────────────────────────────────────────────────────────────
 
 def test_walk_forward_position_sizing_default_is_conviction():
-    """walk_forward_backtest.py default POSITION_SIZING must be 'conviction'."""
+    """walk_forward_backtest.py default POSITION_SIZING must be 'conviction'.
+
+    2026-09-23: the default now comes from the WF_PROFILE table
+    (mp/backtest/wf_profile.py) — both prod and research must be 'conviction',
+    and walk_forward must read it from the profile rather than a hard-coded
+    os.environ default.
+    """
     from pathlib import Path
+    from mp.backtest import wf_profile
+    for prof in ("prod", "research"):
+        default = wf_profile.resolve({"WF_PROFILE": prof})["POSITION_SIZING"]
+        assert default == "conviction", (
+            f"walk_forward POSITION_SIZING default ({prof}) should be 'conviction' per "
+            f"BASELINE 2026-04-29, got '{default}'."
+        )
     src = Path("scripts/walk_forward_backtest.py").read_text()
-    # Look for the os.environ.get default
-    m = re.search(r'POSITION_SIZING\s*=\s*os\.environ\.get\(\s*"POSITION_SIZING"\s*,\s*"([^"]+)"', src)
-    assert m is not None, "Could not find POSITION_SIZING default in walk_forward"
-    default = m.group(1)
-    assert default == "conviction", (
-        f"walk_forward POSITION_SIZING default should be 'conviction' per "
-        f"BASELINE 2026-04-29, got '{default}'."
+    assert re.search(r'POSITION_SIZING\s*=\s*_PROF\["POSITION_SIZING"\]', src), (
+        "walk_forward must take POSITION_SIZING from the WF_PROFILE table"
     )

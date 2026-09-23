@@ -1,7 +1,29 @@
-"""Walk-Forward Backtest with monthly model retraining and daily rebalancing.
+"""Walk-Forward Backtest with periodic model retraining and daily rebalancing.
 
-Monthly:
-  1. Retrain LightGBM on expanding window (TRAIN_START → current month)
+Profiles (WF_PROFILE, 2026-09-23 user rule: 所有回测默认按生产交易策略口径跑):
+  prod (DEFAULT)  mirrors scripts/daily_report.py: 22 conviction targets (→ ~25
+                  holds), live filters (drop 688/689/300/301 + <¥1亿 ADV, HS300
+                  included), 40% single-name hard cap (truncate, no
+                  redistribution), 85% target exposure, held names ranked
+                  ≤30 kept / 31-100 halved / >100 cleared, 2%-of-NAV rebalance
+                  tolerance evaluated daily, straight top-N (no cost-aware
+                  swap), T+1 open execution, WEEKLY retrain.
+  research        the legacy walk-forward defaults (top-10, full universe,
+                  fully invested, sell on drop-out, cost-aware swap, monthly
+                  retrain) so older experiments stay reproducible.
+  Any knob set explicitly in the environment overrides the profile default.
+  See mp/backtest/wf_profile.py for the knob table and the verified prod rules.
+
+未对齐项 (prod profile cannot reproduce these; also printed in the report):
+  - 周度重训带 verify gate (不过门不换模型) — 框架每周无条件重训
+  - 限价单 close×1.01 / ×0.99 的成交假设 — 框架按 T+1 开盘价成交 (+滑点/冲击)
+  - 现金约束用开盘价而非限价, 且无 "1 手 ≤ 2×缺口 买 1 手" 小账户规则
+  - 不在打分池 (rank=None) 的持仓: 生产静默保留, 框架清仓
+  - 排名口径: PIT 成分快照 vs 当日实时成分; predicted_excess 取整差异
+  Full list: mp.backtest.wf_profile.UNALIGNED_ITEMS
+
+Periodic (RETRAIN_FREQ = weekly | monthly):
+  1. Retrain LightGBM on expanding window (TRAIN_START → current period)
      Training labels (fwd_ret) are excluded for the last HORIZON trading days
      to prevent forward-return label leakage.
 
@@ -13,7 +35,8 @@ Daily:
 After the backtest, retrain the production model on the full 2015-2026 dataset.
 
 Usage:
-    python scripts/walk_forward_backtest.py
+    python scripts/walk_forward_backtest.py                 # WF_PROFILE=prod
+    WF_PROFILE=research python scripts/walk_forward_backtest.py
 """
 
 from __future__ import annotations
@@ -51,6 +74,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     )
 
 from mp.account.broker import FeeSchedule, SimulatedBroker, board_of, fill_blocked
+from mp.backtest import wf_profile
 from mp.backtest.engine import calc_performance
 from mp.backtest.ml_backtest import _build_factor_panel, _prefetch_bars
 from mp.data.fetcher import get_daily_bars, get_index_constituents, get_index_constituents_at
@@ -117,7 +141,14 @@ def _merged_current() -> list[str]:
     return get_recommendation_universe(UNIVERSES)
 BT_START = os.environ.get("BT_START", "20200101")   # first trading month (env-overridable for windowed A/B, P11 round 117)
 BT_END = os.environ.get("BT_END", "20260401")       # last month (exclusive)
-TOP_K = int(os.environ.get("TOP_K", "10"))
+
+# ── Profile-resolved knobs (WF_PROFILE=prod|research; explicit env wins) ──
+# See mp/backtest/wf_profile.py — the module docstring above lists what each
+# profile means.  Names below are kept identical to the legacy env knobs so
+# the rest of this file reads unchanged.
+_PROF = wf_profile.resolve(os.environ)
+WF_PROFILE = _PROF["profile"]
+TOP_K = _PROF["TOP_K"]
 HORIZON = 20                    # forward return horizon in trading days
 
 # Round 155 (label-alignment research): which label to train on.
@@ -136,7 +167,10 @@ assert LABEL_KIND in ("close_to_close", "next_open_to_close"), \
     f"Unknown LABEL_KIND={LABEL_KIND}"
 SLIPPAGE_BPS = int(os.environ.get("SLIPPAGE_BPS", "5"))
 COMMISSION_BPS = int(os.environ.get("COMMISSION_BPS", "3"))
-COST_AWARE_REBALANCE = True      # skip swaps where score gap < round-trip cost
+# skip swaps where score gap < round-trip cost.  research=1 (legacy); prod=0
+# because daily_report takes a straight top-N (hysteresis comes from the
+# HOLD_RANK_BAND instead).
+COST_AWARE_REBALANCE = _PROF["COST_AWARE_REBALANCE"]
 
 # Rebalance policy — controls when to rebalance positions that are still
 # selected (same Top-K names as yesterday).  Positions that drop out of the
@@ -211,7 +245,7 @@ SAME_DAY_14_30 = (ENTRY_TIME == "14_30") and not INTRADAY_NEXT_DAY
 #   LIMIT_LOCK_MAX_SUSPEND_DAYS: after this many consecutive suspended days
 #     a blocked sell falls back to the legacy stale-price liquidation, so a
 #     delisted / dropped-from-cache name cannot become a zombie holding.
-LIMIT_LOCK = os.environ.get("LIMIT_LOCK", "1") == "1"
+LIMIT_LOCK = _PROF["LIMIT_LOCK"]
 LIMIT_STRICT = os.environ.get("LIMIT_STRICT", "0") == "1"
 LIMIT_LOCK_MAX_SUSPEND_DAYS = int(os.environ.get("LIMIT_LOCK_MAX_SUSPEND_DAYS", "20"))
 
@@ -232,12 +266,34 @@ INTRADAY_HYBRID = os.environ.get("INTRADAY_HYBRID", "0") == "1"
 # Leak audit (POSITION_SIZING=conviction_oracle, using realized fwd_ret as
 # weights) gave 366% annual / Sharpe 6.77 — 5x higher than real conviction —
 # proving the model's edge is real, not future-leaked.
-POSITION_SIZING = os.environ.get("POSITION_SIZING", "conviction")
+POSITION_SIZING = _PROF["POSITION_SIZING"]
 assert POSITION_SIZING in ("equal", "inverse_vol", "conviction", "vol_target",
                            "conviction_oracle", "rank_decay", "rank_linear",
                            "conviction_softcap"), f"Unknown POSITION_SIZING={POSITION_SIZING}"
 # Soft per-position cap for conviction_softcap (fraction of portfolio).
 SOFT_CAP = float(os.environ.get("SOFT_CAP", "0.06"))
+
+# ── Production order-pass knobs (WF_PROFILE=prod defaults; see wf_profile) ──
+#   ORDER_PASS=prod   : daily_report.generate_order_list semantics — every day,
+#     per top-K name: target = min(NAV×GROSS_EXPOSURE×w, NAV×HARD_CAP) (hard cap
+#     truncates WITHOUT redistribution — unlike conviction_softcap); trade only
+#     if |target − current| ≥ REBALANCE_TOLERANCE×NAV; then scale buys to
+#     0.95×cash and to the total-position cap (NAV×GROSS_EXPOSURE).
+#   ORDER_PASS=legacy : the historical path (rebalance only when the selection
+#     changes; target = NAV×GROSS_EXPOSURE×w; never trims overweights).
+#   HOLD_RANK_BAND / CLEAR_RANK_BAND: held names outside the top-K are kept
+#     while rank ≤ HOLD_RANK_BAND, halved (lot-rounded, daily) while
+#     HOLD_RANK_BAND < rank ≤ CLEAR_RANK_BAND, cleared beyond.  0 = legacy
+#     (sell on drop-out).  Ranks are over the FULL scored pool (before live
+#     filters), matching daily_report's full_scored._rank.
+#   RETRAIN_FREQ: weekly (prod approximation of the gated weekly auto-retrain)
+#     or monthly (legacy).
+ORDER_PASS = _PROF["ORDER_PASS"]
+HARD_CAP = _PROF["HARD_CAP"]
+REBALANCE_TOLERANCE = _PROF["REBALANCE_TOLERANCE"]
+HOLD_RANK_BAND = _PROF["HOLD_RANK_BAND"]
+CLEAR_RANK_BAND = _PROF["CLEAR_RANK_BAND"]
+RETRAIN_FREQ = _PROF["RETRAIN_FREQ"]
 # "conviction_oracle" = LEAK-CHECK ONLY.  Uses REALIZED fwd_ret as conviction,
 # which is information the model could not have at decision time.  Result is
 # the upper bound of "perfect-conviction" performance.  If real conviction is
@@ -271,14 +327,17 @@ _INDUSTRY_MAP: dict = {}  # lazy-loaded in run_walk_forward when INDUSTRY_CAP se
 #     cash (live target_position_pct ~0.85, realized ~0.75; sim is fully invested).
 #     NOTE: gross scaling is ~Sharpe-neutral (mean & vol scale together); it
 #     mainly lowers TOTAL RETURN + adds cash drag in up-markets.
-LIVE_UNIVERSE = os.environ.get("LIVE_UNIVERSE", "0") == "1"
-LIVE_ILLIQ_AMOUNT = float(os.environ.get("LIVE_ILLIQ_AMOUNT", "1e8"))  # ¥1亿
-GROSS_EXPOSURE = float(os.environ.get("GROSS_EXPOSURE", "1.0"))
+#   Profile defaults: prod → LIVE_UNIVERSE=1, EXCL_HS300=0 (HS300 is in-universe
+#   since the 2026-07-17 fix), GROSS_EXPOSURE=0.85 (= portfolio.yaml
+#   target_position_pct); research → legacy (0 / 1 / 1.0).
+LIVE_UNIVERSE = _PROF["LIVE_UNIVERSE"]
+LIVE_ILLIQ_AMOUNT = _PROF["LIVE_ILLIQ_AMOUNT"]  # ¥1亿 (= daily_report LOW_LIQUIDITY_FILTER_AMOUNT)
+GROSS_EXPOSURE = _PROF["GROSS_EXPOSURE"]
 # Per-exclusion toggles so the LIVE_UNIVERSE collapse can be attributed to ONE
-# cause (advisor A/B decomposition 2026-07-17). Default all on when LIVE_UNIVERSE.
-EXCL_CHINEXT = os.environ.get("EXCL_CHINEXT", "1") == "1"  # 300/301/688/689
-EXCL_HS300 = os.environ.get("EXCL_HS300", "1") == "1"
-EXCL_ILLIQ = os.environ.get("EXCL_ILLIQ", "1") == "1"
+# cause (advisor A/B decomposition 2026-07-17).
+EXCL_CHINEXT = _PROF["EXCL_CHINEXT"]  # 300/301/688/689
+EXCL_HS300 = _PROF["EXCL_HS300"]
+EXCL_ILLIQ = _PROF["EXCL_ILLIQ"]
 _LIVE_HS300: set | None = None  # lazy static HS300 exclusion set
 
 
@@ -499,15 +558,18 @@ def _load_or_build_factors(
 # Walk-Forward Backtest
 # ──────────────────────────────────────────────────────────────────────
 
-def _get_monthly_retrain_dates(panel: pd.DataFrame) -> List[pd.Timestamp]:
-    """Get first trading day of each month in [BT_START, BT_END) for model retraining."""
+def _get_retrain_dates(panel: pd.DataFrame, freq: str = RETRAIN_FREQ) -> List[pd.Timestamp]:
+    """First trading day of each period (month / ISO week) in [BT_START, BT_END)."""
     bt_start = pd.Timestamp(BT_START)
     bt_end = pd.Timestamp(BT_END)
     dates = panel["date"].drop_duplicates().sort_values()
     dates = dates[(dates >= bt_start) & (dates < bt_end)]
-    # First trading day of each month
-    monthly = dates.groupby(dates.dt.to_period("M")).first()
-    return monthly.tolist()
+    return wf_profile.retrain_dates(dates, freq)
+
+
+def _get_monthly_retrain_dates(panel: pd.DataFrame) -> List[pd.Timestamp]:
+    """Legacy alias: first trading day of each month (RETRAIN_FREQ=monthly)."""
+    return _get_retrain_dates(panel, "monthly")
 
 
 _ADV_PERIOD = 20   # days for rolling average daily value
@@ -970,6 +1032,13 @@ def run_walk_forward():
     logger.info("=" * 60)
     logger.info("Walk-Forward Backtest: {} -> {}", BT_START, BT_END)
     logger.info("Capital: {:,.0f} | Universe: {} | Top-K: {}", INITIAL_CAPITAL, UNIVERSE, TOP_K)
+    logger.info("Profile: {}", wf_profile.profile_line(_PROF))
+    logger.info("Knobs: " + ", ".join(f"{k}={_PROF[k]}" for k in wf_profile.knob_names())
+                + f", ENTRY_TIME={ENTRY_TIME}, REBALANCE_POLICY={REBALANCE_POLICY}, "
+                  f"RANKER_KIND={RANKER_KIND}, SOFT_CAP={SOFT_CAP}")
+    if WF_PROFILE == "prod":
+        for _item in wf_profile.UNALIGNED_ITEMS:
+            logger.warning("未对齐项: {}", _item)
     logger.info("=" * 60)
 
     # Universe: union of all point-in-time constituents across every stored
@@ -1201,9 +1270,10 @@ def run_walk_forward():
         all_dates_set.update(df.loc[mask, "date"].tolist())
     trading_dates = sorted(all_dates_set)
 
-    retrain_dates = _get_monthly_retrain_dates(panel)
+    retrain_dates = _get_retrain_dates(panel, RETRAIN_FREQ)
     retrain_set = set(retrain_dates)
-    logger.info("{} trading days, {} retrain months", len(trading_dates), len(retrain_dates))
+    logger.info("{} trading days, {} retrain dates (RETRAIN_FREQ={})",
+                len(trading_dates), len(retrain_dates), RETRAIN_FREQ)
 
     # Pre-group panel by date for fast daily feature lookup
     core = TECHNICAL_COLUMNS[:13]
@@ -1335,7 +1405,13 @@ def run_walk_forward():
     current_ranker: Optional[StockRanker] = None
     pending_selection: Optional[List[tuple]] = None  # signal from previous close
     pending_raw_scores: Dict[str, float] = {}        # raw excess pred by code, populated in Step B
+    pending_rank_map: Dict[str, int] = {}            # full-pool rank by code (HOLD_RANK_BAND)
     current_universe: frozenset = _current_codes_set  # updated at each retrain
+    # Prod order-pass / hold-band counters (reported in metrics).
+    band_stats: Dict[str, int] = {
+        "held": 0, "halved": 0, "half_skipped_lt_lot": 0,
+        "trims": 0, "tol_skipped": 0, "cap_scaled_days": 0,
+    }
 
     # Tail-quality records — for each scoring day, capture:
     #   predicted top-K codes, actual fwd_ret of all valid codes
@@ -1347,9 +1423,11 @@ def run_walk_forward():
 
     # Round 147 (fix ②): extract Step B's scoring so SAME_DAY_14_30 can run it
     # BEFORE Step A (same-day fill), while the default path keeps running it
-    # after (next-day fill). Returns (selection, raw_scores) or (None, {})
-    # when the ranker isn't ready / today's panel is empty — callers leave
-    # the prior `pending_selection` untouched in that case.
+    # after (next-day fill). Returns (selection, raw_scores, rank_map) or
+    # (None, {}, {}) when the ranker isn't ready / today's panel is empty —
+    # callers leave the prior `pending_selection` untouched in that case.
+    # rank_map (only when HOLD_RANK_BAND > 0) is the rank over the FULL
+    # scored pool before live filters = daily_report full_scored._rank.
     def _score_today(dt):
         ranker_ready = current_ranker is not None and (
             getattr(current_ranker, "model", None) is not None
@@ -1359,18 +1437,23 @@ def run_walk_forward():
             )
         )
         if not ranker_ready:
-            return None, {}
+            return None, {}, {}
         today_df = panel_by_date.get(dt)
         if today_df is None:
-            return None, {}
+            return None, {}, {}
         today_df = today_df[today_df["code"].isin(current_universe)]
         today_valid = today_df.dropna(subset=core)
         if today_valid.empty:
-            return None, {}
+            return None, {}, {}
+        rank_map: Dict[str, int] = {}
+        if HOLD_RANK_BAND > 0:
+            _all_scores = current_ranker.predict(today_valid)
+            _order = sorted(zip(today_valid["code"].tolist(), _all_scores), key=lambda x: -x[1])
+            rank_map = {c: i + 1 for i, (c, _) in enumerate(_order)}
         if LIVE_UNIVERSE:
             today_valid = _apply_live_universe(today_valid, dt, adv_lk)
             if today_valid.empty:
-                return None, {}
+                return None, {}, rank_map
         codes_in = today_valid["code"].tolist()
         scores = current_ranker.predict(today_valid)
         if hasattr(current_ranker, "predict_raw"):
@@ -1416,7 +1499,7 @@ def run_walk_forward():
             raw_scores = oracle_map
         else:
             raw_scores = raw_score_map
-        return selection, raw_scores
+        return selection, raw_scores, rank_map
 
     # 4. Main loop — retrain monthly, score & rebalance daily
     for step, dt in enumerate(trading_dates):
@@ -1504,10 +1587,11 @@ def run_walk_forward():
         # with INTRADAY_NEXT_DAY=1) keep scoring at Step B → pending for
         # tomorrow (unchanged).
         if SAME_DAY_14_30:
-            _sel, _raws = _score_today(dt)
+            _sel, _raws, _ranks = _score_today(dt)
             if _sel is not None:
                 pending_selection = _sel
                 pending_raw_scores = _raws
+                pending_rank_map = _ranks
 
         # A1: stop-loss force-sell at today's open BEFORE rebalance.
         # Force-sell any held position whose return from avg_cost <= STOP_LOSS_PCT.
@@ -1550,7 +1634,12 @@ def run_walk_forward():
                 ) if total_equity > 0 else 0
                 drift_triggered = max_drift > MAX_WEIGHT_DRIFT
 
-            if selection_changed or drift_triggered:
+            # ORDER_PASS=prod: daily_report re-evaluates every top-N delta
+            # EVERY day (tolerance-gated), so the pass runs daily.
+            daily_pass = ORDER_PASS == "prod"
+            n_trades_before = len(broker.trade_log)
+
+            if selection_changed or drift_triggered or daily_pass:
                 # Sizing uses previous close (already in broker from yesterday's NAV step).
                 # Using today's close here would be look-ahead bias.
 
@@ -1576,15 +1665,32 @@ def run_walk_forward():
                                             date=dt_str, action="SELL (drift)",
                                             adv=adv_lk.get((code, dt)))
 
-                # (b) Sell positions not in new selection at today's open
+                # (b) Positions not in the new selection at today's open:
+                #     legacy (HOLD_RANK_BAND=0) → sell; prod → daily_report Pass 2
+                #     (rank ≤ HOLD_RANK_BAND keep / ≤ CLEAR_RANK_BAND halve / else clear).
                 for code in list(broker.positions.keys()):
-                    if code not in sel_codes:
-                        if _sell_blocked(code, dt):
-                            # 跌停封板 / 停牌: keep holding. Tomorrow the name is
-                            # still held-but-unselected ⇒ selection_changed ⇒
-                            # this loop retries the exit at the next fill time.
+                    if code in sel_codes:
+                        continue
+                    band_action = wf_profile.hold_band_action(
+                        pending_rank_map.get(code), HOLD_RANK_BAND, CLEAR_RANK_BAND)
+                    if band_action == "hold":
+                        band_stats["held"] += 1
+                        continue
+                    if _sell_blocked(code, dt):
+                        # 跌停封板 / 停牌: keep holding. Tomorrow the name is
+                        # still held-but-unselected ⇒ selection_changed ⇒
+                        # this loop retries the exit at the next fill time.
+                        continue
+                    sell_price = _entry_price(code, dt) or broker.positions[code].current_price
+                    if band_action == "half":
+                        half = wf_profile.half_lot_shares(broker.positions[code].shares)
+                        if half <= 0:
+                            band_stats["half_skipped_lt_lot"] += 1   # prod: < 1 lot → skip
                             continue
-                        sell_price = _entry_price(code, dt) or broker.positions[code].current_price
+                        band_stats["halved"] += 1
+                        broker.sell(code, sell_price, shares=half, date=dt_str,
+                                    action="SELL (band-half)", adv=adv_lk.get((code, dt)))
+                    else:
                         broker.sell(code, sell_price, date=dt_str,
                                     adv=adv_lk.get((code, dt)))
 
@@ -1596,7 +1702,9 @@ def run_walk_forward():
                     POSITION_SIZING,
                     raw_scores=pending_raw_scores,
                 )
-                for code, score in pending_selection:
+
+                def _try_buy(code: str, price_raw: float, target_value: float) -> None:
+                    """Limit-lock gated buy up to target_value (shared by both passes)."""
                     is_new = code not in broker.positions
                     if is_new:
                         lock_stats["buy_attempts"] += 1
@@ -1612,19 +1720,77 @@ def run_walk_forward():
                                        else "blocked_buys_suspended"] += 1
                         else:
                             lock_stats["blocked_topups"] += 1
-                        continue
-                    price_raw = _entry_price(code, dt)
+                        return
                     if price_raw is None or pd.isna(price_raw) or price_raw <= 0:
-                        continue
-                    target_value = total_value_now * weights.get(code, 1.0 / TOP_K)
+                        return
                     broker.buy(code, price_raw, target_value=target_value,
                                date=dt_str,
                                action="BUY (add)" if code in broker.positions else "BUY",
                                adv=adv_lk.get((code, dt)))
 
+                if ORDER_PASS == "prod":
+                    # daily_report.generate_order_list Pass 1 + reconciliation:
+                    #   target = min(investable × w, NAV × HARD_CAP)   (no redistribution)
+                    #   skip |delta| < REBALANCE_TOLERANCE × NAV
+                    #   delta < 0 → trim (lot-rounded)  /  delta > 0 → buy candidate
+                    #   buys scaled to 0.95 × cash, then to the total-position cap.
+                    nav_now = broker.total_value
+                    tol_value = REBALANCE_TOLERANCE * nav_now
+                    cap_value = nav_now * HARD_CAP if HARD_CAP > 0 else float("inf")
+                    entry_px: Dict[str, float] = {}
+                    buy_deltas: Dict[str, float] = {}
+                    for code, _score in pending_selection:
+                        price_raw = _entry_price(code, dt)
+                        if price_raw is None or pd.isna(price_raw) or price_raw <= 0:
+                            continue
+                        entry_px[code] = float(price_raw)
+                        target_value = min(total_value_now * weights.get(code, 1.0 / TOP_K),
+                                           cap_value)
+                        cur_value = (broker.positions[code].shares * price_raw
+                                     if code in broker.positions else 0.0)
+                        delta = target_value - cur_value
+                        if abs(delta) < tol_value:
+                            band_stats["tol_skipped"] += 1
+                            continue
+                        if delta < 0:
+                            trim = min(int(-delta / price_raw / 100) * 100,
+                                       broker.positions[code].shares)
+                            if trim < 100:
+                                continue
+                            if _sell_blocked(code, dt):
+                                continue
+                            band_stats["trims"] += 1
+                            broker.sell(code, price_raw, shares=trim, date=dt_str,
+                                        action="SELL (trim)", adv=adv_lk.get((code, dt)))
+                        else:
+                            buy_deltas[code] = delta
+                    pos_value_now = sum(
+                        p.shares * entry_px.get(c, p.current_price)
+                        for c, p in broker.positions.items())
+                    scaled = wf_profile.scale_buys_to_caps(
+                        buy_deltas, pos_value_now + sum(buy_deltas.values()),
+                        total_value_now, broker.cash)
+                    if buy_deltas and sum(scaled.values()) < sum(buy_deltas.values()) - 1e-6:
+                        band_stats["cap_scaled_days"] += 1
+                    for code, _score in pending_selection:
+                        delta = scaled.get(code)
+                        if not delta:
+                            continue
+                        price_raw = entry_px[code]
+                        cur_value = (broker.positions[code].shares * price_raw
+                                     if code in broker.positions else 0.0)
+                        _try_buy(code, price_raw, cur_value + delta)
+                else:
+                    # legacy: target = investable × w, top-up only (never trims);
+                    # attempt/block accounting happens before the price check.
+                    for code, score in pending_selection:
+                        target_value = total_value_now * weights.get(code, 1.0 / TOP_K)
+                        _try_buy(code, _entry_price(code, dt), target_value)
+
                 reason = "drift" if drift_triggered and not selection_changed else "sel"
-                logger.info("  Day {}: rebalanced ({}) → {} stocks, cash: {:,.0f}",
-                            dt.strftime("%Y-%m-%d"), reason, len(broker.positions), broker.cash)
+                if len(broker.trade_log) > n_trades_before or not daily_pass:
+                    logger.info("  Day {}: rebalanced ({}) → {} stocks, cash: {:,.0f}",
+                                dt.strftime("%Y-%m-%d"), reason, len(broker.positions), broker.cash)
             pending_selection = None  # consumed
 
         # --- Step B: Score stocks at today's close, store as pending for tomorrow ---
@@ -1632,10 +1798,11 @@ def run_walk_forward():
         # the default path (baseline / ③ / 14_30 legacy next-day) scores here
         # and stores pending for tomorrow's open execution in Step A.
         if not SAME_DAY_14_30:
-            _sel, _raws = _score_today(dt)
+            _sel, _raws, _ranks = _score_today(dt)
             if _sel is not None:
                 pending_selection = _sel
                 pending_raw_scores = _raws
+                pending_rank_map = _ranks
 
         # --- Daily NAV ---
         close_snap = {}
@@ -1710,6 +1877,22 @@ def run_walk_forward():
     metrics["blocked_sells_limit_down"] = lock_stats["blocked_sells_limit_down"]
     metrics["blocked_sells_suspended"] = lock_stats["blocked_sells_suspended"]
     metrics["forced_sells_after_suspend"] = lock_stats["forced_sells_after_suspend"]
+    # Profile / prod order-pass counters (hold band, trims, tolerance, caps).
+    metrics["profile"] = WF_PROFILE
+    metrics["order_pass"] = ORDER_PASS
+    metrics["hold_band"] = f"{HOLD_RANK_BAND}/{CLEAR_RANK_BAND}" if HOLD_RANK_BAND > 0 else "off"
+    metrics["band_held_name_days"] = band_stats["held"]
+    metrics["band_half_sells"] = band_stats["halved"]
+    metrics["band_half_skipped_lt_lot"] = band_stats["half_skipped_lt_lot"]
+    metrics["trims_to_target"] = band_stats["trims"]
+    metrics["tolerance_skips"] = band_stats["tol_skipped"]
+    metrics["cap_scaled_days"] = band_stats["cap_scaled_days"]
+    metrics["retrain_freq"] = f"{RETRAIN_FREQ} ({len(retrain_dates)} retrains)"
+    logger.info("Order pass [{}]: hold-band {} held-name-days={} half-sells={} (<1 lot skipped={}) "
+                "trims={} tolerance-skips={} cap-scaled-days={}",
+                ORDER_PASS, metrics["hold_band"], band_stats["held"], band_stats["halved"],
+                band_stats["half_skipped_lt_lot"], band_stats["trims"],
+                band_stats["tol_skipped"], band_stats["cap_scaled_days"])
     _cost = _trade_cost_stats(broker.trade_log, nav_df, INITIAL_CAPITAL, broker.total_value)
     metrics["turnover_annual"] = f"{_cost['turnover_annual']:.2f}x"
     metrics["friction_total"] = f"{_cost['friction_total']:,.0f}"
@@ -1844,6 +2027,7 @@ def _print_results(metrics, monthly_returns, benchmark_ret, trade_log, elapsed):
     print(f"  Period:          {BT_START[:4]}-{BT_START[4:6]} ~ {BT_END[:4]}-{BT_END[4:6]}")
     print(f"  Initial Capital: {INITIAL_CAPITAL:,.0f}")
     print(f"  Universe:        {UNIVERSE} | Top-K: {TOP_K}")
+    print(f"  Profile:         {wf_profile.profile_line(_PROF)}")
     print(f"  Runtime:         {elapsed/60:.1f} min")
     print("-" * 60)
     for k, v in metrics.items():
@@ -1878,8 +2062,18 @@ def _save_report(metrics, monthly_returns, benchmark_ret, trade_log, elapsed):
         "# Walk-Forward Backtest Report",
         f"**Period**: {BT_START[:4]}-{BT_START[4:6]} ~ {BT_END[:4]}-{BT_END[4:6]}",
         f"**Initial Capital**: {INITIAL_CAPITAL:,.0f} | **Universe**: {UNIVERSE} | **Top-K**: {TOP_K}",
-        f"**Model**: LightGBM monthly retrain, daily rebalance | **Horizon**: {HORIZON}d",
+        f"**Model**: LightGBM {RETRAIN_FREQ} retrain, daily rebalance | **Horizon**: {HORIZON}d",
+        f"**Profile**: {wf_profile.profile_line(_PROF)}",
         f"**Runtime**: {elapsed/60:.1f} min",
+        "",
+    ]
+    if WF_PROFILE == "prod":
+        lines.append("## 未对齐项 (prod profile, 框架无法复现的生产行为)")
+        lines.append("")
+        lines.extend(f"- {item}" for item in wf_profile.UNALIGNED_ITEMS)
+    else:
+        lines.append("> research profile: 沿用历史回测默认值, 不对标生产口径 (生产口径请用 WF_PROFILE=prod).")
+    lines += [
         "",
         "## Performance",
         "",
