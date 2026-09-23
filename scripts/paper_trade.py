@@ -412,7 +412,7 @@ def append_nav(state: dict, today: pd.Timestamp, broker: SimulatedBroker) -> dic
     return entry
 
 
-def _resolve_names(codes: list[str]) -> Dict[str, str]:
+def _resolve_names(codes: list[str]) -> dict[str, str]:
     """Look up Chinese stock names for *codes* via Sina quote API
     (reuses daily_report.get_stock_names).  Returns {code: name}.  Missing
     codes default to themselves."""

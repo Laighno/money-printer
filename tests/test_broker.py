@@ -149,9 +149,11 @@ class TestSimulatedBroker(unittest.TestCase):
     def test_sell_full(self):
         fees = FeeSchedule(slippage_bps=0, commission_bps=0, stamp_tax_bps_new=0)
         b = SimulatedBroker(100_000, fees, silent=True)
-        b.buy("X", 10.0, shares=500)
+        # A-share T+1: shares bought on day D are locked until D+1 (see
+        # BrokerPosition.available_shares), so sell on the next trading day.
+        b.buy("X", 10.0, shares=500, date="2024-01-02")
         cash_after_buy = b.cash
-        trade = b.sell("X", 10.0)
+        trade = b.sell("X", 10.0, date="2024-01-03")
         assert trade is not None
         assert trade["shares"] == 500
         assert "X" not in b.positions
@@ -160,8 +162,8 @@ class TestSimulatedBroker(unittest.TestCase):
     def test_sell_partial(self):
         fees = FeeSchedule(slippage_bps=0, commission_bps=0, stamp_tax_bps_new=0)
         b = SimulatedBroker(100_000, fees, silent=True)
-        b.buy("X", 10.0, shares=500)
-        trade = b.sell("X", 10.0, shares=200)
+        b.buy("X", 10.0, shares=500, date="2024-01-02")
+        trade = b.sell("X", 10.0, shares=200, date="2024-01-03")  # T+1: next day
         assert trade is not None
         assert trade["shares"] == 200
         assert b.positions["X"].shares == 300
@@ -259,9 +261,9 @@ class TestSimulatedBroker(unittest.TestCase):
     def test_trade_log_accumulated(self):
         fees = FeeSchedule(slippage_bps=0, commission_bps=0, stamp_tax_bps_new=0)
         b = SimulatedBroker(100_000, fees, silent=True)
-        b.buy("X", 10.0, shares=100)
-        b.buy("Y", 20.0, shares=100)
-        b.sell("X", 11.0)
+        b.buy("X", 10.0, shares=100, date="2024-01-02")
+        b.buy("Y", 20.0, shares=100, date="2024-01-02")
+        b.sell("X", 11.0, date="2024-01-03")  # T+1: next day
         assert len(b.trade_log) == 3
         assert b.trade_log[0]["action"] == "BUY"
         assert b.trade_log[2]["action"] == "SELL"
