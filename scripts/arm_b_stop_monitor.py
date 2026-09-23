@@ -39,6 +39,15 @@ The proxy is intentionally conservative: it errs on the side of being
 too sensitive (catch real losses) rather than too lax. False positives
 are recoverable (user reviews + unfreezes); false negatives are not.
 
+Heartbeat
+---------
+Every completed check (exit 0/1/2) writes
+``data/.arm_b_monitor_heartbeat``. ``scripts/execute_orders.py`` refuses
+live trading when that file is missing or older than
+``FREEZE_MONITOR_MAX_AGE_HOURS`` (default 36h) -- so this monitor must
+run on the SAME host as the executor (or the heartbeat + freeze flag
+must be synced there). See ``mp/risk/freeze.py`` module docstring.
+
 Usage
 -----
     .venv/bin/python scripts/arm_b_stop_monitor.py             # check only
@@ -59,7 +68,12 @@ from loguru import logger
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from mp.risk.freeze import freeze, is_frozen, freeze_state  # noqa: E402
+from mp.risk.freeze import (  # noqa: E402
+    freeze,
+    freeze_state,
+    is_frozen,
+    write_monitor_heartbeat,
+)
 
 NAV_FILE = PROJECT_ROOT / "data" / "account_nav_history.json"
 EXEC_DIR = PROJECT_ROOT / "data" / "orders" / "executions"
@@ -315,10 +329,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         return reset_freeze_for_debug()
 
     try:
-        return run_check(simulate_trigger=args.simulate)
+        rc = run_check(simulate_trigger=args.simulate)
     except Exception as e:
         logger.exception("Monitor internal error: {}", e)
+        # No heartbeat on internal error: a monitor that cannot load its
+        # data is NOT monitoring. guard_or_raise fails closed after
+        # FREEZE_MONITOR_MAX_AGE_HOURS of silence.
         return 3
+
+    # Liveness heartbeat (fail-closed contract with mp.risk.freeze.
+    # guard_or_raise): written on every completed check, whatever the
+    # verdict (0 OK / 1 warn / 2 triggered). Heartbeat failure must not
+    # mask the verdict, so it is best-effort here.
+    try:
+        write_monitor_heartbeat(exit_code=rc,
+                                extra={"simulate": bool(args.simulate)})
+    except Exception as e:
+        logger.error("Failed to write monitor heartbeat (executor will "
+                     "refuse live trading once stale): {}", e)
+    return rc
 
 
 if __name__ == "__main__":
