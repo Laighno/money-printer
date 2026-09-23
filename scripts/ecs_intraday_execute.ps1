@@ -100,9 +100,14 @@ $syncArgs = @(
     "scripts\sync_portfolio_from_qmt.py",
     "--local"
 )
+# Rule #4.1 gate: config/portfolio.yaml is a protected prod path; the sync
+# script refuses to write it unless MP_ALLOW_PROD_WRITE=1. Scope the env var
+# to this step only (intraday_plan.py sets its own via --allow-prod-write).
+$env:MP_ALLOW_PROD_WRITE = "1"
 $syncOutput = & $pythonExe @syncArgs 2>&1 | Out-String
-$syncOutput.Trim().Split("`n") | ForEach-Object { Log "  sync: $_" }
 $syncExit = $LASTEXITCODE
+Remove-Item Env:MP_ALLOW_PROD_WRITE -ErrorAction SilentlyContinue
+$syncOutput.Trim().Split("`n") | ForEach-Object { Log "  sync: $_" }
 Log "Step 1b: sync exit = $syncExit"
 if ($syncExit -ne 0) {
     Log "Step 1b: WARNING sync failed (exit $syncExit) -- falling through to on-disk portfolio.yaml; preflight may drift if it is stale"

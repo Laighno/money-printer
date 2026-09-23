@@ -21,6 +21,11 @@ Usage:
         [--portfolio config/portfolio.yaml]
 
 Exits non-zero on failure; daily_report.sh should gate the rest of the pipeline.
+
+Rule #4.1: the real write to config/portfolio.yaml requires env
+MP_ALLOW_PROD_WRITE=1 (set by the scheduled-task PS1 wrappers around this
+step). Without it the script raises RuntimeError before writing. --dry-run is
+unaffected.
 """
 from __future__ import annotations
 
@@ -251,6 +256,30 @@ def extract_header(text: str) -> str:
     return "\n".join(out)
 
 
+def write_portfolio_yaml(portfolio_path: Path, new_text: str,
+                         *, source: Dict[str, Any] | None = None) -> None:
+    """Atomically overwrite ``portfolio_path`` behind the Rule #4.1 gate.
+
+    ``config/portfolio.yaml`` is in ``PROTECTED_PROD_PATHS`` (mp/common/paths.py)
+    but this writer used to bypass ``assert_prod_write_allowed`` -- an ad-hoc
+    ``sync_portfolio_from_qmt.py`` from an ssh session could silently replace
+    the prod account snapshot. The gate (env ``MP_ALLOW_PROD_WRITE=1``) is
+    checked BEFORE the tmp file is even created, and the write is audited to
+    ``data/audit/prod_writes.log``. ``--dry-run`` never reaches this function.
+    """
+    from mp.common.paths import assert_prod_write_allowed, audit_prod_write, make_plan_source
+    assert_prod_write_allowed(portfolio_path)
+    # Atomic write: tmp then rename
+    tmp = portfolio_path.with_suffix(".yaml.tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    tmp.replace(portfolio_path)
+    audit_prod_write(
+        portfolio_path,
+        source or make_plan_source(allow_prod_write=True,
+                                   script="sync_portfolio_from_qmt"),
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ecs-user", default="Administrator")
@@ -290,10 +319,8 @@ def main():
         print(new_text)
         return
 
-    # Atomic write: tmp then rename
-    tmp = portfolio_path.with_suffix(".yaml.tmp")
-    tmp.write_text(new_text, encoding="utf-8")
-    tmp.replace(portfolio_path)
+    # Rule #4.1 gate (MP_ALLOW_PROD_WRITE=1) + audit; raises before touching disk.
+    write_portfolio_yaml(portfolio_path, new_text)
     print(f"[sync_portfolio] {portfolio_path} updated ({n_pos} positions)")
 
 

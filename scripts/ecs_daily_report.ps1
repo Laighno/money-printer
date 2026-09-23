@@ -58,7 +58,12 @@ Log "Step 1: HEAD = $head"
 # sync_portfolio_from_qmt.py --local: in-process qmt_snapshot + write yaml,
 # no SSH self-loop. Replaces D2.5 stop-gap that only printed JSON.
 Log "Step 2: sync_portfolio_from_qmt.py --local (ECS-local mode)"
+# Rule #4.1 gate: config/portfolio.yaml is a protected prod path; the sync
+# script refuses to write it unless MP_ALLOW_PROD_WRITE=1. Scope the env var
+# to this step only (daily_report.py sets its own via --allow-prod-write).
+$env:MP_ALLOW_PROD_WRITE = "1"
 $syncOutput = & $pythonExe -X utf8 scripts\sync_portfolio_from_qmt.py --local 2>&1 | Out-String
+Remove-Item Env:MP_ALLOW_PROD_WRITE -ErrorAction SilentlyContinue
 $syncOutput.Trim().Split("`n") | ForEach-Object { Log "  sync: $_" }
 if ($LASTEXITCODE -ne 0) {
     Log "  WARNING: ECS-local sync failed (exit $LASTEXITCODE); proceeding with existing yaml"
