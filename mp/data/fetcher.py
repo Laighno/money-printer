@@ -153,6 +153,45 @@ def get_recommendation_universe(indices: tuple[str, ...] = ("hs300", "zz500")) -
     return sorted(codes)
 
 
+def get_training_rank_universe(indices: tuple[str, ...] = ("hs300", "zz500")) -> list[str]:
+    """Return the peer pool the industry-relative rank features were trained on.
+
+    ``walk_forward_backtest._merged_all_snapshots`` (and therefore the
+    ``wf_cache`` panel that ``train_blend_cutoff`` / auto-retrain consume)
+    builds the factor panel over the UNION of every stored point-in-time
+    constituent snapshot of *indices* — not just today's members.  Because
+    ``pe_ind_rank`` etc. are pct-ranks within (date, industry) over that
+    whole panel, live inference must rank over the same pool.  Mirrors that
+    union here (2026-09-23: 1578 codes vs 800 current members).
+
+    Falls back to the current constituents (``get_recommendation_universe``)
+    with a WARNING when fewer than two snapshots exist or the DB is
+    unreadable — the same fallback the backtest applies.
+    """
+    try:
+        from .store import DataStore
+        store = DataStore()
+        union: set[str] = set()
+        dates: set[str] = set()
+        for idx in indices:
+            ds = store.list_constituent_snapshot_dates(idx)
+            dates.update(ds)
+            for d in ds:
+                c = store.load_constituent_snapshot_at(idx, d)
+                if c:
+                    union.update(str(x).zfill(6) for x in c)
+        if len(dates) >= 2 and union:
+            logger.info("Training rank universe: {} codes across {} {} snapshots",
+                        len(union), len(dates), "+".join(indices))
+            return sorted(union)
+        logger.warning("Only {} constituent snapshot(s) for {}; rank universe falls "
+                       "back to current members", len(dates), "+".join(indices))
+    except Exception as e:
+        logger.warning("Constituent snapshot lookup failed ({}); rank universe falls "
+                       "back to current members", e)
+    return get_recommendation_universe(indices)
+
+
 def _save_constituent_snapshot(index: str, codes: list[str]) -> None:
     """Persist today's constituent list to the DB (best-effort, silent on failure)."""
     try:

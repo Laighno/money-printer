@@ -947,6 +947,97 @@ def _add_industry_relative_features(
     return df
 
 
+def _resolve_live_industry_source(codes: List[str]):
+    """Industry source for live inference — same PIT branch as training.
+
+    Training / backtest feed :func:`_add_industry_relative_features` the
+    ``get_industry_history`` DataFrame (merge_asof on the row date).  Live
+    inference used to pass the ``get_industry_mapping`` *current snapshot*
+    dict instead, which relabels stocks that changed industry (train/serve
+    skew, audit 2026-09-23).  This helper returns the history DataFrame when
+    it is available; only when it is empty (network down + cold 7-day cache)
+    does it fall back to the snapshot dict — loudly, never silently.
+    """
+    from mp.data.fetcher import get_industry_history, get_industry_mapping
+
+    hist = None
+    try:
+        hist = get_industry_history(universe=codes)
+    except Exception as e:  # get_industry_history normally swallows; belt & braces
+        logger.warning("get_industry_history raised ({}); trying snapshot fallback", e)
+    if hist is not None and not hist.empty:
+        return hist
+
+    logger.warning(
+        "Industry history (PIT) unavailable for live inference — falling back to "
+        "get_industry_mapping current snapshot. This is NOT the training branch "
+        "(stocks that changed industry get today's label): train/serve skew for "
+        "this run."
+    )
+    return get_industry_mapping(universe=codes)
+
+
+def _attach_live_industry_ranks(
+    result: pd.DataFrame,
+    codes: List[str],
+    rank_universe: Optional[List[str]] = None,
+    industry_source=None,
+) -> pd.DataFrame:
+    """Add INDUSTRY_RANK_COLUMNS to a live (latest-row-per-stock) panel.
+
+    Parameters
+    ----------
+    result : pd.DataFrame
+        Latest feature rows for ``codes`` ∪ ``rank_universe`` (one row per
+        stock, ``date`` = that stock's feature date).
+    codes : list[str]
+        The stocks the caller actually wants back (holdings ∪ recommendation
+        pool).  Rows for any other code in *result* are used only as rank
+        peers and dropped from the return value.
+    rank_universe : list[str] or None
+        The peer pool the ranks are computed over.  Must be the universe the
+        model was trained on so that ``pe_ind_rank`` etc. mean the same thing
+        at serve time as at train time.  ``None`` keeps the legacy behaviour
+        (rank within the passed *codes* only) and emits a WARNING.
+    industry_source : DataFrame | dict | None
+        Injected industry assignment (tests).  ``None`` → resolved through
+        :func:`_resolve_live_industry_source` (PIT history, snapshot fallback).
+
+    The ranking itself is delegated to :func:`_add_industry_relative_features`
+    — the exact function ``build_dataset`` / walk-forward use — so there is a
+    single implementation of the rank semantics.
+    """
+    if result.empty:
+        for col in INDUSTRY_RANK_COLUMNS:
+            if col not in result.columns:
+                result[col] = np.nan
+        return result
+
+    codes_set = {str(c) for c in codes}
+    if rank_universe is None:
+        logger.warning(
+            "build_latest_features: rank_universe not supplied — industry-relative "
+            "ranks ({}) computed within the {} passed codes only. Training ranks "
+            "over the full universe; pass rank_universe=<training universe> to "
+            "remove this train/serve skew.",
+            ",".join(INDUSTRY_RANK_COLUMNS), result["code"].nunique(),
+        )
+
+    if industry_source is None:
+        industry_source = _resolve_live_industry_source(
+            result["code"].astype(str).unique().tolist()
+        )
+
+    attrs = dict(result.attrs)
+    ranked = _add_industry_relative_features(result, industry_source)
+    if rank_universe is not None:
+        # Extra peers were only there to make the pct-rank pool match
+        # training — they must never leak into the caller's recommendation pool.
+        ranked = ranked[ranked["code"].astype(str).isin(codes_set)].reset_index(drop=True)
+    ranked.attrs.update(attrs)
+    return ranked
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1187,6 +1278,7 @@ def build_latest_features(
     include_fundamentals: bool = True,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     intraday_bars: Optional[Dict[str, Dict]] = None,
+    rank_universe: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """Return the latest feature row per stock for live prediction.
 
@@ -1199,8 +1291,27 @@ def build_latest_features(
     inside ``get_daily_bars``). The intraday 14:30 path passes ``end=T-1`` so
     the EOD factor window is anchored before today's not-yet-closed bar and
     ``get_daily_bars`` short-circuits on a DB that reaches T-1 (round 111).
+
+    ``rank_universe`` (audit 2026-09-23, train/serve skew): the peer pool for
+    the industry-relative rank features (``INDUSTRY_RANK_COLUMNS``).  Training
+    computes ``pe_ind_rank`` etc. per (date, industry) over the whole training
+    panel; live inference must rank over the same pool, not over whatever
+    subset the caller happens to score.  Codes in ``rank_universe`` that are
+    not in ``codes`` get their features built too (cost!) but are used ONLY as
+    rank peers — the returned frame contains rows for ``codes`` only.
+    ``None`` → legacy behaviour (rank within ``codes``) with a WARNING.
     """
-    total = len(codes)
+    codes = [str(c) for c in codes]
+    codes_set = set(codes)
+    if rank_universe is not None:
+        extra = sorted({str(c) for c in rank_universe} - codes_set)
+        all_codes = codes + extra
+        logger.info("build_latest_features: rank_universe adds {} peer-only codes "
+                    "(features built, excluded from output)", len(extra))
+    else:
+        all_codes = codes
+
+    total = len(all_codes)
     logger.info("build_latest_features: {} codes, start={}", total, start)
 
     # round 202 (advisor 201 E spec): ThreadPool gave only 1.7× speedup
@@ -1222,10 +1333,10 @@ def build_latest_features(
     valuation_map: Dict[str, Dict[str, float]] = {}
     fin_hist_map: Dict[str, Optional[pd.DataFrame]] = {}
     if include_fundamentals:
-        valuation_map = _fetch_valuation_snapshot_map(codes)
+        valuation_map = _fetch_valuation_snapshot_map(all_codes)
         logger.info("Got valuation snapshot for {} stocks", len(valuation_map))
         with ThreadPoolExecutor(max_workers=_WORKERS) as _pool:
-            _futs = {_pool.submit(_fetch_financial_history, c): c for c in codes}
+            _futs = {_pool.submit(_fetch_financial_history, c): c for c in all_codes}
             for _fut in as_completed(_futs):
                 _c = _futs[_fut]
                 try:
@@ -1242,7 +1353,7 @@ def build_latest_features(
          fin_hist_map.get(code) if include_fundamentals else None,
          valuation_map.get(code) if include_fundamentals else None,
          intraday_bars.get(code) if intraday_bars else None)
-        for code in codes
+        for code in all_codes
     )
 
     rows: List[pd.DataFrame] = []
@@ -1268,6 +1379,28 @@ def build_latest_features(
         return pd.DataFrame()
 
     result = pd.concat(rows, ignore_index=True)
+
+    # --- Industry-relative ranking features (audit 2026-09-23 skew fix) ---
+    # Same branch as build_dataset: PIT industry history + merge_asof on each
+    # row's feature date (snapshot dict only as a loud fallback), ranks over
+    # codes ∪ rank_universe, then peer-only rows are dropped so downstream
+    # (quality gate, recommendations) only ever sees `codes`.
+    if include_fundamentals:
+        try:
+            result = _attach_live_industry_ranks(result, codes, rank_universe=rank_universe)
+        except Exception as e:
+            logger.warning("Industry rank features failed for live prediction, skipping: {}", e)
+            if rank_universe is not None:
+                result = result[result["code"].astype(str).isin(codes_set)].reset_index(drop=True)
+            for col in INDUSTRY_RANK_COLUMNS:
+                if col not in result.columns:
+                    result[col] = np.nan
+    elif rank_universe is not None:
+        result = result[result["code"].astype(str).isin(codes_set)].reset_index(drop=True)
+
+    if result.empty:
+        logger.error("build_latest_features: no rows left for requested codes")
+        return pd.DataFrame()
 
     # --- Data quality warnings: flag missing fundamental columns per row ---
     # _data_quality drives the荐股降级 gate, so only count columns that truly
@@ -1302,18 +1435,6 @@ def build_latest_features(
         logger.warning("⚠ {}/{} 股票存在基本面数据缺失，预测可能不准", n_warn, len(result))
     if n_gate > len(result) * 0.5:
         logger.warning("⚠ 超过50%股票缺少基本面数据(PE/PB等)，数据源可能异常")
-
-    # --- Industry-relative ranking features ---
-    if include_fundamentals and len(result) > 0:
-        try:
-            from mp.data.fetcher import get_industry_mapping
-            code_to_industry = get_industry_mapping(universe=codes)
-            result = _add_industry_relative_features(result, code_to_industry)
-        except Exception as e:
-            logger.warning("Industry rank features failed for live prediction, skipping: {}", e)
-            for col in INDUSTRY_RANK_COLUMNS:
-                if col not in result.columns:
-                    result[col] = np.nan
 
     logger.info("build_latest_features complete: {} stocks, {} factors", len(result), len(FACTOR_COLUMNS))
     return result

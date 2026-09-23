@@ -48,6 +48,52 @@ MODEL_PATH = PROJECT_ROOT / "data" / "model.lgb"
 DEFAULT_USER_ID = "ou_da792f0119461fb14c41b21b40834b09"
 
 
+_RANK_UNIVERSE_CACHE: Optional[List[str]] = None
+
+
+def _rank_universe() -> Optional[List[str]]:
+    """Peer pool for the industry-relative rank features (train/serve parity).
+
+    Audit 2026-09-23: ``pe_ind_rank`` etc. are pct-ranks within (date,
+    industry) over the whole training panel, but live scoring ranked within
+    whatever codes were passed.  Every ``build_latest_features`` call in this
+    module now passes this pool as ``rank_universe``; peer-only codes are
+    used for ranking and never enter holdings/recommendations.
+
+    ``MP_RANK_UNIVERSE`` selects the pool (decided per cost/fidelity):
+      ``current``  (default) today's HS300+ZZ500 (~800) — zero extra cost for
+                   run()/run_midday(), whose panel already covers it.
+      ``training`` union of all stored PIT constituent snapshots (~1578, the
+                   exact pool the wf_cache panel ranks over) — ~2x scoring
+                   cost, closest to training.
+    Fetched once per process (successes cached).  Returns ``None`` when the
+    pool cannot be fetched so ``build_latest_features`` emits its explicit
+    skew WARNING instead of silently ranking within the passed codes.
+    """
+    global _RANK_UNIVERSE_CACHE
+    if _RANK_UNIVERSE_CACHE is not None:
+        return _RANK_UNIVERSE_CACHE
+    mode = os.environ.get("MP_RANK_UNIVERSE", "current").strip().lower()
+    try:
+        if mode == "training":
+            from mp.data.fetcher import get_training_rank_universe
+            pool = get_training_rank_universe()
+        else:
+            if mode != "current":
+                logger.warning("Unknown MP_RANK_UNIVERSE={!r}; using 'current'", mode)
+            from mp.data.fetcher import get_recommendation_universe
+            pool = get_recommendation_universe()
+    except Exception as e:
+        logger.warning("rank_universe fetch failed ({}); ranks fall back to passed codes", e)
+        return None
+    if not pool:
+        logger.warning("rank_universe ({}) came back empty; ranks fall back to passed codes", mode)
+        return None
+    _RANK_UNIVERSE_CACHE = [str(c) for c in pool]
+    logger.info("Industry rank universe ({}): {} codes", mode, len(_RANK_UNIVERSE_CACHE))
+    return _RANK_UNIVERSE_CACHE
+
+
 def load_holdings() -> List[dict]:
     """Load A-share holdings from portfolio.yaml."""
     with open(PORTFOLIO_PATH) as f:
@@ -185,7 +231,8 @@ def score_universe(ranker, holding_codes: list[str], intraday_bars: dict | None 
             features = precomputed_features[precomputed_features["code"].isin(holding_codes)].copy()
         else:
             features = build_latest_features(holding_codes, include_fundamentals=True,
-                                             intraday_bars=intraday_bars)
+                                             intraday_bars=intraday_bars,
+                                             rank_universe=_rank_universe())
         if features.empty:
             return pd.DataFrame()
         scores = ranker.predict(features)
@@ -212,7 +259,8 @@ def score_universe(ranker, holding_codes: list[str], intraday_bars: dict | None 
 
         all_codes = list(set(holding_codes + zz500_codes))
         features = build_latest_features(all_codes, include_fundamentals=True,
-                                         intraday_bars=intraday_bars)
+                                         intraday_bars=intraday_bars,
+                                         rank_universe=_rank_universe())
     if features.empty:
         return pd.DataFrame()
 
@@ -225,7 +273,8 @@ def score_universe(ranker, holding_codes: list[str], intraday_bars: dict | None 
             h_features = precomputed_features[precomputed_features["code"].isin(holding_codes)].copy()
         else:
             h_features = build_latest_features(holding_codes, include_fundamentals=True,
-                                               intraday_bars=intraday_bars)
+                                               intraday_bars=intraday_bars,
+                                               rank_universe=_rank_universe())
         if h_features.empty:
             return pd.DataFrame()
         raw = ranker.predict_raw(h_features)
@@ -291,14 +340,16 @@ def evaluate_holdings(ranker, regime: MarketRegime | None = None, intraday_bars:
             features = precomputed_features[precomputed_features["code"].isin(codes)].copy()
         else:
             features = build_latest_features(codes, include_fundamentals=True,
-                                             intraday_bars=intraday_bars)
+                                             intraday_bars=intraday_bars,
+                                             rank_universe=_rank_universe())
     else:
         logger.info("Building features for {} holdings...", len(codes))
         if precomputed_features is not None:
             features = precomputed_features[precomputed_features["code"].isin(codes)].copy()
         else:
             features = build_latest_features(codes, include_fundamentals=True,
-                                             intraday_bars=intraday_bars)
+                                             intraday_bars=intraday_bars,
+                                             rank_universe=_rank_universe())
         if features.empty:
             logger.error("Failed to build features for holdings")
             return pd.DataFrame()
@@ -936,7 +987,8 @@ def recommend_stocks(ranker, n_recommend: int = 5, intraday_bars: dict | None = 
 
         logger.info("Building features for {} universe stocks...", len(codes))
         features = build_latest_features(codes, include_fundamentals=True,
-                                         intraday_bars=intraday_bars)
+                                         intraday_bars=intraday_bars,
+                                         rank_universe=_rank_universe())
     if features.empty:
         logger.error("Failed to build features for ZZ500")
         return pd.DataFrame(), [], {}, pd.DataFrame()
@@ -2749,7 +2801,8 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     panel_codes = sorted(set(zz500_codes) | set(h_codes))
     logger.info("--- Building shared feature panel ({} stocks) ---", len(panel_codes))
     shared_features = build_latest_features(
-        panel_codes, include_fundamentals=True, intraday_bars=intraday_bars)
+        panel_codes, include_fundamentals=True, intraday_bars=intraday_bars,
+        rank_universe=_rank_universe())
     if shared_features.empty:
         logger.error("Shared feature panel is empty — aborting midday")
         return
@@ -2949,7 +3002,8 @@ def run(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Optional[
         universe = []
     panel_codes = sorted(set(universe) | set(holding_codes))
     logger.info("--- Building shared feature panel ({} stocks) ---", len(panel_codes))
-    shared_features = build_latest_features(panel_codes, include_fundamentals=True)
+    shared_features = build_latest_features(panel_codes, include_fundamentals=True,
+                                            rank_universe=_rank_universe())
     if shared_features.empty:
         logger.error("Shared feature panel is empty — aborting")
         return
