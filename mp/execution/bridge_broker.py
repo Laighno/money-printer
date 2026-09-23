@@ -38,6 +38,36 @@ BRIDGE_DIR_DEFAULT = r"C:\money-printer\data\bridge"
 HEARTBEAT_MAX_AGE = 10.0     # sec; 2s tick → 10s means strategy is dead
 RESP_TIMEOUT = 25.0          # sec; order resp resolves 1-2 ticks late by design
 RESP_POLL_INTERVAL = 0.25
+READ_RETRIES = 3             # half-written / mid-replace window on the QMT side
+READ_RETRY_INTERVAL = 0.3    # sec between retries
+
+
+def _read_json_retry(path: Path, what: str,
+                     retries: int = READ_RETRIES,
+                     interval: float = READ_RETRY_INTERVAL) -> Optional[dict]:
+    """Read a bridge JSON file, tolerating the strategy's write window.
+
+    The BigQMT strategy writes tmp -> os.replace; historically it was
+    remove -> rename, which leaves a "file missing" gap, and either way a
+    reader can observe a partially written file. FileNotFoundError and JSON
+    decode errors are retried ``retries`` times with ``interval`` between
+    attempts before giving up (returns None; the caller decides how loudly
+    to report that).
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        # FileNotFoundError / PermissionError (Windows mid-replace) are OSError;
+        # json.JSONDecodeError is a ValueError.
+        except (OSError, ValueError) as e:
+            last_err = e
+            if attempt < retries:
+                logger.debug("bridge {} read attempt {}/{} failed ({}), retrying",
+                             what, attempt, retries, e)
+                time.sleep(interval)
+    logger.debug("bridge {} unreadable after {} attempts: {}", what, retries, last_err)
+    return None
 
 
 class FileBridgeBroker:
@@ -54,12 +84,17 @@ class FileBridgeBroker:
 
     def connect(self) -> bool:
         hb = self.bridge_dir / "heartbeat.json"
+        data = _read_json_retry(hb, "heartbeat")
+        if data is None:
+            logger.error("bridge connect failed: heartbeat unreadable after "
+                         "{} attempts ({}) — is the BigQMT bridge strategy "
+                         "running?", READ_RETRIES, hb)
+            return False
         try:
-            data = json.loads(hb.read_text(encoding="utf-8"))
             age = time.time() - float(data.get("ts", 0))
         except Exception as e:
-            logger.error("bridge connect failed: heartbeat unreadable ({}) — "
-                         "is the BigQMT bridge strategy running?", e)
+            logger.error("bridge connect failed: heartbeat malformed ({}) — {}",
+                         e, hb)
             return False
         if age > HEARTBEAT_MAX_AGE:
             logger.error("bridge connect failed: heartbeat stale {:.0f}s "
@@ -116,10 +151,11 @@ class FileBridgeBroker:
         deadline = time.time() + timeout
         while time.time() < deadline:
             if resp_p.exists():
-                try:
-                    resp = json.loads(resp_p.read_text(encoding="utf-8"))
-                except Exception:
-                    time.sleep(RESP_POLL_INTERVAL)   # partially written; retry
+                resp = _read_json_retry(resp_p, f"resp seq={seq}")
+                if resp is None:
+                    # still partially written after the retry budget; the
+                    # outer deadline loop keeps polling
+                    time.sleep(RESP_POLL_INTERVAL)
                     continue
                 try:
                     resp_p.unlink()
@@ -177,6 +213,8 @@ class FileBridgeBroker:
                 avg_fill_price=float(o.get("avg_fill_price", 0)),
                 status=o.get("status", "pending"),
                 error_msg=o.get("error_msg"),
+                # strategy side emits m_dLimitPrice as "limit_price" (commit d775974)
+                limit_price=(float(o.get("limit_price") or 0) or None),
             ))
         return out
 
