@@ -1668,6 +1668,12 @@ def run_walk_forward():
     if _nav_dump and not nav_df.empty:
         nav_df.to_csv(_nav_dump, index=False)
         logger.info("NAV_DUMP: wrote {} daily rows → {}", len(nav_df), _nav_dump)
+    # 2026-09-23: TRADE_DUMP writes the full broker trade log (the md report
+    # only shows the first/last 20 trades) for turnover / outlier forensics.
+    _trade_dump = os.environ.get("TRADE_DUMP")
+    if _trade_dump:
+        pd.DataFrame(broker.trade_log).to_csv(_trade_dump, index=False)
+        logger.info("TRADE_DUMP: wrote {} trades → {}", len(broker.trade_log), _trade_dump)
     metrics = calc_performance(nav_df)
 
     # 5b. Tail-quality metrics — Hit Rate@K and NDCG@K averaged over
