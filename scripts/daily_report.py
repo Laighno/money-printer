@@ -2678,22 +2678,18 @@ def run_midday(dry_run: bool = False, chat_id: Optional[str] = None, user_id: Op
     label_zh = {"midday": "午间快报", "2pm": "盘中快报 14:00"}.get(session_label, session_label)
     logger.info("=== {} Report: {} ===", label_zh, date.today())
 
-    # 1. Load models (ensemble preferred, single blend fallback)
-    from mp.ml.model import EnsembleBlendRanker
-    ensemble = EnsembleBlendRanker()
-    if ensemble.load():
-        ranker = ensemble
-        logger.info("Using EnsembleBlendRanker ({} members)", len(ensemble))
+    # 1. Load models (blend preferred, StockRanker fallback).
+    # EnsembleBlendRanker 已于 2026-05-24 废弃 (data/ensemble.deprecated_*), mp.ml.model
+    # 里已无此类; 原 import 会让 --midday / --2pm 路径直接 ImportError (audit 2026-09-23).
+    ranker = BlendRanker()
+    if ranker.load():
+        logger.info("Using single BlendRanker")
     else:
-        ranker = BlendRanker()
-        if ranker.load():
-            logger.info("Using single BlendRanker (no ensemble found)")
-        else:
-            logger.info("Blend models not found, falling back to StockRanker")
-            ranker = StockRanker()
-            if not ranker.load():
-                logger.error("No ML model found. Run training first.")
-                return
+        logger.info("Blend models not found, falling back to StockRanker")
+        ranker = StockRanker()
+        if not ranker.load():
+            logger.error("No ML model found. Run training first.")
+            return
 
     ranker_60d = StockRanker()
     has_60d_model = ranker_60d.load(path="data/model_60d.lgb")
