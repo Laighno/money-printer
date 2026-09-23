@@ -424,6 +424,9 @@ def fetch_today_1m_and_eod_history(
         start_time=today_start,
         end_time=today_end,
         count=-1,
+        # 不复权: 仅用于同日盘中相对量 (open/high/low/close/vol 聚合成今日
+        # 上午 bar). 同一天内所有 1m bar 尺度一致, 不受复权影响. 这份数据
+        # 不得流入任何跨日窗口 (跨日历史统一走下面 1d 的 "front").
         dividend_type="none",
         fill_data=False,
     )
@@ -474,7 +477,12 @@ def fetch_today_1m_and_eod_history(
         start_time=eod_start_str,
         end_time=eod_end_str,
         count=-1,
-        dividend_type="none",
+        # 前复权 (qfq): 这 20 日 EOD 进 compute_intraday_extras 的跨日因子
+        # (overnight_gap = T_open vs T-1_close, morning_vol_ratio = 今日上午量
+        # / 20 日 EOD 量均). 训练侧 (train_intraday.py) 这两个特征由 Sina-qfq
+        # DB 面板算出, 且 :307 的日线预热同样用 "front" — 若这里用 "none",
+        # 窗口内除权的票会与训练尺度错配 (docs/decision_log.md ①复权尺度混用).
+        dividend_type="front",
         fill_data=False,
     )
     if not eod_raw or not all(isinstance(v, pd.DataFrame) for v in eod_raw.values()):
