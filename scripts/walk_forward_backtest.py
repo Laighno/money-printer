@@ -1145,6 +1145,7 @@ def run_walk_forward():
         "blocked_sells_suspended": 0, "forced_sells_after_suspend": 0,
     }
     suspend_days: Dict[str, int] = {}  # consecutive suspended-blocked sell days per code
+    blocked_events: List[dict] = []    # (date, code, action, reason, is_new) for TRADE_DUMP forensics
 
     def _fill_block(action: str, code: str, dt) -> Optional[str]:
         """None when fillable; else 'limit_up' / 'limit_down' / 'suspended'."""
@@ -1601,6 +1602,8 @@ def run_walk_forward():
                         lock_stats["buy_attempts"] += 1
                     block_reason = _fill_block("buy", code, dt)
                     if block_reason is not None:
+                        blocked_events.append({"date": dt, "code": code, "action": "buy",
+                                               "reason": block_reason, "is_new": is_new})
                         # 涨停封板 / 停牌: skip this name for today. Cash is NOT
                         # redistributed to the other picks (conservative).
                         if is_new:
@@ -1674,6 +1677,10 @@ def run_walk_forward():
     if _trade_dump:
         pd.DataFrame(broker.trade_log).to_csv(_trade_dump, index=False)
         logger.info("TRADE_DUMP: wrote {} trades → {}", len(broker.trade_log), _trade_dump)
+        if blocked_events:
+            _bd = _trade_dump + ".blocked.csv"
+            pd.DataFrame(blocked_events).to_csv(_bd, index=False)
+            logger.info("TRADE_DUMP: wrote {} blocked events → {}", len(blocked_events), _bd)
     metrics = calc_performance(nav_df)
 
     # 5b. Tail-quality metrics — Hit Rate@K and NDCG@K averaged over
