@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import lightgbm as lgb
 import numpy as np
@@ -26,6 +26,90 @@ from mp.ml.dataset import CURATED_COLUMNS, FACTOR_COLUMNS, FUNDAMENTAL_COLUMNS, 
 
 FEATURE_COLS = FACTOR_COLUMNS  # re-export for convenience
 DEFAULT_MODEL_PATH = str(Path("data") / "model.lgb")
+
+# Label horizon in trading days.  Every producer of ``fwd_ret`` /
+# ``excess_ret`` defaults to 20 (dataset.build_dataset / add_excess_ret,
+# wf_gate.HORIZON_DEFAULT, walk_forward_backtest.HORIZON,
+# prediction_diagnostics.HORIZON).  Used as the train/val embargo width.
+DEFAULT_HORIZON = 20
+
+
+def _time_split(df: pd.DataFrame, val_frac: float,
+                horizon: int = DEFAULT_HORIZON) -> Tuple[np.ndarray, np.ndarray]:
+    """Date-level train/validation split with a label-horizon embargo.
+
+    Splits on *unique trading dates*, never on row position.  The last
+    ``val_frac`` of dates form the validation set, so a single date can
+    never be divided between train and val.  (The previous row-position
+    split ``int(n * (1 - val_frac))`` cut the ~800-stock cross-section of
+    one date in half; both halves share the same forward-return window, so
+    early stopping was tuned on a leaked validation set.)
+
+    The ``horizon`` trading days immediately before the first validation
+    date are dropped from train (embargo).  A row at date ``D`` carries the
+    label ``close[D + horizon] / close[D] - 1``; that window overlaps the
+    validation period unless ``D + horizon < val_start`` — the same
+    contract as ``walk_forward_backtest`` ``_cutoff_idx``.
+
+    Parameters
+    ----------
+    df : DataFrame with a ``date`` column (any order; masks are aligned to
+        ``df``'s row order).
+    val_frac : fraction of the most recent *dates* used for validation.
+    horizon : embargo width in trading days (``0`` disables it).
+
+    Returns
+    -------
+    (train_mask, val_mask) : bool ndarrays aligned with ``df`` rows.  Rows in
+    the embargo gap belong to neither mask.  If fewer than ``horizon + 1``
+    dates precede the validation start, the embargo cannot be applied: a
+    warning is logged and train simply ends at the validation start.
+    """
+    dates = df["date"].values
+    unique_dates = np.sort(np.unique(dates))
+    n_dates = len(unique_dates)
+    if n_dates == 0:
+        empty = np.zeros(0, dtype=bool)
+        return empty, empty
+
+    split_pos = int(n_dates * (1 - val_frac))
+    split_pos = min(max(split_pos, 0), n_dates)
+    if split_pos >= n_dates:
+        logger.warning("_time_split: val_frac={} leaves no validation dates "
+                       "(n_dates={}); everything goes to train", val_frac, n_dates)
+        return np.ones(len(dates), dtype=bool), np.zeros(len(dates), dtype=bool)
+
+    split_date = unique_dates[split_pos]
+    val_mask = dates >= split_date
+
+    embargo_pos = split_pos - horizon
+    if horizon > 0 and embargo_pos > 0:
+        train_mask = dates < unique_dates[embargo_pos]
+        embargo_days = horizon
+    else:
+        if horizon > 0:
+            logger.warning(
+                "_time_split: only {} dates precede the validation start — cannot "
+                "embargo {} trading days; falling back to NO embargo (train/val "
+                "label windows overlap)", split_pos, horizon)
+        train_mask = dates < split_date
+        embargo_days = 0
+
+    def _fmt(d) -> str:
+        return str(d)[:10]
+
+    n_train_dates = len(np.unique(dates[train_mask]))
+    n_val_dates = n_dates - split_pos
+    logger.info(
+        "_time_split: train {}..{} ({} dates, {} rows) | embargo {} trading days "
+        "| val {}..{} ({} dates, {} rows)",
+        _fmt(unique_dates[0]),
+        _fmt(unique_dates[max(split_pos - embargo_days - 1, 0)]),
+        n_train_dates, int(train_mask.sum()), embargo_days,
+        _fmt(split_date), _fmt(unique_dates[-1]),
+        n_val_dates, int(val_mask.sum()),
+    )
+    return train_mask, val_mask
 
 
 def _topk_metrics(preds: np.ndarray, actuals: np.ndarray,
@@ -94,7 +178,8 @@ class StockRanker:
     # Training
     # ------------------------------------------------------------------
 
-    def train(self, df: pd.DataFrame, n_splits: int = 5) -> dict:
+    def train(self, df: pd.DataFrame, n_splits: int = 5,
+              horizon: int = DEFAULT_HORIZON) -> dict:
         """Train with time-series cross-validation (expanding window).
 
         Parameters
@@ -103,6 +188,10 @@ class StockRanker:
             Must contain ``date``, FEATURE_COLS, and ``fwd_ret``.
         n_splits : int
             Number of temporal CV folds.
+        horizon : int
+            Label horizon in trading days; the last ``horizon`` dates before
+            each fold's validation start are embargoed from train (see
+            :func:`_time_split` for the rationale).
 
         Returns
         -------
@@ -156,15 +245,30 @@ class StockRanker:
         }
 
         for fold in range(n_splits):
-            # Train: dates[0 : (fold+1)*fold_size]
             # Val:   dates[(fold+1)*fold_size : (fold+2)*fold_size]
-            train_end = unique_dates[(fold + 1) * fold_size - 1]
-            val_start = unique_dates[(fold + 1) * fold_size]
+            # Train: dates[0 : (fold+1)*fold_size - horizon]  (embargo: a row
+            #        at D is labelled with close[D+horizon], which must not
+            #        fall inside the validation window — see _time_split)
+            val_start_idx = (fold + 1) * fold_size
+            val_start = unique_dates[val_start_idx]
             val_end_idx = min((fold + 2) * fold_size - 1, n_dates - 1)
             val_end = unique_dates[val_end_idx]
 
+            train_end_idx = val_start_idx - 1 - horizon
+            embargo_days = horizon
+            if train_end_idx < 0:
+                logger.warning(
+                    "Fold {}: only {} dates precede validation — cannot embargo {} "
+                    "trading days; falling back to NO embargo", fold, val_start_idx, horizon)
+                train_end_idx = val_start_idx - 1
+                embargo_days = 0
+            train_end = unique_dates[train_end_idx]
+
             train_mask = dates <= train_end
             val_mask = (dates >= val_start) & (dates <= val_end)
+            logger.info("Fold {}: train ..{} | embargo {} trading days | val {}..{}",
+                        fold, str(train_end)[:10], embargo_days,
+                        str(val_start)[:10], str(val_end)[:10])
 
             if train_mask.sum() < 100 or val_mask.sum() < 20:
                 logger.debug("Fold {} skipped: train={}, val={}", fold,
@@ -242,7 +346,8 @@ class StockRanker:
         )
         return metrics
 
-    def train_fast(self, df: pd.DataFrame, val_frac: float = 0.15) -> dict:
+    def train_fast(self, df: pd.DataFrame, val_frac: float = 0.15,
+                   horizon: int = DEFAULT_HORIZON) -> dict:
         """Single-pass training for walk-forward loops (no CV, no auto-save).
 
         Parameters
@@ -251,7 +356,12 @@ class StockRanker:
             Must contain ``date``, FEATURE_COLS, and the label column
             (``fwd_ret`` by default, or ``excess_ret`` / others).
         val_frac : float
-            Fraction of the most recent dates used as validation set.
+            Fraction of the most recent *dates* used as validation set
+            (date-level split, see :func:`_time_split`).
+        horizon : int
+            Label horizon in trading days; the last ``horizon`` dates before
+            the validation start are embargoed from train so no training
+            label window overlaps the validation period.
 
         Returns
         -------
@@ -287,9 +397,10 @@ class StockRanker:
                 grade[mask] = bins.astype(np.int32)
             y = grade
 
-        # Split by time: last val_frac as validation
-        n = len(df)
-        split_idx = int(n * (1 - val_frac))
+        # Split by trading date (never by row position) with a label-horizon
+        # embargo: rows in the gap are in neither mask.
+        train_mask, val_mask = _time_split(df, val_frac, horizon)
+        n_train, n_val = int(train_mask.sum()), int(val_mask.sum())
 
         # --- Build LGB params (with env-controlled seed for multi-seed runs) ---
         import os as _os
@@ -334,7 +445,7 @@ class StockRanker:
         # Apply user overrides
         params.update(self._lgb_params_override)
 
-        if split_idx < 100 or n - split_idx < 20:
+        if n_train < 100 or n_val < 20:
             # Fallback: train on everything, no early stopping
             if is_rank:
                 groups = pd.Series(dates).groupby(dates).size().values
@@ -346,18 +457,22 @@ class StockRanker:
             self.feature_importance = dict(zip(self.feature_cols, importance.tolist()))
             return {"mae": float("nan"), "ic": float("nan"), "best_rounds": 200}
 
+        X_tr, y_tr, d_tr = X[train_mask], y[train_mask], dates[train_mask]
+        X_va, y_va, d_va = X[val_mask], y[val_mask], dates[val_mask]
         if is_rank:
-            train_groups = pd.Series(dates[:split_idx]).groupby(dates[:split_idx]).size().values
-            val_groups = pd.Series(dates[split_idx:]).groupby(dates[split_idx:]).size().values
-            dtrain = lgb.Dataset(X[:split_idx], label=y[:split_idx],
+            # df is date-sorted and masks preserve order, so per-date groups
+            # stay contiguous as LambdaRank requires.
+            train_groups = pd.Series(d_tr).groupby(d_tr).size().values
+            val_groups = pd.Series(d_va).groupby(d_va).size().values
+            dtrain = lgb.Dataset(X_tr, label=y_tr,
                                  group=train_groups,
                                  feature_name=list(self.feature_cols))
-            dval = lgb.Dataset(X[split_idx:], label=y[split_idx:],
+            dval = lgb.Dataset(X_va, label=y_va,
                                group=val_groups, reference=dtrain)
         else:
-            dtrain = lgb.Dataset(X[:split_idx], label=y[:split_idx],
+            dtrain = lgb.Dataset(X_tr, label=y_tr,
                                  feature_name=list(self.feature_cols))
-            dval = lgb.Dataset(X[split_idx:], label=y[split_idx:], reference=dtrain)
+            dval = lgb.Dataset(X_va, label=y_va, reference=dtrain)
 
         callbacks = [
             lgb.early_stopping(stopping_rounds=50, verbose=False),
@@ -370,10 +485,10 @@ class StockRanker:
         importance = self.model.feature_importance(importance_type="gain")
         self.feature_importance = dict(zip(self.feature_cols, importance.tolist()))
 
-        preds = self.model.predict(X[split_idx:])
+        preds = self.model.predict(X_va)
 
         # Use raw continuous labels for metrics when lambdarank quantized them
-        y_eval = y_raw[split_idx:] if is_rank else y[split_idx:]
+        y_eval = y_raw[val_mask] if is_rank else y_va
         mae = float(np.mean(np.abs(preds - y_eval)))
 
         from scipy.stats import spearmanr
@@ -381,7 +496,7 @@ class StockRanker:
         ic = float(ic) if not np.isnan(ic) else 0.0
 
         # Top-K metrics on validation set
-        topk = _topk_metrics(preds, y_eval, dates[split_idx:], k=10)
+        topk = _topk_metrics(preds, y_eval, d_va, k=10)
 
         return {
             "mae": mae,
@@ -527,7 +642,8 @@ class TwoStageRanker:
 
     # ----- training -----
 
-    def train_fast(self, df: pd.DataFrame, val_frac: float = 0.15) -> dict:
+    def train_fast(self, df: pd.DataFrame, val_frac: float = 0.15,
+                   horizon: int = DEFAULT_HORIZON) -> dict:
         """Train both stages on *df*.
 
         1. Train Stage-1 (regression on fwd_ret) on full data.
@@ -538,7 +654,7 @@ class TwoStageRanker:
         from mp.ml.stage2_features import compute_stage2_features
 
         # Stage 1
-        m1 = self.stage1.train_fast(df, val_frac)
+        m1 = self.stage1.train_fast(df, val_frac, horizon=horizon)
         logger.info("Stage-1 trained: IC={:.3f}, HitRate@K={:.3f}",
                      m1.get("ic", 0), m1.get("hit_rate_at_k", 0))
 
@@ -559,7 +675,7 @@ class TwoStageRanker:
         filtered = compute_stage2_features(filtered)
 
         # Stage 2 train
-        m2 = self.stage2.train_fast(filtered, val_frac)
+        m2 = self.stage2.train_fast(filtered, val_frac, horizon=horizon)
         logger.info("Stage-2 trained: IC={:.3f}, HitRate@K={:.3f}",
                      m2.get("ic", 0), m2.get("hit_rate_at_k", 0))
 
@@ -656,14 +772,15 @@ class BlendRanker:
 
         return df.groupby("date", group_keys=False).apply(_keep)
 
-    def train_fast(self, df: pd.DataFrame, val_frac: float = 0.15) -> dict:
+    def train_fast(self, df: pd.DataFrame, val_frac: float = 0.15,
+                   horizon: int = DEFAULT_HORIZON) -> dict:
         """Train both component models.
 
         1. Primary model: trained on all data with ``primary_label``.
         2. Extreme model: trained on top/bottom extremes with ``excess_ret``.
         """
         # Primary (excess_ret)
-        m1 = self.primary.train_fast(df, val_frac)
+        m1 = self.primary.train_fast(df, val_frac, horizon=horizon)
         logger.info("BlendRanker primary: IC={:.3f}", m1.get("ic", 0))
 
         # Extreme — filter requires excess_ret; fall back to fwd_ret rows only
@@ -671,7 +788,7 @@ class BlendRanker:
         extreme_df = self._filter_extremes(
             df[df[filter_col].notna()].copy()
         )
-        m2 = self.extreme.train_fast(extreme_df, val_frac)
+        m2 = self.extreme.train_fast(extreme_df, val_frac, horizon=horizon)
         logger.info("BlendRanker extreme: IC={:.3f}, train rows={}",
                      m2.get("ic", 0), len(extreme_df))
 
