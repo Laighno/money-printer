@@ -1414,19 +1414,38 @@ def generate_order_list(
     buy_cap = min(cash_after_sells * 0.95, room_under_cap)
     buys_total = sum(o["cost"] for o in buys)
     if buys_total > buy_cap and buys_total > 0:
-        # Scale down each buy proportionally, re-rounding to lots
-        scale = buy_cap / buys_total
+        # 2026-10-16 fix #2: fit buys into the budget by SPENDING DOWN the
+        # budget in conviction order, not by scaling every order's share count
+        # by the same ratio.
+        #
+        # The proportional-scaling version died on lot rounding: with a 6%
+        # overshoot (buys 100,376 vs cap 94,539) the ratio was 0.94, and
+        # int(100 * 0.94 / 100) * 100 == 0 for every single-lot order. 10 of
+        # 14 buys were dropped outright and only 1.4万 of a 9.4万 budget was
+        # deployed — the same "sells run, buys don't" bleed in a new disguise,
+        # just relabelled 受预算约束 instead of 受总仓位上限约束.
+        #
+        # Spending down in order keeps whole lots intact: each name is bought
+        # in full if it still fits, trimmed to the lots that do fit otherwise,
+        # and only genuinely unaffordable names are skipped. buys arrive
+        # conviction-sorted from Pass-1, so the budget goes to the strongest
+        # signals first.
+        remaining = buy_cap
         scaled_buys: list[dict] = []
         for o in buys:
             limit = o["limit_price"]
-            new_shares = int(o["shares"] * scale / 100) * 100
-            if new_shares >= 100:
+            lot_cost = limit * 100
+            affordable_lots = int(remaining / lot_cost) if lot_cost > 0 else 0
+            wanted_lots = int(o["shares"] / 100)
+            take_lots = min(wanted_lots, affordable_lots)
+            if take_lots >= 1:
                 o = dict(o)
-                o["shares"] = new_shares
-                o["cost"] = new_shares * limit
+                o["shares"] = take_lots * 100
+                o["cost"] = o["shares"] * limit
+                remaining -= o["cost"]
                 scaled_buys.append(o)
             else:
-                # Buy can't even afford 1 lot at scaled budget — alert
+                # Not even one lot fits in what's left of the budget.
                 alerts.append(
                     f"⚠️ {o['name']} ({o['code']}) 受预算约束，无法完成完整加仓。"
                 )
@@ -1465,16 +1484,22 @@ def generate_order_list(
         current_sells = [o for o in rebalance_orders if o["cost"] <= 0]
         current_buy_total = sum(o["cost"] for o in current_buys)
         if current_buy_total > 0:
+            # 2026-10-16: same lot-rounding trap as the cash step above —
+            # scaling every order by one ratio rounds single-lot buys to zero.
+            # Spend down the allowed budget in conviction order instead.
             new_buy_budget = max(0.0, current_buy_total - excess)
-            scale2 = new_buy_budget / current_buy_total
+            remaining2 = new_buy_budget
             scaled_buys2: list[dict] = []
             for o in current_buys:
                 limit = float(o["limit_price"])
-                new_shares = int(int(o["shares"]) * scale2 / 100) * 100
-                if new_shares >= 100:
+                lot_cost = limit * 100
+                affordable_lots = int(remaining2 / lot_cost) if lot_cost > 0 else 0
+                take_lots = min(int(int(o["shares"]) / 100), affordable_lots)
+                if take_lots >= 1:
                     o2 = dict(o)
-                    o2["shares"] = new_shares
-                    o2["cost"] = new_shares * limit
+                    o2["shares"] = take_lots * 100
+                    o2["cost"] = o2["shares"] * limit
+                    remaining2 -= o2["cost"]
                     scaled_buys2.append(o2)
                 else:
                     alerts.append(

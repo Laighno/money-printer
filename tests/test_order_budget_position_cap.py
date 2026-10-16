@@ -154,3 +154,46 @@ def test_cap_alert_still_fires_when_genuinely_overinvested(monkeypatch):
     # correct behaviour is to add NO new exposure; sells may still trim it.
     bought = sum(o["cost"] for o in orders if o["cost"] > 0)
     assert bought == 0, f"added {bought:,.0f} of buys to an already-overinvested book"
+
+
+def test_small_overshoot_does_not_wipe_out_single_lot_buys(monkeypatch):
+    """A 6% budget overshoot must trim lots, not delete every order.
+
+    2026-10-16 part two. After the first fix the plan still produced almost no
+    buys: ``buys_total`` 100,376 against a 94,539 budget gave scale 0.94, and
+    the old code computed ``int(shares * 0.94 / 100) * 100``. For a 100-share
+    order that is ``int(0.94) * 100 == 0``, so 10 of 14 names were dropped
+    outright and only ¥14k of a ¥94k budget was deployed. Expensive A-share
+    lots mean most orders ARE single-lot, so proportional share-scaling fails
+    exactly when it is needed.
+    """
+    from scripts import daily_report
+
+    # Eight names, one lot each, priced so the total slightly exceeds budget.
+    closes = {f"00000{i}": 100.0 for i in range(1, 9)}
+    monkeypatch.setattr(daily_report, "_latest_closes", lambda codes: closes)
+
+    acct = {
+        "total_assets": 100000.0,
+        "cash_available": 75000.0,     # budget ≈ 71,250 vs ~80,000 wanted
+        "market_value": 0.0,
+        "target_position_pct": 0.85,
+        "hard_single_weight": 0.40,
+        "rebalance_tolerance": 0.02,
+    }
+    recs = _recs({c: 5.0 - i * 0.1 for i, c in enumerate(closes)})
+    orders, alerts = daily_report.generate_order_list(
+        [], acct, recs, _scored(list(closes)),
+    )
+
+    buys = [o for o in orders if o["cost"] > 0]
+    spent = sum(o["cost"] for o in buys)
+    budget = acct["cash_available"] * 0.95
+
+    assert len(buys) >= 5, (
+        f"only {len(buys)} buys survived a 6% overshoot; alerts={alerts!r}"
+    )
+    assert spent >= budget * 0.80, (
+        f"deployed only {spent:,.0f} of a {budget:,.0f} budget"
+    )
+    assert spent <= budget + 1e-6, f"overspent: {spent:,.0f} > {budget:,.0f}"
