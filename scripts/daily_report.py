@@ -1398,7 +1398,20 @@ def generate_order_list(
     buys = [o for o in rebalance_orders if o["cost"] > 0]
     proceeds_total = sum(-o["cost"] for o in sells)
     cash_after_sells = cash_available + proceeds_total
-    buy_cap = cash_after_sells * 0.95   # 5% fee buffer
+    # 2026-10-16 fix: the buy budget must respect BOTH the cash on hand AND the
+    # room left under the target position cap.  Previously this step only
+    # capped by cash (cash × 0.95), so on a cash-heavy account it sized buys up
+    # to the full cash pile; the total-position step further down then saw
+    # holdings + those buys exceed target_pos_pct and dropped EVERY buy with
+    # "当前总仓 90.9% > 上限 85%".  Net effect: sells executed, buys never did,
+    # and the book bled down from ~85% to 29% invested over ~3 weeks while the
+    # alert text blamed an over-allocation that did not exist (actual holdings
+    # were 36%).  Deriving one budget here keeps the two steps consistent, so
+    # buys get SCALED to fit the cap instead of being dropped wholesale.
+    held_value_now = sum(current_value.get(c, 0.0) for c in held_shares)
+    sold_value = sum(-o["cost"] for o in sells)
+    room_under_cap = max(0.0, investable - (held_value_now - sold_value))
+    buy_cap = min(cash_after_sells * 0.95, room_under_cap)
     buys_total = sum(o["cost"] for o in buys)
     if buys_total > buy_cap and buys_total > 0:
         # Scale down each buy proportionally, re-rounding to lots
