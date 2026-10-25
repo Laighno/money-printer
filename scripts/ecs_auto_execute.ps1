@@ -63,10 +63,11 @@ Log "==================== ECS auto-execute start ===================="
 # every protected path globally.
 $env:MP_ALLOW_PROD_WRITE = "1"
 
-# CUTOVER 2026-09-02 (user approved after live order+cancel smoke ALL PASS):
-# execution now goes through the BigQMT file bridge (miniQMT retires 9/27).
-# Rollback: comment out this line -> next run uses miniQMT again (until 9/27).
-$env:MP_BROKER = "bridge"
+# CUTOVER 2026-10-25: the file bridge died when the broker banned file reads in
+# the QMT built-in Python (2026-10-23). Orders now travel as FILENAMES, which
+# os.listdir still returns. See scripts/bigqmt_namebridge_strategy.py.
+# Rollback is NOT to "bridge" (that transport cannot load at all any more).
+$env:MP_BROKER = "namebridge"
 
 # Ensure log dir exists
 $LogDir = Split-Path $LogPath
@@ -82,20 +83,29 @@ $head = (& git rev-parse --short HEAD).Trim()
 Log "Step 1: HEAD = $head"
 
 # Step 2: liveness gate for the active broker transport.
-# bridge: heartbeat.json must be fresh (BigQMT client + MONEY strategy running).
+# namebridge: hb\<epoch>.hb filenames must be fresh (the sandbox cannot write
+#   readable content, so the tick time lives in the NAME).
+# bridge: dead since 2026-10-23, kept only to fail loudly if someone sets it.
 # miniqmt (rollback): XtMiniQmt process must exist.
-if ($env:MP_BROKER -eq "bridge") {
-    Log "Step 2: verify bridge heartbeat (BigQMT strategy alive)"
-    try {
-        $hb = Get-Content "$REPO\data\bridge\heartbeat.json" -Raw | ConvertFrom-Json
-        $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$hb.ts
-    } catch {
-        Abort "bridge heartbeat unreadable -- is BigQMT client + MONEY strategy running?"
+if ($env:MP_BROKER -eq "namebridge") {
+    Log "Step 2: verify namebridge heartbeat (NAMEBRIDGE strategy alive)"
+    $HbDir = "C:\guojin\python\mp_orders\hb"
+    $stamps = @()
+    if (Test-Path $HbDir) {
+        $stamps = Get-ChildItem $HbDir -Filter "*.hb" -ErrorAction SilentlyContinue |
+                  ForEach-Object { [int]($_.BaseName) }
     }
+    if (-not $stamps -or $stamps.Count -eq 0) {
+        Abort "no namebridge heartbeat -- load NAMEBRIDGE.py as a BigQMT model strategy + run it"
+    }
+    $newest = ($stamps | Measure-Object -Maximum).Maximum
+    $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $newest
     if ($age -gt 30) {
-        Abort "bridge heartbeat stale (${age}s > 30s) -- start MONEY strategy in BigQMT + retry"
+        Abort "namebridge heartbeat stale (${age}s > 30s) -- restart NAMEBRIDGE strategy"
     }
-    Log "  bridge heartbeat OK (${age}s)"
+    Log "  namebridge heartbeat OK (${age}s)"
+} elseif ($env:MP_BROKER -eq "bridge") {
+    Abort "MP_BROKER=bridge is dead (broker banned file reads 2026-10-23); use namebridge"
 } else {
     Log "Step 2: verify XtMiniQmt running"
     $qmt = Get-Process -Name "XtMiniQmt" -ErrorAction SilentlyContinue
