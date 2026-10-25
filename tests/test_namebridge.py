@@ -127,7 +127,7 @@ def test_order_file_is_created_and_receipt_is_honoured(tmp_path):
     (b.done_dir / "777__sent__xt42__mp.rcpt").touch()
 
     res = b.place_limit_order("600363", "buy", 100, 8.76, seq="777", timeout=2)
-    assert res.success and res.order_id == "xt42" and res.status == "sent"
+    assert res.success and res.order_id == "xt42" and res.error is None
     assert (tmp_path / "777__B__600363__100__000876__mp.ord").exists()
 
 
@@ -138,7 +138,7 @@ def test_failed_receipt_is_not_reported_as_success(tmp_path):
 
     res = b.place_limit_order("600363", "buy", 100, 8.76, seq="778", timeout=2)
     assert not res.success
-    assert res.status == "failed"
+    assert "failed" in res.error
 
 
 def test_claimed_order_without_receipt_is_unknown_not_failed(tmp_path):
@@ -162,7 +162,7 @@ def test_claimed_order_without_receipt_is_unknown_not_failed(tmp_path):
     threading.Thread(target=claim, daemon=True).start()
     res = b.place_limit_order("600363", "buy", 100, 8.76, seq="779", timeout=1.5)
     assert not res.success
-    assert res.status == "unknown_submitted"
+    assert "unknown_submitted" in res.error
 
 
 def test_untouched_order_without_receipt_is_plain_no_receipt(tmp_path):
@@ -171,7 +171,7 @@ def test_untouched_order_without_receipt_is_plain_no_receipt(tmp_path):
     b.done_dir.mkdir(parents=True)
     res = b.place_limit_order("600363", "buy", 100, 8.76, seq="780", timeout=1.0)
     assert not res.success
-    assert res.status == "no_receipt"
+    assert "no_receipt" in res.error
 
 
 def test_prune_removes_only_consumed_files(tmp_path):
@@ -192,3 +192,94 @@ def test_prune_removes_only_consumed_files(tmp_path):
     removed = b.prune(max_age_hours=24.0)
     assert removed == 3
     assert pending.exists(), "an unsubmitted order must never be pruned"
+
+
+# ------------------------------------------------------- published state
+def _acct(tmp_path, ts_offset=0, cash=26264.90, mv=135267.0, total=161513.0):
+    b = NameBridgeBroker(ord_dir=str(tmp_path))
+    b.acct_dir.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time()) + ts_offset
+    name = f"{ts}__{int(cash*100)}__{int(mv*100)}__{int(total*100)}.acct"
+    (b.acct_dir / name).touch()
+    return b
+
+
+def test_account_snapshot_decodes_fen_back_to_yuan(tmp_path):
+    b = _acct(tmp_path)
+    a = b.get_account_info()
+    assert a.cash_available == pytest.approx(26264.90)
+    assert a.market_value == pytest.approx(135267.0)
+    assert a.total_assets == pytest.approx(161513.0)
+
+
+def test_stale_account_state_raises_rather_than_returning_stale(tmp_path):
+    """Trading on a stale book is worse than not trading at all."""
+    from mp.execution.namebridge_broker import STATE_MAX_AGE
+    b = _acct(tmp_path, ts_offset=-int(STATE_MAX_AGE) - 60)
+    with pytest.raises(RuntimeError, match="old"):
+        b.get_account_info()
+
+
+def test_missing_account_state_raises(tmp_path):
+    b = NameBridgeBroker(ord_dir=str(tmp_path))
+    b.acct_dir.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="no account snapshot"):
+        b.get_account_info()
+
+
+def test_positions_decode_with_market_value_derived(tmp_path):
+    b = NameBridgeBroker(ord_dir=str(tmp_path))
+    b.pos_dir.mkdir(parents=True)
+    (b.pos_dir / "600363__600__600__297423__871.pos").touch()
+    (b.pos_dir / "000582__400__0__958__889.pos").touch()
+
+    ps = {p.code: p for p in b.get_positions()}
+    assert set(ps) == {"600363", "000582"}
+    assert ps["600363"].shares_total == 600
+    assert ps["600363"].avg_cost == pytest.approx(2974.23)
+    assert ps["600363"].market_price == pytest.approx(8.71)
+    assert ps["600363"].market_value == pytest.approx(600 * 8.71)
+    # T+1 locked shares must survive the round trip: 0 available, 400 held.
+    assert ps["000582"].shares_available == 0
+
+
+def test_orders_decode_for_the_idempotency_check(tmp_path):
+    """execute_orders keys on (code, action, shares, limit_price)."""
+    b = NameBridgeBroker(ord_dir=str(tmp_path))
+    b.ordq_dir.mkdir(parents=True)
+    (b.ordq_dir / "xt1082134677__600363__B__100__0__rejected__820.oq").touch()
+    (b.ordq_dir / "xt1090606341__000582__S__300__300__filled__877.oq").touch()
+
+    os_ = {o.order_id: o for o in b.get_orders(only_today=True)}
+    a = os_["xt1082134677"]
+    assert (a.code, a.action, a.shares_submitted) == ("600363", "buy", 100)
+    assert a.status == "rejected" and a.shares_filled == 0
+    assert a.limit_price == pytest.approx(8.20)
+
+    f = os_["xt1090606341"]
+    assert f.action == "sell" and f.status == "filled" and f.shares_filled == 300
+
+
+def test_malformed_state_files_are_skipped_not_fatal(tmp_path):
+    b = NameBridgeBroker(ord_dir=str(tmp_path))
+    b.pos_dir.mkdir(parents=True)
+    b.ordq_dir.mkdir(parents=True)
+    (b.pos_dir / "garbage.pos").touch()
+    (b.pos_dir / "600363__notanint__600__297423__871.pos").touch()
+    (b.pos_dir / "600363__600__600__297423__871.pos").touch()
+    (b.ordq_dir / "too__few.oq").touch()
+
+    assert len(b.get_positions()) == 1
+    assert b.get_orders() == []
+
+
+def test_emergency_liquidate_refuses_rather_than_half_working(tmp_path):
+    b = NameBridgeBroker(ord_dir=str(tmp_path))
+    with pytest.raises(NotImplementedError):
+        b.emergency_liquidate_all()
+
+
+def test_factory_returns_the_namebridge(monkeypatch):
+    from mp.execution.broker_factory import make_broker
+    monkeypatch.setenv("MP_BROKER", "namebridge")
+    assert type(make_broker()).__name__ == "NameBridgeBroker"

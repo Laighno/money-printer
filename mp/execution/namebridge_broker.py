@@ -34,24 +34,24 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from loguru import logger
 
+from mp.execution.qmt_broker import (
+    AccountInfo,
+    OrderResult,
+    OrderStatus,
+    Position,
+)
+
 ORD_DIR_DEFAULT = r"C:\guojin\python\mp_orders"
 HEARTBEAT_MAX_AGE = 30.0     # sec; strategy ticks every 2s
 RECEIPT_TIMEOUT = 25.0       # sec to wait for a receipt after writing an order
 RECEIPT_POLL = 0.25
-
-
-@dataclass
-class NameOrderResult:
-    success: bool
-    order_id: Optional[str]
-    status: str
-    error: Optional[str] = None
+STATE_MAX_AGE = 120.0        # sec; strategy refreshes state every ~10s
 
 
 def encode_order(seq: str, side: str, code: str, shares: int,
@@ -92,10 +92,12 @@ def decode_receipt(name: str) -> Optional[dict]:
 class NameBridgeBroker:
     """Submit orders by filename; read receipts and account state as files.
 
-    Account/position queries are NOT available through this channel - the
-    strategy can only write names, which is far too thin for a position book.
-    Callers that need live account state should read it from the daily QMT
-    export or portfolio.yaml. ``connect`` only proves the strategy is alive.
+    Implements the broker interface ``execute_orders`` relies on. Account,
+    position and order state are published by the strategy as filenames under
+    ``acct/``, ``pos/`` and ``ords/`` and refreshed every ~10s, because the
+    safety gates (cash/position parity, the idempotency re-check) cannot run
+    without them. State older than ``STATE_MAX_AGE`` raises rather than being
+    returned stale: trading on a stale book is worse than not trading.
     """
 
     def __init__(self, ord_dir: str = ORD_DIR_DEFAULT,
@@ -103,6 +105,9 @@ class NameBridgeBroker:
         self.ord_dir = Path(ord_dir)
         self.done_dir = self.ord_dir / "done"
         self.hb_dir = self.ord_dir / "hb"
+        self.acct_dir = self.ord_dir / "acct"
+        self.pos_dir = self.ord_dir / "pos"
+        self.ordq_dir = self.ord_dir / "ords"
         self.account_id = account_id
 
     # ---------------------------------------------------------------- liveness
@@ -147,7 +152,7 @@ class NameBridgeBroker:
     def place_limit_order(self, code: str, action: str, shares: int,
                           limit_price: float, seq: Optional[str] = None,
                           tag: str = "mp",
-                          timeout: float = RECEIPT_TIMEOUT) -> NameOrderResult:
+                          timeout: float = RECEIPT_TIMEOUT) -> OrderResult:
         side = "B" if action.lower() in ("buy", "b") else "S"
         if seq is None:
             # Monotonic and unique within a day; the strategy sorts on it.
@@ -158,15 +163,18 @@ class NameBridgeBroker:
         try:
             path.touch()
         except OSError as e:
-            return NameOrderResult(False, None, "write_failed", repr(e))
+            return OrderResult(success=False, error=f"write_failed: {e!r}",
+                               code=code, action=action, shares=shares)
 
         deadline = time.time() + timeout
         while time.time() < deadline:
             rcpt = self._find_receipt(seq)
             if rcpt is not None:
                 ok = rcpt["status"] == "sent"
-                return NameOrderResult(ok, rcpt["order_id"], rcpt["status"],
-                                       None if ok else rcpt["status"])
+                return OrderResult(
+                    success=ok, order_id=rcpt["order_id"],
+                    error=None if ok else f"strategy reported {rcpt['status']}",
+                    code=code, action=action, shares=shares)
             time.sleep(RECEIPT_POLL)
 
         # No receipt. The order may still have been submitted - the strategy
@@ -176,7 +184,10 @@ class NameBridgeBroker:
         status = "unknown_submitted" if claimed else "no_receipt"
         logger.error("namebridge: no receipt for seq={} after {:.0f}s "
                      "(claimed={})", seq, timeout, claimed)
-        return NameOrderResult(False, None, status, "receipt timeout")
+        # execute_orders re-queries get_orders on failure and promotes a match
+        # to unknown_submitted itself; the error text says which case this is.
+        return OrderResult(success=False, error=f"{status}: receipt timeout",
+                           code=code, action=action, shares=shares)
 
     def _find_receipt(self, seq: str) -> Optional[dict]:
         try:
@@ -187,6 +198,103 @@ class NameBridgeBroker:
         except OSError:
             pass
         return None
+
+    # ------------------------------------------------------- published state
+    def _newest(self, directory: Path, suffix: str) -> Optional[str]:
+        try:
+            names = [n for n in os.listdir(directory) if n.endswith(suffix)]
+        except OSError:
+            return None
+        return max(names) if names else None
+
+    def get_account_info(self) -> AccountInfo:
+        """``<ts>__<cash_fen>__<mv_fen>__<total_fen>.acct`` -> AccountInfo."""
+        name = self._newest(self.acct_dir, ".acct")
+        if not name:
+            raise RuntimeError(
+                f"namebridge: no account snapshot in {self.acct_dir}; "
+                "is the QMT strategy running?")
+        parts = name[:-5].split("__")
+        ts = int(parts[0])
+        age = time.time() - ts
+        if age > STATE_MAX_AGE:
+            raise RuntimeError(
+                f"namebridge: account snapshot is {age:.0f}s old "
+                f"(max {STATE_MAX_AGE:.0f}s) - strategy stalled?")
+        cash, mv, total = (int(parts[1]) / 100.0, int(parts[2]) / 100.0,
+                           int(parts[3]) / 100.0)
+        return AccountInfo(
+            cash_available=cash, cash_frozen=0.0, market_value=mv,
+            total_assets=total,
+            updated_at=datetime.fromtimestamp(ts).isoformat(timespec="seconds"))
+
+    def get_positions(self) -> list[Position]:
+        """``<code>__<total>__<avail>__<cost_fen>__<px_fen>.pos`` -> Positions."""
+        out: list[Position] = []
+        try:
+            names = os.listdir(self.pos_dir)
+        except OSError:
+            return out
+        for n in names:
+            if not n.endswith(".pos"):
+                continue
+            parts = n[:-4].split("__")
+            if len(parts) < 5:
+                continue
+            try:
+                total = int(parts[1])
+                px = int(parts[4]) / 100.0
+                out.append(Position(
+                    code=parts[0], name="", shares_total=total,
+                    shares_available=int(parts[2]),
+                    avg_cost=int(parts[3]) / 100.0,
+                    market_price=px, market_value=total * px))
+            except ValueError:
+                continue
+        return out
+
+    def get_orders(self, only_today: bool = True) -> list[OrderStatus]:
+        """``<oid>__<code>__<B|S>__<sub>__<filled>__<status>__<px_fen>.oq``.
+
+        The strategy only ever publishes today's orders, so ``only_today`` is
+        accepted for interface parity and has no effect.
+        """
+        out: list[OrderStatus] = []
+        try:
+            names = os.listdir(self.ordq_dir)
+        except OSError:
+            return out
+        for n in names:
+            if not n.endswith(".oq"):
+                continue
+            parts = n[:-3].split("__")
+            if len(parts) < 7:
+                continue
+            try:
+                out.append(OrderStatus(
+                    order_id=parts[0], code=parts[1],
+                    action="buy" if parts[2] == "B" else "sell",
+                    shares_submitted=int(parts[3]),
+                    shares_filled=int(parts[4]),
+                    avg_fill_price=0.0,
+                    status=parts[5],
+                    limit_price=int(parts[6]) / 100.0 or None))
+            except ValueError:
+                continue
+        return out
+
+    def disconnect(self) -> None:
+        """Nothing to tear down: the channel is a directory."""
+
+    def emergency_liquidate_all(self, *args, **kwargs):
+        """Not available through the filename channel.
+
+        Liquidation needs live prices per holding and a tight submit loop; the
+        name channel publishes state only every ~10s. Raising is the honest
+        answer - a half-working panic button is worse than none.
+        """
+        raise NotImplementedError(
+            "namebridge cannot liquidate; use the QMT client directly")
 
     # ------------------------------------------------------------- maintenance
     def prune(self, max_age_hours: float = 24.0) -> int:

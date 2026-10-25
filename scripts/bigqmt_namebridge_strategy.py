@@ -41,6 +41,14 @@
 #   heartbeat : ORD_DIR\hb\<unix_ts>.hb  - one file per tick, old ones removed.
 #               External side reads the NAME (its own listdir) to get the time;
 #               it cannot read content either way, so the name carries it.
+#   account   : ORD_DIR\acct\<ts>__<cash_fen>__<mv_fen>__<total_fen>.acct
+#   positions : ORD_DIR\pos\<code>__<total>__<avail>__<cost_fen>__<px_fen>.pos
+#   orders    : ORD_DIR\ords\<oid>__<code>__<B|S>__<sub>__<filled>__<status>__<px_fen>.oq
+#               Refreshed every SNAP_EVERY ticks. execute_orders' safety gates
+#               (cash/position parity, idempotency re-check) need this state and
+#               the sandbox cannot hand back content, so it goes in names too.
+#               Amounts are integer fen; a float in a filename invites locale
+#               and rounding surprises on the 3.6 side.
 #
 # DEPLOY: QMT client -> 模型交易 -> new strategy -> paste this file -> run.
 # ASCII-only string literals (the client parses .py as GBK).
@@ -52,6 +60,10 @@ ACCOUNT = "8886933837"
 ORD_DIR = r"C:\guojin\python\mp_orders"
 DONE_DIR = os.path.join(ORD_DIR, "done")
 HB_DIR = os.path.join(ORD_DIR, "hb")
+ACCT_DIR = os.path.join(ORD_DIR, "acct")
+POS_DIR = os.path.join(ORD_DIR, "pos")
+ORDQ_DIR = os.path.join(ORD_DIR, "ords")
+SNAP_EVERY = 5          # ticks between state snapshots (~10s at 2s/tick)
 
 # passorder constants (same values the file bridge used)
 OPTYPE_BUY = 23
@@ -60,11 +72,12 @@ ORDERBY_VOLUME = 1101
 PRTYPE_LIMIT = 11
 
 _last_hb = [0.0]
+_tick_n = [0]
 _seen = {}          # seq -> submitted ts, guards against double submit in-process
 
 
 def _ensure_dirs():
-    for d in (ORD_DIR, DONE_DIR, HB_DIR):
+    for d in (ORD_DIR, DONE_DIR, HB_DIR, ACCT_DIR, POS_DIR, ORDQ_DIR):
         try:
             if not os.path.isdir(d):
                 os.makedirs(d)
@@ -206,9 +219,104 @@ def _heartbeat():
         pass
 
 
+def _fen(x):
+    try:
+        return int(round(float(x) * 100))
+    except Exception:
+        return 0
+
+
+def _clear(d):
+    try:
+        for n in os.listdir(d):
+            try:
+                os.remove(os.path.join(d, n))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _snap_account():
+    try:
+        rows = get_trade_detail_data(ACCOUNT, "stock", "account")
+    except Exception as e:
+        print("namebridge account query failed: %r" % (e,))
+        return
+    if not rows:
+        return
+    a = rows[0]
+    cash = _fen(getattr(a, "m_dAvailable", 0))
+    mv = _fen(getattr(a, "m_dInstrumentValue", 0))
+    total = _fen(getattr(a, "m_dBalance", 0))
+    _clear(ACCT_DIR)
+    _write_marker(os.path.join(
+        ACCT_DIR, "%d__%d__%d__%d.acct" % (int(time.time()), cash, mv, total)))
+
+
+def _snap_positions():
+    try:
+        rows = get_trade_detail_data(ACCOUNT, "stock", "position")
+    except Exception as e:
+        print("namebridge position query failed: %r" % (e,))
+        return
+    _clear(POS_DIR)
+    for p in rows:
+        try:
+            code = str(p.m_strInstrumentID).split(".")[0]
+            total = int(getattr(p, "m_nVolume", 0))
+            avail = int(getattr(p, "m_nCanUseVolume", 0))
+            cost = _fen(getattr(p, "m_dOpenPrice", 0))
+            px = _fen(getattr(p, "m_dLastPrice", 0))
+            if total <= 0:
+                continue
+            _write_marker(os.path.join(POS_DIR, "%s__%d__%d__%d__%d.pos" % (
+                code, total, avail, cost, px)))
+        except Exception:
+            continue
+
+
+def _snap_orders():
+    """Today's orders. execute_orders needs these for its idempotency check."""
+    try:
+        rows = get_trade_detail_data(ACCOUNT, "stock", "order")
+    except Exception as e:
+        print("namebridge order query failed: %r" % (e,))
+        return
+    smap = {48: "pending", 49: "pending", 50: "pending", 51: "pending",
+            52: "partial", 53: "filled", 54: "cancelled", 55: "cancelled",
+            56: "rejected", 57: "rejected"}
+    _clear(ORDQ_DIR)
+    for o in rows:
+        try:
+            oid = str(o.m_strOrderSysID).replace("_", "-")[:40]
+            code = str(o.m_strInstrumentID).split(".")[0]
+            side = "B" if int(getattr(o, "m_nDirection", 48)) == 48 else "S"
+            sub = int(getattr(o, "m_nVolumeTotalOriginal", 0))
+            fill = int(getattr(o, "m_nVolumeTraded", 0))
+            st = smap.get(int(getattr(o, "m_nOrderStatus", 0)), "pending")
+            px = _fen(getattr(o, "m_dLimitPrice", 0))
+            _write_marker(os.path.join(ORDQ_DIR, "%s__%s__%s__%d__%d__%s__%d.oq" % (
+                oid, code, side, sub, fill, st, px)))
+        except Exception:
+            continue
+
+
+def _snapshot_state():
+    _snap_account()
+    _snap_positions()
+    _snap_orders()
+
+
 def _tick(C):
     _ensure_dirs()
     _heartbeat()
+    _tick_n[0] += 1
+    if _tick_n[0] % SNAP_EVERY == 1:
+        try:
+            _snapshot_state()
+        except Exception as e:
+            print("namebridge snapshot error: %r" % (e,))
     try:
         names = os.listdir(ORD_DIR)
     except Exception as e:
@@ -242,6 +350,10 @@ def _tick(C):
             print("namebridge sent %s %s %s x%d @%.2f -> %s" % (
                 o["seq"], o["side"], o["code"], o["shares"], o["price"], oid))
             _receipt(o["seq"], "sent", oid, o["tag"])
+            try:
+                _snap_orders()
+            except Exception:
+                pass
         except Exception as e:
             print("namebridge FAILED %s: %r" % (o["seq"], e))
             _receipt(o["seq"], "failed", None, o["tag"])
