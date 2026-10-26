@@ -32,7 +32,14 @@ _REPO = Path(__file__).resolve().parent.parent.parent
 SUMMARY = _REPO / "data" / "auto_retrain_last.json"
 SWAP_LOG = _REPO / "data" / "model_swap_log.json"
 
-RED_AGE = timedelta(days=8)   # weekly cadence; >8d means a Friday was missed
+# Weekly cadence, but the Mac is usually asleep at the Friday 18:30 slot, so
+# launchd re-runs the job on next wake - Sat/Sun/Mon in practice (2026-06-24
+# decision: "睡过等醒来补跑", no pmset forced wake). Measured catch-up lag over
+# 8 consecutive runs was 1-3 days, so a genuine weekly run can legitimately
+# land 10 days after the previous one. 8 days paged for that normal drift
+# (2026-10-24 false RED); 12 keeps a missed week detectable without crying
+# wolf at the expected catch-up.
+RED_AGE = timedelta(days=12)
 
 
 def _send(markdown: str) -> None:

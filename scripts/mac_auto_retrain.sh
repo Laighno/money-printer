@@ -177,6 +177,34 @@ if [ "$first_done" = "True" ]; then
     exit 5
   fi
   echo "  ✓ Mac prod synced"
+
+  # 2026-10-26: record the swap in the status file. auto_retrain.py writes
+  # swapped=false and never revisits it (it deliberately has no --auto-swap in
+  # production; THIS script performs the swap over ssh afterwards). So the
+  # status file claimed swapped=false even on weeks where prod was replaced,
+  # which reads as "trained but never deployed" to anyone - human or monitor -
+  # inspecting it later. Stamp the truth, and push it to ECS so the deadman
+  # there sees the same thing.
+  .venv/bin/python - "$new_prefix" "$cutoff" <<'PYSTAMP'
+import json, sys
+from datetime import datetime
+from pathlib import Path
+p = Path("data/auto_retrain_last.json")
+try:
+    d = json.loads(p.read_text(encoding="utf-8"))
+except Exception as e:
+    print("  WARN: cannot stamp swap state: %r" % (e,)); sys.exit(0)
+d["swapped"] = True
+d["swapped_by"] = "mac_auto_retrain.sh"
+d["swapped_ts"] = datetime.now().isoformat(timespec="seconds")
+d["swapped_prefix"] = sys.argv[1]
+p.write_text(json.dumps(d, indent=2, default=str), encoding="utf-8")
+print("  stamped swapped=true (cutoff %s)" % sys.argv[2])
+PYSTAMP
+  scp -o ConnectTimeout=45 data/auto_retrain_last.json \
+      "$ECS:$ECS_REPO/data/auto_retrain_last.json" 2>/dev/null \
+      && echo "  ✓ status pushed to ECS" \
+      || echo "  ⚠ status push to ECS failed (deadman may read stale swapped flag)"
 else
   echo "  ECS first-swap sentinel ABSENT → ②B: first swap needs MANUAL approval."
   scp -o ConnectTimeout=45 data/retrain_pending_swap.json "$ECS:$ECS_REPO/data/retrain_pending_swap.json" 2>/dev/null || true
