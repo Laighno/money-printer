@@ -54,7 +54,7 @@ sys.path.insert(0, str(ROOT))
 
 from mp.execution.dryrun_broker import DryRunBroker
 from mp.execution.qmt_broker import (
-    AccountInfo, Position, QMTBroker,
+    AccountInfo, Position,
 )
 
 
@@ -858,14 +858,25 @@ def main() -> int:
             autofill=True,
         )
     else:
-        if not args.qmt_account or not args.qmt_userdata:
-            logger.error("--qmt-account and --qmt-userdata are required for live modes")
+        # 2026-10-26: this gate predates the BigQMT migration. Only the retired
+        # miniQMT transport needed a userdata path; the bridge and namebridge
+        # transports talk to a directory the strategy watches and derive the
+        # account from config. Demanding both args made the scheduled 9:25 task
+        # exit 1 before placing anything (the task never passed them), so the
+        # requirement now applies only to the transport that actually uses it.
+        import os as _os
+        _kind = _os.environ.get("MP_BROKER", "miniqmt").lower()
+        if _kind == "miniqmt" and (not args.qmt_account or not args.qmt_userdata):
+            logger.error("--qmt-account and --qmt-userdata are required for "
+                         "live modes on MP_BROKER=miniqmt")
             return 1
         from mp.execution.broker_factory import make_broker
-        broker = make_broker(
-            account_id=args.qmt_account,
-            qmt_userdata_path=args.qmt_userdata,
-        )
+        _mk = {}
+        if args.qmt_account:
+            _mk["account_id"] = args.qmt_account
+        if args.qmt_userdata:
+            _mk["qmt_userdata_path"] = args.qmt_userdata
+        broker = make_broker(**_mk)
 
     # Engage Arm B daily-budget tracker iff this plan came from the 14:30
     # OOS bucket. EOD / morning 9:30 plans run uncapped (their cap is

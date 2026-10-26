@@ -165,7 +165,7 @@ def _find_new_id(C, before, o):
     except Exception:
         return None
     before = set(before)
-    want_dir = 48 if o["side"] == "B" else 49
+    want_side = o["side"]
     cands = []
     for r in rows:
         oid = str(r.m_strOrderSysID)
@@ -176,8 +176,7 @@ def _find_new_id(C, before, o):
                 continue
             if int(r.m_nVolumeTotalOriginal) != o["shares"]:
                 continue
-            d = int(getattr(r, "m_nDirection", want_dir))
-            if d != want_dir:
+            if _side_of(r) != want_side:
                 continue
         except Exception:
             continue
@@ -217,6 +216,35 @@ def _heartbeat():
                 pass
     except Exception:
         pass
+
+
+def _side_of(o):
+    """Return "B"/"S" for an order row.
+
+    m_nDirection is unusable on this build: all four orders placed on
+    2026-10-26 reported 48, including the two sells. bIsBuy is what the
+    client's own linkage layer logs, so it is tried first.
+    """
+    for attr in ("bIsBuy", "m_bIsBuy"):
+        v = getattr(o, attr, None)
+        if v is not None:
+            try:
+                return "B" if bool(v) else "S"
+            except Exception:
+                pass
+    try:
+        # offset flag: 48 = open/buy, 49 = close/sell on most builds
+        off = int(getattr(o, "m_nOffsetFlag", -1))
+        if off in (48, 49):
+            return "B" if off == 48 else "S"
+    except Exception:
+        pass
+    name = str(getattr(o, "m_strOptName", "") or "")
+    if name:
+        for token in ("sell", "Sell", "SELL"):
+            if token in name:
+                return "S"
+    return "B"
 
 
 def _fen(x):
@@ -283,15 +311,30 @@ def _snap_orders():
     except Exception as e:
         print("namebridge order query failed: %r" % (e,))
         return
-    smap = {48: "pending", 49: "pending", 50: "pending", 51: "pending",
-            52: "partial", 53: "filled", 54: "cancelled", 55: "cancelled",
-            56: "rejected", 57: "rejected"}
+    # Status codes verified against live pushes on 2026-10-26 (QMT client log,
+    # XtClient_20261026.log). The earlier 48..57 table was wrong: it mapped
+    # 56/57 to "rejected", but a FILLED order reports 56, so a real fill was
+    # reported as a rejection. Ground truth from that session:
+    #   stat 2  -> accepted, working      (002709/000021/000032/603650 on entry)
+    #   stat 8  -> fully filled           (002709 @27.07, 000032 @11.37)
+    #   stat 9  -> cancelled/void         (603650, cancelvol 100)
+    # 53/54/55/56/57 are the linkage-layer codes seen alongside; 56 accompanied
+    # fills and 57 accompanied the void, so they are mapped to match.
+    smap = {1: "pending", 2: "pending", 3: "pending",
+            4: "partial", 5: "partial", 52: "partial",
+            8: "filled", 53: "filled", 56: "filled",
+            9: "cancelled", 54: "cancelled", 55: "cancelled", 57: "cancelled",
+            6: "rejected", 7: "rejected"}
     _clear(ORDQ_DIR)
     for o in rows:
         try:
             oid = str(o.m_strOrderSysID).replace("_", "-")[:40]
             code = str(o.m_strInstrumentID).split(".")[0]
-            side = "B" if int(getattr(o, "m_nDirection", 48)) == 48 else "S"
+            # Direction: m_nDirection does NOT encode buy/sell here (every row
+            # read 48 on 2026-10-26, including two sells). The client's own
+            # linkage log prints bIsBuy, so prefer that; fall back to the
+            # offset flag, then to the string op name.
+            side = _side_of(o)
             sub = int(getattr(o, "m_nVolumeTotalOriginal", 0))
             fill = int(getattr(o, "m_nVolumeTraded", 0))
             st = smap.get(int(getattr(o, "m_nOrderStatus", 0)), "pending")
